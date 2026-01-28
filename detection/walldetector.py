@@ -1,121 +1,120 @@
 """
-Быков Вадим Олегович - 16.12.2025
+Система анализа планировок помещений - Модуль детекции стен на основе цветовой фильтрации
+Версия: 3.9
+Автор: Быков Вадим Олегович
+Дата: 01.28.2026
 
-Модуль детекции стен на основе цветовой фильтрации - v2.2
+Цветовая фильтрация стен с комбинированным RGB + HSV подходом
++ формирование единой формы стен с внешними контурами
 
-ПАЙПЛАЙН:
-- OCR-очистка текстовых меток (docTR)
-- Цветовая фильтрация стен с комбинированным RGB + HSV подходом
-- Удаление наиболее выраженной круглой метки комнаты
-- Морфологическая очистка и скелетизация
-- Детекция структуры стен (Probabilistic Hough Line Transform)
-- Distance Transform для измерения толщины
-- Трассировка и фильтрация по толщине
-- Детекция и анализ соединений стен
-
-СТЕК:
-- OpenCV: цветовая фильтрация, Hough Transform, distance transform
-- docTR: OCR для удаления текстовых меток
-- scikit-image: прецизионная скелетизация
-- NumPy: векторные операции для измерений
-- scipy: интерполяция и кластеризация
-
-Последнее изменение - 22.12.25 - Silent operation + OCR text removal
 """
 
 import cv2
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass
-from scipy.spatial.distance import cdist
-from skimage.morphology import skeletonize
 
 
-# ------------------------------------------------------------------ #
-# DATA STRUCTURES
-# ------------------------------------------------------------------ #
+# ============================================================
+# СТРУКТУРЫ ДАННЫХ
+# ============================================================
 
 @dataclass
-class WallSegment:
-    """Структура данных для сегмента стены"""
+class WallRectangle:
+    """
+    Осе-ориентированный прямоугольник, аппроксимирующий часть маски стен.
+
+    Атрибуты:
+        id: Уникальный идентификатор прямоугольника
+        x1, y1: Левый верхний угол (включительно)
+        x2, y2: Правый нижний угол (включительно)
+        width, height: Размеры прямоугольника
+        area: Площадь прямоугольника
+        outline: 4 точки контура прямоугольника
+    """
     id: int
     x1: int
     y1: int
     x2: int
     y2: int
-    length: float
-    thickness_mean: float
-    thickness_std: float
-    thickness_min: float
-    thickness_max: float
-    thickness_profile: List[float]
-    sample_points: List[Tuple[int, int]]
+    width: int
+    height: int
+    area: int
+    outline: List[Tuple[int, int]]
 
 
-@dataclass
-class WallJunction:
-    """Структура данных для соединения стен"""
-    id: int
-    x: int
-    y: int
-    connected_walls: List[int]
-    junction_type: str
-    local_thickness: float
-
-
-# ------------------------------------------------------------------ #
-# MORPHOLOGICAL OPERATIONS
-# ------------------------------------------------------------------ #
+# ============================================================
+# МОРФОЛОГИЧЕСКИЕ ОПЕРАЦИИ
+# ============================================================
 
 def morphological_cleanup(mask: np.ndarray) -> np.ndarray:
-    """Морфологическая очистка маски стен"""
+    """
+    Морфологическая очистка маски стен.
+
+    Выполняет закрытие дыр, удаление мелких шумов и фильтрацию
+    по минимальной площади компонент.
+
+    Параметры:
+        mask: Входная бинарная маска
+
+    Возвращает:
+        Очищенную маску
+    """
     kernel_small = np.ones((3, 3), np.uint8)
+
+    # Закрытие дыр и удаление шума
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_small, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
 
+    # Анализ связных компонент
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
 
+    # Фильтрация малых компонент
     cleaned = np.zeros_like(mask)
     for i in range(1, num_labels):
         area = stats[i, cv2.CC_STAT_AREA]
-        if area > 50:
+        if area > 50:  # Минимальная площадь компоненты
             cleaned[labels == i] = 255
 
     return cleaned
 
 
-def skeletonize_walls(mask: np.ndarray) -> np.ndarray:
-    """Скелетизация стен для последующей детекции линий"""
-    skeleton = skeletonize(mask > 0).astype(np.uint8) * 255
-
-    kernel = np.ones((3, 3), np.uint8)
-    skeleton = cv2.morphologyEx(skeleton, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-    return skeleton
-
-
-# ------------------------------------------------------------------ #
-# WALL DETECTOR
-# ------------------------------------------------------------------ #
+# ============================================================
+# ДЕТЕКТОР СТЕН
+# ============================================================
 
 class ColorBasedWallDetector:
-    """Детектор стен на основе цветовой фильтрации"""
+    """
+    Детектор стен на основе цветовой фильтрации и прямоугольной декомпозиции.
+
+    Особенности:
+    - Прямоугольники используются как внутреннее представление формы стен
+    - При визуализации строится общий контур формы без внутренних разделов
+    - Поддержка автоматического определения цвета стен
+    - Интеграция с внешней OCR моделью
+    """
 
     def __init__(self,
                  wall_color_hex: str = "8E8780",
                  color_tolerance: int = 3,
-                 min_wall_length: int = 10,
-                 hough_threshold: int = 10,
-                 auto_wall_color: bool = False):
+                 auto_wall_color: bool = False,
+                 min_rect_area_ratio: float = 0.0002,
+                 rect_visual_gap_px: int = 3,
+                 ocr_model: Optional[object] = None,
+                 edge_expansion_tolerance: int = 8,
+                 max_edge_expansion_px: int = 10):
         """
-        Инициализация детектора стен
+        Инициализация детектора стен.
 
         Параметры:
-            wall_color_hex: цвет стен в формате HEX
-            color_tolerance: толерантность цвета RGB
-            min_wall_length: минимальная длина стены в пикселях
-            hough_threshold: порог для Hough Line Transform
-            auto_wall_color: автоматическое определение цвета стен
+            wall_color_hex: Цвет стен в формате HEX
+            color_tolerance: Допуск по RGB каналам
+            auto_wall_color: Автоматическое определение цвета стен
+            min_rect_area_ratio: Минимальная относительная площадь прямоугольника
+            rect_visual_gap_px: Максимальный зазор для объединения при визуализации
+            ocr_model: Предварительно инициализированная модель OCR
+            edge_expansion_tolerance: Допуск цвета для расширения краёв
+            max_edge_expansion_px: Максимальное расширение краёв в пикселях
         """
         self.auto_wall_color = auto_wall_color
 
@@ -125,59 +124,52 @@ class ColorBasedWallDetector:
             self.wall_rgb = None
 
         self.color_tolerance = color_tolerance
-        self.min_wall_length = min_wall_length
-        self.hough_threshold = hough_threshold
+        self.edge_expansion_tolerance = edge_expansion_tolerance
+        self.max_edge_expansion_px = max_edge_expansion_px
+        self.min_rect_area_ratio = float(min_rect_area_ratio)
+        self.rect_visual_gap_px = int(rect_visual_gap_px)
 
-        # Параметры фильтрации сегментов
-        self.min_valid_thickness_ratio = 0.6
-        self.max_rel_thickness_std = 0.45
-        self.max_angle_deviation_deg = 12.0
+        # Использование предоставленной OCR модели или инициализация новой
+        self.ocr_model = ocr_model
+        if self.ocr_model is None:
+            self._init_ocr()
 
-        # OCR модель для удаления текстовых меток
-        self.ocr_model = None
-        self._init_ocr()
-
-    # ------------------------------------------------------------------ #
-    # OCR ИНИЦИАЛИЗАЦИЯ / ОЧИСТКА ТЕКСТА
-    # ------------------------------------------------------------------ #
+    # ============================================================
+    # OCR ФУНКЦИОНАЛ
+    # ============================================================
 
     def _init_ocr(self) -> None:
-        """Инициализация модели OCR (docTR) для удаления текстовых меток"""
+        """Инициализация модели OCR (docTR) для удаления текстовых меток."""
         try:
             from doctr.models import ocr_predictor
             self.ocr_model = ocr_predictor(pretrained=True)
         except Exception:
-            # Без docTR работаем без OCR-очистки, в silent-режиме
             self.ocr_model = None
 
-    def remove_text_labels_ocr(self,
-                               img: np.ndarray,
-                               inpaint_radius: int = 3,
-                               bbox_expansion_px: int = 2) -> np.ndarray:
+    def get_ocr_bboxes(self,
+                      img: np.ndarray,
+                      bbox_expansion_px: int = 2) -> List[Tuple[int, int, int, int]]:
         """
-        Удаление текстовых меток с чертежа с помощью OCR (docTR)
+        Получение ограничивающих рамок текста через OCR.
 
         Параметры:
-            img: входное изображение (BGR)
-            inpaint_radius: радиус для cv2.inpaint
-            bbox_expansion_px: расширение прямоугольников вокруг текста в пикселях
+            img: Входное изображение
+            bbox_expansion_px: Расширение рамок в пикселях
 
         Возвращает:
-            Изображение без текстовых надписей (после инпейнтинга)
+            Список рамок в формате (x1, y1, x2, y2)
         """
         if self.ocr_model is None:
-            return img
+            return []
 
         h, w = img.shape[:2]
-        text_mask = np.zeros((h, w), dtype=np.uint8)
+        bboxes = []
 
         try:
-            # docTR ожидает список изображений [H, W, C] (np.uint8)
             result = self.ocr_model([img])
         except Exception:
-            return img
+            return []
 
-        # Обход всех распознанных слов и построение маски текста
         try:
             for page in getattr(result, "pages", []):
                 for block in getattr(page, "blocks", []):
@@ -187,19 +179,14 @@ class ColorBasedWallDetector:
                             if geom is None:
                                 continue
 
-                            # geometry в docTR обычно: ((x_min, y_min), (x_max, y_max)) в относительных координатах
                             x_min_rel = y_min_rel = x_max_rel = y_max_rel = None
                             try:
-                                # Попытка распаковки как ((x_min, y_min), (x_max, y_max))
-                                (x_min_rel, y_min_rel), (x_max_rel, y_max_rel) = geom  # type: ignore[misc]
+                                (x_min_rel, y_min_rel), (x_max_rel, y_max_rel) = geom
                             except Exception:
-                                # Возможные альтернативные форматы экспорта
                                 try:
-                                    # [[x_min, y_min], [x_max, y_max]]
                                     if len(geom) == 2 and len(geom[0]) == 2:
                                         x_min_rel, y_min_rel = geom[0]
                                         x_max_rel, y_max_rel = geom[1]
-                                    # [x_min, y_min, x_max, y_max]
                                     elif len(geom) == 4:
                                         x_min_rel, y_min_rel, x_max_rel, y_max_rel = geom
                                     else:
@@ -210,13 +197,13 @@ class ColorBasedWallDetector:
                             if x_min_rel is None or x_max_rel is None:
                                 continue
 
-                            # Перевод относительных координат (0..1) в пиксели
+                            # Преобразование относительных координат в абсолютные
                             x_min = int(np.floor(float(x_min_rel) * w))
                             y_min = int(np.floor(float(y_min_rel) * h))
                             x_max = int(np.ceil(float(x_max_rel) * w))
                             y_max = int(np.ceil(float(y_max_rel) * h))
 
-                            # Небольшое расширение bbox, чтобы захватить контур текста
+                            # Расширение рамок
                             x_min = max(0, x_min - bbox_expansion_px)
                             y_min = max(0, y_min - bbox_expansion_px)
                             x_max = min(w - 1, x_max + bbox_expansion_px)
@@ -225,36 +212,64 @@ class ColorBasedWallDetector:
                             if x_max <= x_min or y_max <= y_min:
                                 continue
 
-                            cv2.rectangle(text_mask, (x_min, y_min), (x_max, y_max), 255, -1)
+                            bboxes.append((x_min, y_min, x_max, y_max))
         except Exception:
-            # Любая ошибка OCR не должна ломать основной пайплайн
+            return []
+
+        return bboxes
+
+    def remove_text_labels_ocr(self,
+                               img: np.ndarray,
+                               inpaint_radius: int = 3,
+                               bbox_expansion_px: int = 2) -> np.ndarray:
+        """
+        Удаление текстовых меток с изображения через OCR и инпэйнтинг.
+
+        Параметры:
+            img: Входное изображение
+            inpaint_radius: Радиус инпэйнтинга
+            bbox_expansion_px: Расширение рамок текста
+
+        Возвращает:
+            Изображение с удалённым текстом
+        """
+        if self.ocr_model is None:
             return img
+
+        h, w = img.shape[:2]
+        text_mask = np.zeros((h, w), dtype=np.uint8)
+
+        # Получение рамок текста
+        bboxes = self.get_ocr_bboxes(img, bbox_expansion_px)
+
+        # Отрисовка рамок на маске
+        for x_min, y_min, x_max, y_max in bboxes:
+            cv2.rectangle(text_mask, (x_min, y_min), (x_max, y_max), 255, -1)
 
         if np.count_nonzero(text_mask) == 0:
             return img
 
-        # Небольшое расширение маски, чтобы убрать ореолы вокруг текста
+        # Дополнительное расширение маски
         if bbox_expansion_px > 1:
             k = max(1, bbox_expansion_px)
             kernel = np.ones((k, k), np.uint8)
             text_mask = cv2.dilate(text_mask, kernel, iterations=1)
 
-        # Инпейтинг текста по маске
+        # Инпэйнтинг для удаления текста
         try:
             cleaned = cv2.inpaint(img, text_mask, inpaint_radius, cv2.INPAINT_TELEA)
         except Exception:
-            # В случае проблем с inpaint возвращаем исходное изображение
             cleaned = img
 
         return cleaned
 
-    # ------------------------------------------------------------------ #
-    # ЦВЕТОВАЯ ДЕТЕКЦИЯ СТЕН
-    # ------------------------------------------------------------------ #
+    # ============================================================
+    # ЦВЕТОВАЯ ДЕТЕКЦИЯ
+    # ============================================================
 
     @staticmethod
     def _hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
-        """Конвертация HEX -> RGB"""
+        """Конвертация цвета из HEX в RGB формат."""
         hex_color = hex_color.lstrip('#')
         return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
 
@@ -266,21 +281,24 @@ class ColorBasedWallDetector:
         max_samples: int = 2000000
     ) -> Tuple[int, int, int]:
         """
-        Автоматическое определение цвета стен
+        Автоматическое определение цвета стен через кластеризацию.
+
+        Использует K-means для поиска доминирующих цветов и выбирает
+        самый тёмный из часто встречающихся.
 
         Параметры:
-            img: входное изображение
-            min_fraction: минимальная доля пикселей для кластера
-            k: количество кластеров для k-means
-            max_samples: максимальное количество пикселей для анализа
+            img: Входное изображение
+            min_fraction: Минимальная доля для рассмотрения кластера
+            k: Количество кластеров
+            max_samples: Максимальное количество пикселей для анализа
 
         Возвращает:
-            Кортеж (R, G, B) цвета стен
+            Цвет стен в формате (R, G, B)
         """
         h, w = img.shape[:2]
         pixels = img.reshape(-1, 3).astype(np.float32)
 
-        # Подвыборка для ускорения
+        # Сэмплирование пикселей для ускорения
         if pixels.shape[0] > max_samples:
             idx = np.random.choice(pixels.shape[0], max_samples, replace=False)
             sample = pixels[idx]
@@ -296,6 +314,7 @@ class ColorBasedWallDetector:
             mean_bgr = sample.mean(axis=0).astype(np.uint8)
             return int(mean_bgr[2]), int(mean_bgr[1]), int(mean_bgr[0])
 
+        # K-means кластеризация
         criteria = (
             cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
             10,
@@ -312,15 +331,16 @@ class ColorBasedWallDetector:
         labels = labels.flatten()
         centers = centers.astype(np.uint8)
 
+        # Анализ кластеров
         counts = np.bincount(labels, minlength=K).astype(np.float32)
         fractions = counts / float(labels.size)
 
-        # Оценка яркости (L в Lab) для центров кластеров
+        # Преобразование в LAB для оценки яркости
         centers_bgr = centers.reshape(K, 1, 3)
         centers_lab = cv2.cvtColor(centers_bgr, cv2.COLOR_BGR2LAB).reshape(K, 3)
         L = centers_lab[:, 0]
 
-        # Кластеры с достаточной долей пикселей
+        # Выбор самого тёмного из достаточно больших кластеров
         candidate_idx = np.where(fractions >= min_fraction)[0]
         if candidate_idx.size == 0:
             candidate_idx = np.arange(K)
@@ -331,18 +351,17 @@ class ColorBasedWallDetector:
         r = int(chosen_bgr[2])
         g = int(chosen_bgr[1])
         b = int(chosen_bgr[0])
-
         return r, g, b
 
     def filter_walls_by_color(self, img: np.ndarray) -> np.ndarray:
         """
-        Цветовая фильтрация стен с комбинированным RGB + HSV подходом
+        Цветовая фильтрация стен с комбинированным RGB + HSV подходом.
 
         Параметры:
-            img: входное изображение (BGR)
+            img: Входное изображение в формате BGR
 
         Возвращает:
-            Бинарная маска стен
+            Бинарную маску стен (0/255)
         """
         if self.auto_wall_color:
             wall_rgb = self._detect_wall_color_auto(img)
@@ -362,13 +381,11 @@ class ColorBasedWallDetector:
 
         # HSV фильтрация
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
         target_hsv = cv2.cvtColor(
             np.uint8([[wall_rgb[::-1]]]),
             cv2.COLOR_BGR2HSV
         )[0, 0]
 
-        # Допуски для HSV
         h_tol = 4
         s_tol = 15
         v_tol = 12
@@ -381,7 +398,7 @@ class ColorBasedWallDetector:
         target_s = int(target_hsv[1])
         target_v = int(target_hsv[2])
 
-        # Обработка цикличности Hue
+        # Обработка циклической природы Hue
         h_diff = np.abs(h - target_h)
         h_diff = np.minimum(h_diff, 180 - h_diff)
         h_match = h_diff <= h_tol
@@ -390,32 +407,32 @@ class ColorBasedWallDetector:
         v_match = np.abs(v - target_v) <= v_tol
         hsv_mask = (h_match & s_match & v_match).astype(np.uint8) * 255
 
-        # Пересечение масок RGB и HSV
+        # Объединение масок
         combined_mask = cv2.bitwise_and(rgb_mask, hsv_mask)
 
-        # Замыкание мелких дыр
+        # Морфологическое закрытие малых разрывов
         kernel = np.ones((3, 3), np.uint8)
         combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
         return combined_mask
 
-    # ------------------------------------------------------------------ #
-    # СПЕЦИАЛЬНАЯ ОЧИСТКА КРУГЛЫХ МЕТОК
-    # ------------------------------------------------------------------ #
+    # ============================================================
+    # ОБРАБОТКА СПЕЦИАЛЬНЫХ МЕТОК
+    # ============================================================
 
     def remove_circular_labels(self, wall_mask: np.ndarray) -> np.ndarray:
         """
-        Удаление наиболее выраженной круглой метки комнаты
+        Удаление наиболее выраженной круглой метки комнаты.
+
+        Использует преобразование Хафа для поиска кругов.
 
         Параметры:
-            wall_mask: бинарная маска стен
+            wall_mask: Маска стен
 
         Возвращает:
-            Очищенная маска стен
+            Маску с удалённой круглой меткой
         """
         cleaned = wall_mask.copy()
-
-        # Лёгкое размытие для устойчивого поиска окружностей
         blurred = cv2.GaussianBlur(wall_mask, (5, 5), 0)
 
         circles = cv2.HoughCircles(
@@ -429,359 +446,329 @@ class ColorBasedWallDetector:
             maxRadius=100
         )
 
-        # HoughCircles возвращает круги по убыванию accumulator value —
-        # используем только первый (самый сильный) круг
         if circles is not None:
             circles = np.around(circles[0]).astype(np.uint16)
             if len(circles) > 0:
+                # Удаление первого (наиболее выраженного) круга
                 cx, cy, r = circles[0]
                 cv2.circle(cleaned, (cx, cy), r + 5, 0, -1)
 
         return cleaned
 
-    # ------------------------------------------------------------------ #
-    # ДЕТЕКЦИЯ ЛИНИЙ, ТОЛЩИНА, СОЕДИНЕНИЯ
-    # ------------------------------------------------------------------ #
+    # ============================================================
+    # ПРЯМОУГОЛЬНАЯ ДЕКОМПОЗИЦИЯ
+    # ============================================================
 
-    def detect_wall_lines(self, skeleton: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    @staticmethod
+    def _largest_rectangle_in_mask(mask_bool: np.ndarray) -> Optional[Tuple[int, int, int, int, int]]:
         """
-        Детекция линий стен через Probabilistic Hough Transform
+        Поиск наибольшего прямоугольника единиц в бинарной матрице.
+
+        Использует алгоритм на основе стека для эффективного поиска.
 
         Параметры:
-            skeleton: скелетизированная маска стен
+            mask_bool: Бинарная маска (True/False)
 
         Возвращает:
-            Список линий в формате (x1, y1, x2, y2)
+            (x1, y1, x2, y2, area) или None, если единиц нет
         """
-        lines = cv2.HoughLinesP(
-            skeleton,
-            rho=1,
-            theta=np.pi / 180,
-            threshold=self.hough_threshold,
-            minLineLength=self.min_wall_length,
-            maxLineGap=10
+        h, w = mask_bool.shape
+        heights = np.zeros(w, dtype=np.int32)
+
+        best_area = 0
+        best_coords: Optional[Tuple[int, int, int, int]] = None
+
+        for i in range(h):
+            row = mask_bool[i]
+            heights = heights + row.astype(np.int32)
+            heights[~row] = 0
+
+            stack: List[int] = []
+            j = 0
+            while j <= w:
+                cur_h = heights[j] if j < w else 0
+                if not stack or cur_h >= heights[stack[-1]]:
+                    stack.append(j)
+                    j += 1
+                else:
+                    top = stack.pop()
+                    height = heights[top]
+                    if height == 0:
+                        continue
+                    width = j if not stack else j - stack[-1] - 1
+                    area = int(height * width)
+                    if area > best_area:
+                        best_area = area
+                        y2 = i
+                        y1 = i - height + 1
+                        x2 = j - 1
+                        x1 = (stack[-1] + 1) if stack else 0
+                        best_coords = (x1, y1, x2, y2)
+
+        if best_coords is None or best_area <= 0:
+            return None
+
+        x1, y1, x2, y2 = best_coords
+        return x1, y1, x2, y2, best_area
+
+    def _expand_rectangle_edges(self,
+                                wall_mask: np.ndarray,
+                                img: np.ndarray,
+                                rect: WallRectangle) -> WallRectangle:
+        """
+        Расширение краёв прямоугольника в областях с близким цветом стен.
+
+        Параметры:
+            wall_mask: Текущая маска стен
+            img: Исходное изображение (BGR)
+            rect: Прямоугольник для расширения
+
+        Возвращает:
+            Расширенный прямоугольник
+        """
+        if self.wall_rgb is None:
+            return rect
+
+        h, w = wall_mask.shape
+        target_r, target_g, target_b = self.wall_rgb
+        tol = self.edge_expansion_tolerance
+
+        x1, y1, x2, y2 = rect.x1, rect.y1, rect.x2, rect.y2
+
+        def color_matches(y_coord: int, x_coord: int) -> bool:
+            """Проверка близости цвета пикселя к цвету стены."""
+            if y_coord < 0 or y_coord >= h or x_coord < 0 or x_coord >= w:
+                return False
+            b, g, r = img[y_coord, x_coord]
+            return (abs(int(r) - target_r) <= tol and
+                    abs(int(g) - target_g) <= tol and
+                    abs(int(b) - target_b) <= tol)
+
+        # Расширение влево
+        for expansion in range(1, self.max_edge_expansion_px + 1):
+            new_x1 = x1 - expansion
+            if new_x1 < 0:
+                break
+            matches = sum(color_matches(y, new_x1) for y in range(y1, y2 + 1))
+            if matches / (y2 - y1 + 1) < 0.5:  # Минимум 50% совпадения
+                break
+            x1 = new_x1
+
+        # Расширение вправо
+        for expansion in range(1, self.max_edge_expansion_px + 1):
+            new_x2 = x2 + expansion
+            if new_x2 >= w:
+                break
+            matches = sum(color_matches(y, new_x2) for y in range(y1, y2 + 1))
+            if matches / (y2 - y1 + 1) < 0.5:
+                break
+            x2 = new_x2
+
+        # Расширение вверх
+        for expansion in range(1, self.max_edge_expansion_px + 1):
+            new_y1 = y1 - expansion
+            if new_y1 < 0:
+                break
+            matches = sum(color_matches(new_y1, x) for x in range(x1, x2 + 1))
+            if matches / (x2 - x1 + 1) < 0.5:
+                break
+            y1 = new_y1
+
+        # Расширение вниз
+        for expansion in range(1, self.max_edge_expansion_px + 1):
+            new_y2 = y2 + expansion
+            if new_y2 >= h:
+                break
+            matches = sum(color_matches(new_y2, x) for x in range(x1, x2 + 1))
+            if matches / (x2 - x1 + 1) < 0.5:
+                break
+            y2 = new_y2
+
+        # Создание расширенного прямоугольника
+        width = x2 - x1 + 1
+        height = y2 - y1 + 1
+        area = width * height
+
+        outline = [
+            (int(x1), int(y1)),
+            (int(x2), int(y1)),
+            (int(x2), int(y2)),
+            (int(x1), int(y2)),
+        ]
+
+        return WallRectangle(
+            id=rect.id,
+            x1=int(x1),
+            y1=int(y1),
+            x2=int(x2),
+            y2=int(y2),
+            width=int(width),
+            height=int(height),
+            area=int(area),
+            outline=outline
         )
 
-        if lines is None:
-            return []
-
-        wall_lines: List[Tuple[int, int, int, int]] = []
-        for line in lines:
-            x1, y1, x2, y2 = line[0]
-            length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-            if length >= self.min_wall_length:
-                wall_lines.append((int(x1), int(y1), int(x2), int(y2)))
-
-        return wall_lines
-
-    def compute_distance_transform(self, wall_mask: np.ndarray) -> np.ndarray:
+    def _decompose_to_rectangles(self, wall_mask: np.ndarray, img: Optional[np.ndarray] = None) -> List[WallRectangle]:
         """
-        Вычисление Distance Transform для измерения толщины стен
+        Разложение бинарной маски стен на набор осевых прямоугольников.
+
+        Алгоритм:
+        - На каждом шаге ищется максимальный прямоугольник единиц
+        - Он записывается и вычитается из маски
+        - Края прямоугольников расширяются в областях с близким цветом
+        - Процесс продолжается до исчерпания маски
 
         Параметры:
-            wall_mask: бинарная маска стен
+            wall_mask: Маска стен
+            img: Изображение для расширения краёв (опционально)
 
         Возвращает:
-            Distance transform изображение
+            Список прямоугольников
         """
-        dist_transform = cv2.distanceTransform(wall_mask, cv2.DIST_L2, 5)
-        return dist_transform
+        h, w = wall_mask.shape
+        image_area = h * w
+        min_area = int(max(1, self.min_rect_area_ratio * image_area))
 
-    def measure_thickness_along_line(self,
-                                     x1: int, y1: int, x2: int, y2: int,
-                                     dist_transform: np.ndarray,
-                                     num_samples: int = 50) -> Tuple[List[float], List[Tuple[int, int]]]:
-        """
-        Измерение толщины стены вдоль линии
+        work = (wall_mask > 0).copy()
+        rectangles: List[WallRectangle] = []
+        rect_id = 0
 
-        Параметры:
-            x1, y1, x2, y2: координаты линии
-            dist_transform: distance transform изображение
-            num_samples: количество точек для измерения
+        while True:
+            res = self._largest_rectangle_in_mask(work)
+            if res is None:
+                break
 
-        Возвращает:
-            Кортеж (профиль толщины, точки измерения)
-        """
-        length = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-        if length < 1:
-            return [0.0], [(x1, y1)]
+            x1, y1, x2, y2, area = res
+            if area < min_area:
+                break
 
-        t_values = np.linspace(0.0, 1.0, num_samples)
+            width = x2 - x1 + 1
+            height = y2 - y1 + 1
 
-        sample_points: List[Tuple[int, int]] = []
-        thickness_values: List[float] = []
+            outline = [
+                (int(x1), int(y1)),
+                (int(x2), int(y1)),
+                (int(x2), int(y2)),
+                (int(x1), int(y2)),
+            ]
 
-        h, w = dist_transform.shape
-
-        for t in t_values:
-            x = int(x1 + t * (x2 - x1))
-            y = int(y1 + t * (y2 - y1))
-
-            if 0 <= x < w and 0 <= y < h:
-                sample_points.append((x, y))
-                thickness = float(dist_transform[y, x] * 2.0)
-                thickness_values.append(thickness)
-
-        if not thickness_values:
-            return [0.0], [(x1, y1)]
-
-        return thickness_values, sample_points
-
-    def detect_junctions(self,
-                         wall_lines: List[Tuple[int, int, int, int]],
-                         dist_transform: np.ndarray,
-                         proximity_threshold: int = 15) -> List[WallJunction]:
-        """
-        Детекция соединений стен (L-образные, T-образные, X-образные)
-
-        Параметры:
-            wall_lines: список линий стен
-            dist_transform: distance transform изображение
-            proximity_threshold: порог близости для группировки концов
-
-        Возвращает:
-            Список соединений стен
-        """
-        endpoints = []
-        for idx, (x1, y1, x2, y2) in enumerate(wall_lines):
-            endpoints.append((x1, y1, idx, 'start'))
-            endpoints.append((x2, y2, idx, 'end'))
-
-        if not endpoints:
-            return []
-
-        coords = np.array([(x, y) for x, y, _, _ in endpoints])
-        distances = cdist(coords, coords, metric='euclidean')
-
-        junctions: List[WallJunction] = []
-        processed = set()
-        junction_id = 0
-
-        for i in range(len(endpoints)):
-            if i in processed:
-                continue
-
-            nearby = np.where(distances[i] < proximity_threshold)[0]
-
-            if len(nearby) >= 3:
-                connected_walls = list(set([endpoints[j][2] for j in nearby]))
-
-                if len(connected_walls) >= 2:
-                    x_mean = int(np.mean([endpoints[j][0] for j in nearby]))
-                    y_mean = int(np.mean([endpoints[j][1] for j in nearby]))
-
-                    h, w = dist_transform.shape
-                    if 0 <= x_mean < w and 0 <= y_mean < h:
-                        local_thick = float(dist_transform[y_mean, x_mean] * 2.0)
-                    else:
-                        local_thick = 0.0
-
-                    if len(connected_walls) == 2:
-                        junction_type = "L-junction"
-                    elif len(connected_walls) == 3:
-                        junction_type = "T-junction"
-                    else:
-                        junction_type = "X-junction"
-
-                    junctions.append(WallJunction(
-                        id=junction_id,
-                        x=x_mean,
-                        y=y_mean,
-                        connected_walls=connected_walls,
-                        junction_type=junction_type,
-                        local_thickness=local_thick
-                    ))
-
-                    processed.update(nearby)
-                    junction_id += 1
-
-        return junctions
-
-    # ------------------------------------------------------------------ #
-    # "УМНАЯ" ФИЛЬТРАЦИЯ СЕГМЕНТОВ СТЕН
-    # ------------------------------------------------------------------ #
-
-    def _segment_pass_smart_filters(self,
-                                    seg: WallSegment,
-                                    global_median_thickness: Optional[float]) -> bool:
-        """
-        Фильтрация сегментов стен по критериям качества
-
-        Параметры:
-            seg: сегмент стены
-            global_median_thickness: медианная толщина всех стен
-
-        Возвращает:
-            True если сегмент проходит фильтрацию
-        """
-        if not seg.thickness_profile:
-            return False
-
-        prof = np.array(seg.thickness_profile, dtype=np.float32)
-        if prof.size == 0:
-            return False
-
-        valid_mask = prof > 0
-        valid_ratio = float(valid_mask.mean()) if prof.size > 0 else 0.0
-
-        # Проверка доли валидных точек
-        if valid_ratio < self.min_valid_thickness_ratio:
-            return False
-
-        # Проверка толщины
-        if seg.thickness_mean <= 0:
-            return False
-
-        # Относительное стандартное отклонение толщины
-        if seg.thickness_mean > 0:
-            rel_std = seg.thickness_std / (seg.thickness_mean + 1e-6)
-            if rel_std > self.max_rel_thickness_std:
-                return False
-
-        # Сопоставимость с глобальной толщиной
-        if global_median_thickness is not None and global_median_thickness > 0:
-            if seg.thickness_mean < 0.3 * global_median_thickness:
-                return False
-            if seg.thickness_mean > 3.0 * global_median_thickness:
-                return False
-
-        # Прямолинейность (угол отклонения от 0° или 90°)
-        dx = seg.x2 - seg.x1
-        dy = seg.y2 - seg.y1
-        angle_deg = (np.degrees(np.arctan2(dy, dx)) + 180.0) % 180.0
-        deviation = min(abs(angle_deg), abs(angle_deg - 90.0))
-
-        if deviation > self.max_angle_deviation_deg:
-            return False
-
-        return True
-
-    def analyze_walls(self,
-                      wall_lines: List[Tuple[int, int, int, int]],
-                      dist_transform: np.ndarray) -> List[WallSegment]:
-        """
-        Полный анализ стен с измерением толщины и фильтрацией
-
-        Параметры:
-            wall_lines: список линий стен
-            dist_transform: distance transform изображение
-
-        Возвращает:
-            Список отфильтрованных сегментов стен
-        """
-        raw_segments: List[WallSegment] = []
-
-        for idx, (x1, y1, x2, y2) in enumerate(wall_lines):
-            length = float(np.hypot(x2 - x1, y2 - y1))
-
-            thickness_profile, sample_points = self.measure_thickness_along_line(
-                x1, y1, x2, y2, dist_transform,
-                num_samples=max(20, int(length / 5))
+            rect = WallRectangle(
+                id=rect_id,
+                x1=int(x1),
+                y1=int(y1),
+                x2=int(x2),
+                y2=int(y2),
+                width=int(width),
+                height=int(height),
+                area=int(area),
+                outline=outline
             )
 
-            if thickness_profile:
-                arr = np.array(thickness_profile, dtype=np.float32)
-                valid_mask = arr > 0
+            # Расширение краёв при наличии изображения
+            if img is not None:
+                rect = self._expand_rectangle_edges(wall_mask, img, rect)
 
-                if valid_mask.any():
-                    arr_valid = arr[valid_mask]
-                    thickness_mean = float(arr_valid.mean())
-                    thickness_min = float(arr_valid.min())
-                    thickness_max = float(arr_valid.max())
+            rectangles.append(rect)
+            rect_id += 1
 
-                    # Для σ используем "сердцевину" профиля
-                    n = len(arr_valid)
-                    if n >= 5:
-                        start = n // 10
-                        end = n - start
-                        core = arr_valid[start:end] if end > start else arr_valid
-                    else:
-                        core = arr_valid
+            # Вычитание исходного прямоугольника из рабочей маски
+            work[y1:y2 + 1, x1:x2 + 1] = False
 
-                    thickness_std = float(core.std()) if core.size > 1 else 0.0
-                else:
-                    thickness_mean = thickness_std = thickness_min = thickness_max = 0.0
-            else:
-                thickness_mean = thickness_std = thickness_min = thickness_max = 0.0
+            if not work.any():
+                break
 
-            raw_segments.append(WallSegment(
-                id=idx,
-                x1=x1, y1=y1, x2=x2, y2=y2,
-                length=length,
-                thickness_mean=thickness_mean,
-                thickness_std=thickness_std,
-                thickness_min=thickness_min,
-                thickness_max=thickness_max,
-                thickness_profile=thickness_profile,
-                sample_points=sample_points
-            ))
+        return rectangles
 
-        if not raw_segments:
-            return []
+    # ============================================================
+    # ОСНОВНОЙ МЕТОД ОБРАБОТКИ
+    # ============================================================
 
-        # Глобальная статистика толщины
-        thickness_means = np.array(
-            [s.thickness_mean for s in raw_segments if s.thickness_mean > 0],
-            dtype=np.float32
-        )
-
-        if thickness_means.size >= 3:
-            global_median = float(np.median(thickness_means))
-        else:
-            global_median = None
-
-        # Применение фильтрации
-        filtered_segments: List[WallSegment] = []
-        for seg in raw_segments:
-            if self._segment_pass_smart_filters(seg, global_median):
-                filtered_segments.append(seg)
-
-        # Перенумерация id сегментов
-        for new_id, seg in enumerate(filtered_segments):
-            seg.id = new_id
-
-        return filtered_segments
-
-    # ------------------------------------------------------------------ #
-    # ПОЛНЫЙ ПАЙПЛАЙН
-    # ------------------------------------------------------------------ #
-
-    def process(self, img: np.ndarray) -> Tuple[np.ndarray, List[WallSegment], List[WallJunction], np.ndarray]:
+    def process(self, img: np.ndarray) -> Tuple[np.ndarray, List[WallRectangle], np.ndarray]:
         """
-        Полный пайплайн обработки изображения
+        Полный пайплайн обработки изображения.
+
+        Этапы:
+        1. OCR-очистка текстовых меток
+        2. Цветовая фильтрация стен
+        3. Удаление круглых меток
+        4. Морфологическая очистка
+        5. Прямоугольная декомпозиция
+        6. Формирование объединённой формы
+        7. Построение внешних контуров
 
         Параметры:
-            img: входное изображение (BGR)
+            img: Входное изображение в формате BGR
 
         Возвращает:
-            Кортеж (маска стен, сегменты стен, соединения, distance transform)
+            wall_mask: Бинарная маска стен
+            rectangles: Список прямоугольников
+            outline_mask: Маска с контурами объединённой формы
         """
-        # OCR-очистка текстовых меток
+        # Этап 1: OCR-очистка текстовых меток
         img_no_text = self.remove_text_labels_ocr(img)
 
-        # Цветовая фильтрация
+        # Этап 2: Цветовая фильтрация
         wall_mask = self.filter_walls_by_color(img_no_text)
 
-        # Удаление наиболее выраженной круглой метки
+        # Этап 3: Удаление круглой метки
         wall_mask = self.remove_circular_labels(wall_mask)
 
-        # Морфологическая очистка
+        # Этап 4: Морфологическая очистка
         wall_mask = morphological_cleanup(wall_mask)
 
-        # Скелетизация
-        skeleton = skeletonize_walls(wall_mask)
+        # Этап 5: Прямоугольная декомпозиция
+        rectangles = self._decompose_to_rectangles(wall_mask, img=img_no_text)
 
-        # Детекция линий
-        wall_lines = self.detect_wall_lines(skeleton)
+        # Этап 6: Формирование объединённой формы стен
+        union_mask = np.zeros_like(wall_mask, dtype=np.uint8)
+        for rect in rectangles:
+            cv2.rectangle(
+                union_mask,
+                (rect.x1, rect.y1),
+                (rect.x2, rect.y2),
+                255,
+                -1  # Заливка
+            )
 
-        # Distance Transform
-        dist_transform = self.compute_distance_transform(wall_mask)
+        # Морфологическое замыкание зазоров между прямоугольниками
+        if self.rect_visual_gap_px > 0:
+            k = 2 * self.rect_visual_gap_px + 1
+            kernel = np.ones((k, k), np.uint8)
+            union_mask = cv2.morphologyEx(union_mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-        # Анализ толщины
-        segments = self.analyze_walls(wall_lines, dist_transform)
+        # Этап 7: Построение только внешних контуров
+        contours, _ = cv2.findContours(union_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        outline_mask = np.zeros_like(wall_mask, dtype=np.uint8)
+        cv2.drawContours(outline_mask, contours, -1, 255, 1)
 
-        # Детекция соединений
-        filtered_wall_lines = [(s.x1, s.y1, s.x2, s.y2) for s in segments]
-        junctions = self.detect_junctions(filtered_wall_lines, dist_transform)
+        return wall_mask, rectangles, outline_mask
 
-        return wall_mask, segments, junctions, dist_transform
+    # ============================================================
+    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
+    # ============================================================
+
+    @staticmethod
+    def rectangles_to_dict_list(rectangles: List[WallRectangle]) -> List[Dict]:
+        """
+        Преобразование списка прямоугольников в словари для сериализации.
+
+        Параметры:
+            rectangles: Список прямоугольников
+
+        Возвращает:
+            Список словарей для JSON/CSV экспорта
+        """
+        out = []
+        for r in rectangles:
+            out.append({
+                "id": r.id,
+                "x1": r.x1,
+                "y1": r.y1,
+                "x2": r.x2,
+                "y2": r.y2,
+                "width": r.width,
+                "height": r.height,
+                "area": r.area,
+                "outline": r.outline,
+            })
+        return out

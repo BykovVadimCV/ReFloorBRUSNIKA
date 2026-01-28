@@ -1,20 +1,11 @@
 """
-Быков Вадим Олегович - 16.12.2025
+Система анализа планировок помещений - Модуль YOLO-детекции
+Версия: 3.9
+Автор: Быков Вадим Олегович
+Дата: 01.28.2026
 
-Модуль YOLO-детекции дверей и окон - v1.1
-
-ПАЙПЛАЙН:
-- Загрузка модели через models.common.DetectMultiBackend
-- Ручной препроцессинг (Letterbox) и инференс (PyTorch)
-- Детекция дверей (0) и окон (1)
-- Постобработка (NMS, Scaling)
-
-СТЕК:
-- PyTorch: инференс
-- OpenCV: обработка изображений
-- NumPy: массивы
-
-Последнее изменение - 22.12.25 - Refactored silent operation
+Модуль YOLO-детекции и экспорта масок мебели. На данный момент
+можуль нацелен исключительно на обнаружение дверей и окон.
 """
 
 import cv2
@@ -27,12 +18,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-# ------------------------------------------------------------------ #
-# YOLO PATH SETUP
-# ------------------------------------------------------------------ #
+# ============================================================
+# НАСТРОЙКА ПУТЕЙ YOLO
+# ============================================================
 
 current_dir = os.getcwd()
-yolo_path = os.path.join(current_dir, 'utils', 'yolov9')
+yolo_path = os.path.join("D:/ReFloorBRUSNIKA", 'utils', 'yolov9')
 
 if os.path.exists(yolo_path):
     if yolo_path not in sys.path:
@@ -46,13 +37,22 @@ except ImportError as e:
     raise ImportError(f"Не удалось импортировать модули YOLOv9. Проверьте путь и структуру репозитория. Ошибка: {e}")
 
 
-# ------------------------------------------------------------------ #
-# DATA STRUCTURES
-# ------------------------------------------------------------------ #
+# ============================================================
+# СТРУКТУРЫ ДАННЫХ
+# ============================================================
 
 @dataclass
 class YOLODetection:
-    """Структура данных для одной YOLO детекции"""
+    """
+    Структура данных для одной YOLO детекции.
+
+    Атрибуты:
+        class_id: Идентификатор класса (0 - дверь, 1 - окно)
+        class_name: Название класса
+        confidence: Уверенность детекции (0-1)
+        bbox: Ограничивающий прямоугольник (x1, y1, x2, y2)
+        mask: Бинарная маска объекта (опционально)
+    """
     class_id: int
     class_name: str
     confidence: float
@@ -62,7 +62,16 @@ class YOLODetection:
 
 @dataclass
 class YOLOResults:
-    """Структура данных для результатов YOLO детекции"""
+    """
+    Структура данных для результатов YOLO детекции.
+
+    Атрибуты:
+        doors: Список обнаруженных дверей
+        windows: Список обнаруженных окон
+        all_detections: Все детекции
+        combined_door_mask: Объединённая маска всех дверей
+        combined_window_mask: Объединённая маска всех окон
+    """
     doors: List[YOLODetection]
     windows: List[YOLODetection]
     all_detections: List[YOLODetection]
@@ -70,16 +79,31 @@ class YOLOResults:
     combined_window_mask: np.ndarray
 
 
-# ------------------------------------------------------------------ #
-# PREPROCESSING
-# ------------------------------------------------------------------ #
+# ============================================================
+# ПРЕДОБРАБОТКА ИЗОБРАЖЕНИЙ
+# ============================================================
 
 def letterbox(im, new_shape=(1048, 1048), color=(114, 114, 114), auto=True, scaleFill=False, scaleup=True, stride=32):
-    """Изменение размера изображения с сохранением пропорций"""
-    shape = im.shape[:2]  # текущая форма [высота, ширина]
+    """
+    Изменение размера изображения с сохранением пропорций и добавлением отступов.
+
+    Параметры:
+        im: Входное изображение
+        new_shape: Целевой размер (высота, ширина)
+        color: Цвет заполнения отступов
+        auto: Автоматический расчёт отступов
+        scaleFill: Заполнение всей области без отступов
+        scaleup: Разрешить увеличение изображения
+        stride: Шаг для выравнивания размера
+
+    Возвращает:
+        Кортеж (изображение с отступами, коэффициент масштабирования, отступы)
+    """
+    shape = im.shape[:2]  # Текущая форма [высота, ширина]
     if isinstance(new_shape, int):
         new_shape = (new_shape, new_shape)
 
+    # Расчёт коэффициента масштабирования
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
     if not scaleup:
         r = min(r, 1.0)
@@ -88,6 +112,7 @@ def letterbox(im, new_shape=(1048, 1048), color=(114, 114, 114), auto=True, scal
     new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
     dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
 
+    # Расчёт отступов
     if auto:
         dw, dh = np.mod(dw, stride), np.mod(dh, stride)
     elif scaleFill:
@@ -98,9 +123,11 @@ def letterbox(im, new_shape=(1048, 1048), color=(114, 114, 114), auto=True, scal
     dw /= 2
     dh /= 2
 
+    # Изменение размера при необходимости
     if shape[::-1] != new_unpad:
         im = cv2.resize(im, new_unpad, interpolation=cv2.INTER_LINEAR)
 
+    # Добавление отступов
     top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
     left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
 
@@ -108,16 +135,23 @@ def letterbox(im, new_shape=(1048, 1048), color=(114, 114, 114), auto=True, scal
     return im, ratio, (dw, dh)
 
 
-# ------------------------------------------------------------------ #
-# DETECTOR
-# ------------------------------------------------------------------ #
+# ============================================================
+# ДЕТЕКТОР
+# ============================================================
 
 class YOLODoorWindowDetector:
-    """YOLO-детектор дверей и окон на базе нативного YOLOv9"""
+    """
+    YOLO-детектор дверей и окон на базе нативного YOLOv9.
 
+    Поддерживает детекцию двух классов объектов:
+    - Двери (класс 0)
+    - Окна (класс 1)
+    """
+
+    # Сопоставление ID классов с названиями
     CLASS_NAMES = {
         0: "Door",
-        1: "window"
+        1: "Window"
     }
 
     def __init__(self,
@@ -126,30 +160,32 @@ class YOLODoorWindowDetector:
                  iou_threshold: float = 0.45,
                  device: str = "cpu"):
         """
-        Инициализация YOLO-детектора
-        
+        Инициализация YOLO-детектора.
+
         Параметры:
-            model_path: путь к файлу весов модели (.pt)
-            conf_threshold: порог уверенности для детекции
-            iou_threshold: порог IoU для NMS
-            device: устройство для инференса (cpu/cuda/0/1/...)
+            model_path: Путь к файлу весов модели (.pt)
+            conf_threshold: Порог уверенности для детекции
+            iou_threshold: Порог IoU для NMS (Non-Maximum Suppression)
+            device: Устройство для инференса (cpu/cuda/0/1/...)
         """
         self.model_path = Path(model_path)
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
         self.device = select_device(device)
 
+        # Проверка существования файла модели
         if not self.model_path.exists():
             raise FileNotFoundError(f"Файл модели не найден: {model_path}")
 
         try:
+            # Загрузка модели
             self.model = DetectMultiBackend(str(self.model_path), device=self.device, dnn=False)
             self.stride = self.model.stride
             self.names = self.model.names
             self.pt = self.model.pt
             self.img_size = 640
 
-            # Прогрев модели
+            # Прогрев модели для оптимизации производительности
             self.model.warmup(imgsz=(1, 3, self.img_size, self.img_size))
 
         except Exception as e:
@@ -157,40 +193,44 @@ class YOLODoorWindowDetector:
 
     def detect(self, img: np.ndarray, verbose: bool = False) -> YOLOResults:
         """
-        Детекция дверей и окон на изображении
-        
+        Детекция дверей и окон на изображении.
+
         Параметры:
-            img: входное изображение (BGR)
-            verbose: флаг вывода информации в консоль
-            
+            img: Входное изображение в формате BGR
+            verbose: Флаг вывода отладочной информации
+
         Возвращает:
             YOLOResults с результатами детекции
+
+        Исключения:
+            ValueError: При пустом или некорректном изображении
         """
+        # Валидация входного изображения
         if img is None or img.size == 0:
             raise ValueError("Пустое изображение")
 
         original_img = img.copy()
         h0, w0 = img.shape[:2]
 
-        # Препроцессинг
+        # Этап 1: Предобработка изображения
         img_input, ratio, pad = letterbox(img, self.img_size, stride=self.stride, auto=True)
-        img_input = img_input.transpose((2, 0, 1))[::-1]  # HWC to CHW, BGR to RGB
+        img_input = img_input.transpose((2, 0, 1))[::-1]  # HWC -> CHW, BGR -> RGB
         img_input = np.ascontiguousarray(img_input)
 
-        # Конвертация в тензор
+        # Этап 2: Преобразование в тензор PyTorch
         im = torch.from_numpy(img_input).to(self.device)
         im = im.half() if self.model.fp16 else im.float()
-        im /= 255.0
+        im /= 255.0  # Нормализация к [0, 1]
         if len(im.shape) == 3:
-            im = im[None]
+            im = im[None]  # Добавление batch dimension
 
-        # Инференс
+        # Этап 3: Инференс модели
         pred = self.model(im, augment=False, visualize=False)
 
-        # NMS
+        # Этап 4: Non-Maximum Suppression
         pred = non_max_suppression(pred, self.conf_threshold, self.iou_threshold, classes=None, agnostic=False)
 
-        # Обработка результатов
+        # Этап 5: Обработка результатов
         all_detections = []
         doors = []
         windows = []
@@ -200,7 +240,7 @@ class YOLODoorWindowDetector:
         det = pred[0]
 
         if len(det):
-            # Масштабирование bbox к исходному размеру
+            # Масштабирование координат bbox к исходному размеру изображения
             det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], (h0, w0)).round()
 
             for *xyxy, conf, cls in reversed(det):
@@ -208,19 +248,21 @@ class YOLODoorWindowDetector:
                 conf_val = float(conf)
                 class_id = int(cls)
 
-                # Валидация координат
+                # Ограничение координат размерами изображения
                 x1, y1 = max(0, x1), max(0, y1)
                 x2, y2 = min(w0, x2), min(h0, y2)
 
+                # Пропуск невалидных bbox
                 if x2 <= x1 or y2 <= y1:
                     continue
 
                 class_name = self.CLASS_NAMES.get(class_id, f"class_{class_id}")
 
-                # Создание маски из bbox
+                # Создание маски из ограничивающего прямоугольника
                 bbox_mask = np.zeros((h0, w0), dtype=np.uint8)
                 bbox_mask[y1:y2, x1:x2] = 255
 
+                # Создание объекта детекции
                 detection = YOLODetection(
                     class_id=class_id,
                     class_name=class_name,
@@ -231,6 +273,7 @@ class YOLODoorWindowDetector:
 
                 all_detections.append(detection)
 
+                # Классификация по типу объекта
                 if class_id == 0:  # Дверь
                     doors.append(detection)
                     combined_door_mask = cv2.bitwise_or(combined_door_mask, bbox_mask)
@@ -253,26 +296,27 @@ class YOLODoorWindowDetector:
                              show_masks: bool = True,
                              show_labels: bool = True) -> np.ndarray:
         """
-        Визуализация результатов детекции
-        
+        Визуализация результатов детекции на изображении.
+
         Параметры:
-            img: исходное изображение
-            results: результаты детекции
-            show_boxes: отображать ли bbox
-            show_masks: отображать ли маски
-            show_labels: отображать ли подписи
-            
+            img: Исходное изображение
+            results: Результаты детекции от метода detect()
+            show_boxes: Отображать ли ограничивающие прямоугольники
+            show_masks: Отображать ли маски объектов
+            show_labels: Отображать ли текстовые подписи
+
         Возвращает:
-            Изображение с наложенными детекциями
+            Изображение с наложенными визуализациями детекций
         """
         vis_img = img.copy()
 
+        # Цветовая схема для разных классов
         colors = {
-            0: (0, 255, 0),   # Зелёный (двери)
-            1: (255, 0, 0)    # Синий (окна)
+            0: (0, 255, 0),   # Зелёный для дверей
+            1: (255, 0, 0)    # Синий для окон
         }
 
-        # Наложение масок
+        # Наложение масок с прозрачностью
         if show_masks:
             mask_overlay = np.zeros_like(vis_img)
             for detection in results.all_detections:
@@ -280,21 +324,28 @@ class YOLODoorWindowDetector:
                     color = colors.get(detection.class_id, (128, 128, 128))
                     mask_overlay[detection.mask > 0] = color
 
-            alpha = 0.4
+            alpha = 0.4  # Прозрачность масок
             vis_img = cv2.addWeighted(vis_img, 1 - alpha, mask_overlay, alpha, 0)
 
-        # Рисование bbox и подписей
+        # Отрисовка ограничивающих прямоугольников и подписей
         for detection in results.all_detections:
             x1, y1, x2, y2 = detection.bbox
             color = colors.get(detection.class_id, (128, 128, 128))
 
+            # Отрисовка прямоугольника
             if show_boxes:
                 cv2.rectangle(vis_img, (x1, y1), (x2, y2), color, 2)
 
+            # Отрисовка подписи с фоном
             if show_labels:
                 label = f"{detection.class_name}: {detection.confidence:.2f}"
                 (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+
+                # Фон для текста
                 cv2.rectangle(vis_img, (x1, y1 - text_h - 10), (x1 + text_w + 10, y1), color, -1)
-                cv2.putText(vis_img, label, (x1 + 5, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+                # Текст
+                cv2.putText(vis_img, label, (x1 + 5, y1 - 5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         return vis_img
