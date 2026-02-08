@@ -90,19 +90,19 @@ class GeometricOpeningDetector:
                  merge_min_overlap_ratio: float = 0.1,
                  merge_parallel_overlap_ratio: float = 0.1,
                  yolo_iou_threshold: float = 0.3,
-                 adjacency_max_gap: int = 2,
-                 adjacency_min_ratio: float = 0.5,
-                 max_opening_thickness_factor: float = 4.0,
-                 min_opening_length_factor: float = 1.2,
-                 max_opening_length_factor: float = 4.0,
-                 max_opening_aspect_ratio: float = 4.0,
-                 connectivity_tolerance: int = 3,
+                 adjacency_max_gap: int = 3,
+                 adjacency_min_ratio: float = 0.6,
+                 max_opening_thickness_factor: float = 8.0,
+                 min_opening_length_factor: float = 1.0,
+                 max_opening_length_factor: float = 8.0,
+                 max_opening_aspect_ratio: float = 8.0,
+                 connectivity_tolerance: int = 2,
                  min_gap_width_m: float = 0.60,
                  max_gap_width_m: float = 0.90,
                  max_wall_touch_length_m: float = 0.35,
                  max_non_white_ratio: float = 0.25,
                  white_threshold: int = 240,
-                 third_wall_check_tolerance: int = 5):
+                 third_wall_check_tolerance: int = 3):
         """
         Инициализация детектора проёмов.
 

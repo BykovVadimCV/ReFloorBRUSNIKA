@@ -1,1062 +1,1480 @@
 """
-Система анализа планировок помещений - Экспортёр планировок - формат Blueprint3D
-Версия: 3.9
-Автор: Быков Вадим Олегович
-Дата: 01.28.2026
+Экспортёр планировок Sweet Home 3D - Полная переработка
+Версия: 6.6
+Автор: Расширение для системы анализа планировок
+Дата: 02.06.2026
 
-Форматирование и сохранение планировок в формате .blueprint3D.
+Изменения:
+1. Стены с проёмами РЕАЛЬНО ПЕРЕМЕЩАЮТСЯ для выравнивания с соседними структурными стенами
+2. Простой прямой подход: поиск ближайших стен, перемещение к их центральным линиям
+3. Финальный проход расширяет стены для проникновения в ближайшие стеновые блоки
+4. Корректное хранилище .sh3d файлов со встроенными OBJ моделями и иконками
 """
 
-import uuid
-import json
 import math
-from typing import Dict, List, Tuple, Optional, Set
+import uuid
+import zipfile
+import base64
+from typing import List, Dict, Tuple, Optional, Set
 from dataclasses import dataclass, field
 from collections import defaultdict
-from enum import IntEnum, Enum
+from enum import Enum
+from xml.etree import ElementTree as ET
+from xml.dom import minidom
 
 
 # ============================================================
-# КОНФИГУРАЦИЯ
+# РЕСУРСЫ И КОНСТАНТЫ
 # ============================================================
-
-class ItemType(IntEnum):
-    """Типы объектов в Blueprint3D"""
-    FLOOR = 1
-    WALL = 2
-    IN_WALL = 3      # Окна
-    ROOF = 4
-    WALL_FLOOR = 7   # Двери
-    ON_FLOOR = 8
-
-
-# Текстура стен по умолчанию
-WALL_TEXTURE = {
-    "url": "rooms/textures/wallmap.png",
-    "stretch": True,
-    "scale": 0
-}
-
-# 3D модели объектов
-MODELS = {
-    "window": "models/js/whitewindow.js",
-    "open_door": "models/js/open_door.js",
-}
-
-# Константа преобразования дюймов в сантиметры
-INCHES_TO_CM = 2.54
 
 
 # ============================================================
-# ГЕОМЕТРИЧЕСКИЕ ПРИМИТИВЫ (только целые числа)
+# ASSETS & CONSTANTS
 # ============================================================
 
-@dataclass(frozen=True, order=True)
-class Pt:
-    """Неизменяемая точка с целочисленными координатами."""
-    x: int
-    y: int
+DUMMY_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg=="
 
-    def dist(self, other: 'Pt') -> float:
-        """Расстояние до другой точки."""
+DOOR_OBJ_CONTENT = """# door.obj
+g sweethome3d_hinge_1_3
+v -0.40393 -0.84 0.02143
+v -0.401 -0.84 0.0285
+v -0.411 -0.84 0.0285
+v -0.411 -0.84 0.0185
+v -0.41807 -0.84 0.02143
+v -0.421 -0.84 0.0285
+v -0.41807 -0.84 0.03557
+v -0.411 -0.84 0.0385
+v -0.40393 -0.84 0.03557
+v -0.401 -0.76 0.0285
+v -0.40393 -0.76 0.02143
+v -0.411 -0.76 0.0185
+v -0.41807 -0.76 0.02143
+v -0.421 -0.76 0.0285
+v -0.41807 -0.76 0.03557
+v -0.411 -0.76 0.0385
+v -0.40393 -0.76 0.03557
+v -0.411 -0.76 0.0285
+usemtl white
+f 1 2 3
+f 4 1 3
+f 5 4 3
+f 6 5 3
+f 7 6 3
+f 8 7 3
+f 9 8 3
+f 2 9 3
+f 18 10 11
+f 18 11 12
+f 18 12 13
+f 18 13 14
+f 18 14 15
+f 18 15 16
+f 18 16 17
+f 18 17 10
+f 10 2 1
+f 11 1 4
+f 12 4 5
+f 13 5 6
+f 14 6 7
+f 15 7 8
+f 16 8 9
+f 17 9 2
+f 10 1 11
+f 11 4 12
+f 12 5 13
+f 13 6 14
+f 14 7 15
+f 15 8 16
+f 16 9 17
+f 17 2 10
+g frame
+v 0.4575 -1.02 0.0195
+v 0.4575 -1.02 -0.0755
+v 0.4575 1.065 -0.0755
+v 0.4575 1.065 0.0195
+v -0.4575 -1.02 -0.0755
+v -0.4575 -1.02 0.0195
+v -0.4575 1.065 0.0195
+v -0.4575 1.065 -0.0755
+v -0.4025 1.01 -0.0755
+v -0.4025 -1.02 -0.0755
+v 0.4025 -1.02 -0.0755
+v 0.4025 -1.02 -0.02
+v 0.4025 1.01 -0.02
+v 0.4025 1.01 -0.0755
+v -0.4135 -1.02 -0.02
+v 0.4135 1.021 0.0195
+v 0.4135 1.021 -0.02
+v -0.4135 -1.02 0.0195
+v -0.4135 1.021 0.0195
+v 0.4135 -1.02 0.0195
+v -0.4025 1.01 -0.02
+v -0.4025 -1.02 -0.02
+v -0.4135 1.021 -0.02
+v 0.4135 -1.02 -0.02
+usemtl white
+s off
+f 22 19 20 21
+f 29 30 31 32
+f 26 25 22 21
+f 41 37 36 33
+f 25 26 23 24
+f 37 41 35 34
+f 39 40 28 27
+f 24 36 37 34 38 19 22 25
+f 38 34 35 42
+f 23 26 21 20 29 32 27 28
+f 27 32 31 39
+f 33 36 24 23
+f 20 19 38 42
+f 23 28 40 33
+f 41 33 40 39
+f 30 42 31
+f 41 39 31 35
+f 31 42 35
+f 29 20 42 30
+"""
+
+WINDOW_OBJ_CONTENT = """# window85x163.obj
+g sweethome3d_hinge_1_1
+v -0.41601 2.01433 -0.00407
+v -0.41308 2.01433 0.003
+v -0.42308 2.01433 0.003
+v -0.42308 2.01433 -0.007
+v -0.43015 2.01433 -0.00407
+v -0.43308 2.01433 0.003
+v -0.43015 2.01433 0.01007
+v -0.42308 2.01433 0.013
+v -0.41601 2.01433 0.01007
+v -0.42308 2.05433 0.003
+v -0.41308 2.05433 0.003
+v -0.41601 2.05433 -0.00407
+v -0.42308 2.05433 -0.007
+v -0.43015 2.05433 -0.00407
+v -0.43308 2.05433 0.003
+v -0.43015 2.05433 0.01007
+v -0.42308 2.05433 0.013
+v -0.41601 2.05433 0.01007
+usemtl white
+f 1 2 3
+f 4 1 3
+f 5 4 3
+f 6 5 3
+f 7 6 3
+f 8 7 3
+f 9 8 3
+f 2 9 3
+f 10 11 12
+f 10 12 13
+f 10 13 14
+f 10 14 15
+f 10 15 16
+f 10 16 17
+f 10 17 18
+f 10 18 11
+f 7 16 15 6
+f 1 12 11 2
+f 2 11 18 9
+f 9 18 17 8
+f 6 15 14 5
+f 8 17 16 7
+f 5 14 13 4
+f 4 13 12 1
+g sweethome3d_opening_on_hinge_1
+v 0.415 0.53367 0.0125
+v 0.34067 0.61867 0.0125
+v -0.33933 0.61867 0.0125
+v -0.415 0.53367 0.0125
+v -0.33933 0.69667 0.0125
+v -0.33933 2.07867 0.0125
+v -0.415 2.16367 0.0125
+v 0.34067 2.07867 0.0125
+v 0.415 2.16367 0.0125
+v 0.34067 0.91067 0.0125
+v -0.33933 2.07867 -0.0475
+v 0.34067 2.07867 -0.0475
+v 0.398 2.16367 -0.0475
+v -0.398 2.16367 -0.0475
+v 0.398 0.53367 -0.0475
+v 0.34067 0.61867 -0.0475
+v 0.34067 1.78667 -0.0475
+v -0.398 0.53367 -0.0475
+v -0.33933 2.00067 -0.0475
+v -0.33933 0.61867 -0.0475
+v -0.398 0.53367 -0.00275
+v -0.415 0.53367 -0.00275
+v -0.398 2.16367 -0.00275
+v -0.415 2.16367 -0.00275
+v 0.398 2.16367 -0.00275
+v 0.415 2.16367 -0.00275
+v 0.398 0.53367 -0.00275
+v 0.415 0.53367 -0.00275
+usemtl white
+s off
+f 19 20 21 22
+f 22 21 23 24 25
+f 25 24 26 27
+f 28 20 19 27 26
+f 24 29 30 26
+f 27 44 43 31 32 41 42 25
+f 30 31 33 34 35
+f 32 36 39 41
+f 33 31 43 45
+f 29 37 38 36 32
+f 21 20 34 38
+f 36 33 45 46 19 22 40 39
+f 28 26 30 35 34 20
+f 24 23 21 38 37 29
+f 30 29 32 31
+f 38 34 33 36
+f 41 39 40 42
+f 42 40 22 25
+f 45 43 44 46
+f 46 44 27 19
+g frame
+v -0.455 0.475 -0.00421
+v -0.455 0.475 -0.27421
+v 0.455 0.475 -0.27421
+v 0.455 0.475 -0.00421
+v -0.455 2.215 -0.00421
+v -0.455 2.215 -0.27421
+v 0.455 2.215 -0.00421
+v 0.455 2.215 -0.27421
+v -0.4 2.1637 -0.00421
+v -0.4 2.1637 -0.27421
+v 0.4 2.1637 -0.27421
+v 0.4 2.1637 -0.00421
+v -0.4 0.5337 -0.00421
+v -0.4 0.5337 -0.27421
+v 0.4 0.5337 -0.27421
+v 0.4 0.5337 -0.00421
+usemtl white
+s off
+f 47 48 49 50
+f 51 52 48 47
+f 53 54 52 51
+f 55 56 57 58
+f 57 56 52 54
+f 55 59 60 56
+f 53 50 49 54
+f 49 48 60 61
+f 61 60 59 62
+f 57 61 62 58
+f 55 58 53 51
+f 58 62 50 53
+f 55 51 47 59
+f 54 49 61 57
+f 47 50 62 59
+f 48 52 56 60
+g sweethome3d_window_pane_on_hinge_1
+v -0.34433 2.08367 -0.0125
+v -0.34433 0.61367 -0.0125
+v 0.34567 0.61367 -0.0125
+v 0.34567 2.08367 -0.0125
+v -0.34433 2.08367 -0.0225
+v -0.34433 0.61367 -0.0225
+v 0.34567 0.61367 -0.0225
+v 0.34567 2.08367 -0.0225
+usemtl flltgrey
+s off
+f 63 64 65 66
+f 67 68 64 63
+f 68 69 65 64
+f 70 67 63 66
+f 70 69 68 67
+f 69 70 66 65
+"""
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+DEFAULT_WALL_HEIGHT = 243.84
+DEFAULT_WALL_THICKNESS = 15.0
+DEFAULT_DOOR_WIDTH = 91.44
+DEFAULT_DOOR_HEIGHT = 208.5975
+DEFAULT_WINDOW_WIDTH = 91.1225
+DEFAULT_WINDOW_HEIGHT = 173.98999
+DEFAULT_WINDOW_ELEVATION = 46.989998
+
+SNAP_TOLERANCE = 15.0
+PARENT_WALL_SEARCH_TOLERANCE = 50.0
+WALL_EXTENSION_FACTOR = 0.05
+WALL_OVERLAP = 2.0
+BOX_PROXIMITY_TOLERANCE = 20.0
+BOX_EXTENSION_AMOUNT = 5.0
+CENTERLINE_SEARCH_RADIUS = 150.0
+OPENING_TO_WALL_RATIO = 0.85
+
+
+class OpeningType(Enum):
+    DOOR = "door"
+    WINDOW = "window"
+    GAP = "gap"
+
+
+# ============================================================
+# DATA STRUCTURES
+# ============================================================
+
+@dataclass
+class Point:
+    """2D точка на планировке"""
+    x: float
+    y: float
+
+    def distance_to(self, other: 'Point') -> float:
         return math.hypot(self.x - other.x, self.y - other.y)
+
+    def __hash__(self):
+        return hash((round(self.x, 2), round(self.y, 2)))
+
+    def __eq__(self, other):
+        if not isinstance(other, Point):
+            return False
+        return abs(self.x - other.x) < 0.01 and abs(self.y - other.y) < 0.01
+
+    def copy(self) -> 'Point':
+        return Point(self.x, self.y)
+
+    def __repr__(self):
+        return f"Point({self.x:.2f}, {self.y:.2f})"
 
 
 @dataclass
-class Rect:
-    """Прямоугольник стены с целочисленными координатами."""
-    x1: int
-    y1: int
-    x2: int
-    y2: int
-    rect_id: int = 0
-
-    def __post_init__(self):
-        """Нормализация координат (x1 < x2, y1 < y2)."""
-        if self.x1 > self.x2:
-            self.x1, self.x2 = self.x2, self.x1
-        if self.y1 > self.y2:
-            self.y1, self.y2 = self.y2, self.y1
-
-    @property
-    def width(self) -> int:
-        """Ширина прямоугольника."""
-        return self.x2 - self.x1
+class Wall:
+    """
+    Представление стены для экспорта Sweet Home 3D.
+    Содержит геометрические параметры, связи с другими стенами и метаданные.
+    """
+    start: Point
+    end: Point
+    thickness: float
+    height: float = DEFAULT_WALL_HEIGHT
+    wall_id: str = field(default_factory=lambda: f"wall-{uuid.uuid4()}")
+    wall_at_start: Optional[str] = None
+    wall_at_end: Optional[str] = None
+    pattern: str = "hatchUp"
+    is_structural: bool = True
 
     @property
-    def height(self) -> int:
-        """Высота прямоугольника."""
-        return self.y2 - self.y1
+    def length(self) -> float:
+        return self.start.distance_to(self.end)
 
-    def contains(self, x: int, y: int) -> bool:
-        """Проверка, находится ли точка строго внутри (не на границе)."""
-        return self.x1 < x < self.x2 and self.y1 < y < self.y2
+    @property
+    def midpoint(self) -> Point:
+        return Point((self.start.x + self.end.x) / 2, (self.start.y + self.end.y) / 2)
 
-    def get_edges(self) -> List[Tuple[Pt, Pt, str]]:
-        """Получить 4 грани как (точка1, точка2, сторона)."""
-        return [
-            (Pt(self.x1, self.y1), Pt(self.x2, self.y1), 'top'),
-            (Pt(self.x1, self.y2), Pt(self.x2, self.y2), 'bottom'),
-            (Pt(self.x1, self.y1), Pt(self.x1, self.y2), 'left'),
-            (Pt(self.x2, self.y1), Pt(self.x2, self.y2), 'right'),
-        ]
+    @property
+    def angle(self) -> float:
+        return math.atan2(self.end.y - self.start.y, self.end.x - self.start.x)
+
+    @property
+    def is_horizontal(self) -> bool:
+        return abs(self.end.y - self.start.y) < abs(self.end.x - self.start.x)
+
+    def direction_vector(self) -> Tuple[float, float]:
+        length = self.length
+        if length < 0.001:
+            return (1.0, 0.0)
+        return ((self.end.x - self.start.x) / length, (self.end.y - self.start.y) / length)
+
+    def perpendicular_distance(self, point: Point) -> float:
+        dx = self.end.x - self.start.x
+        dy = self.end.y - self.start.y
+        length = self.length
+        if length < 0.001:
+            return point.distance_to(self.start)
+        return abs(dy * point.x - dx * point.y + self.end.x * self.start.y - self.end.y * self.start.x) / length
+
+    def project_point(self, point: Point) -> Tuple[float, Point]:
+        length_sq = self.length ** 2
+        if length_sq < 0.001:
+            return (0.0, self.start.copy())
+
+        t = ((point.x - self.start.x) * (self.end.x - self.start.x) +
+             (point.y - self.start.y) * (self.end.y - self.start.y)) / length_sq
+
+        proj = Point(
+            self.start.x + t * (self.end.x - self.start.x),
+            self.start.y + t * (self.end.y - self.start.y)
+        )
+        return (t, proj)
+
+    def get_min_x(self) -> float:
+        return min(self.start.x, self.end.x)
+
+    def get_max_x(self) -> float:
+        return max(self.start.x, self.end.x)
+
+    def get_min_y(self) -> float:
+        return min(self.start.y, self.end.y)
+
+    def get_max_y(self) -> float:
+        return max(self.start.y, self.end.y)
+
+    def get_centerline_y(self) -> float:
+        return (self.start.y + self.end.y) / 2.0
+
+    def get_centerline_x(self) -> float:
+        return (self.start.x + self.end.x) / 2.0
 
 
 @dataclass
 class Opening:
-    """Проём двери/окна."""
-    x1: int
-    y1: int
-    x2: int
-    y2: int
-    opening_type: str = 'unknown'
-
-    @property
-    def is_horizontal(self) -> bool:
-        """Проверка горизонтальной ориентации."""
-        return abs(self.x2 - self.x1) >= abs(self.y2 - self.y1)
-
-    @property
-    def center(self) -> Tuple[float, float]:
-        """Центр проёма."""
-        return ((self.x1 + self.x2) / 2, (self.y1 + self.y2) / 2)
-
-    @property
-    def size(self) -> int:
-        """Размер проёма (максимальное измерение)."""
-        return max(abs(self.x2 - self.x1), abs(self.y2 - self.y1))
-
-
-# ============================================================
-# КООРДИНАТНАЯ СЕТКА
-# ============================================================
-
-class Grid:
     """
-    Целочисленная координатная сетка.
-    Выполняет привязку координат и отслеживает все валидные X/Y линии.
+    Представление проёма (дверь или окно) в Sweet Home 3D.
+    Включает позицию, размеры, тип и связь с родительской стеной.
     """
+    opening_type: OpeningType
+    center: Point
+    width: float
+    height: float
+    depth: float
+    angle: float
+    elevation: float = 0.0
+    parent_wall_id: Optional[str] = None
+    opening_id: str = field(default_factory=lambda: f"opening-{uuid.uuid4()}")
+    wall_thickness: float = 0.5
+    wall_distance: float = 0.0
+    model: str = ""
+    icon: str = ""
 
-    def __init__(self, snap_dist: int = 5):
-        """
-        Инициализация сетки.
 
-        Параметры:
-            snap_dist: Максимальное расстояние для привязки координат
-        """
-        self.snap_dist = snap_dist
-        self.xs: List[int] = []
-        self.ys: List[int] = []
-
-    def build(self, rects: List[Rect]):
-        """Построение сетки из углов прямоугольников."""
-        x_set = set()
-        y_set = set()
-
-        for r in rects:
-            x_set.add(r.x1)
-            x_set.add(r.x2)
-            y_set.add(r.y1)
-            y_set.add(r.y2)
-
-        self.xs = self._merge(sorted(x_set))
-        self.ys = self._merge(sorted(y_set))
-
-    def _merge(self, coords: List[int]) -> List[int]:
-        """Объединение координат в пределах snap_dist."""
-        if not coords:
-            return []
-        result = [coords[0]]
-        for c in coords[1:]:
-            if c - result[-1] <= self.snap_dist:
-                # Объединяем близкие координаты
-                result[-1] = (result[-1] + c) // 2
-            else:
-                result.append(c)
-        return result
-
-    def snap(self, val: int, coords: List[int]) -> int:
-        """Привязка к ближайшей координате."""
-        if not coords:
-            return val
-        best = val
-        best_d = self.snap_dist + 1
-        for c in coords:
-            d = abs(c - val)
-            if d < best_d:
-                best_d = d
-                best = c
-        return best if best_d <= self.snap_dist else val
-
-    def snap_x(self, x: int) -> int:
-        """Привязка X координаты."""
-        return self.snap(x, self.xs)
-
-    def snap_y(self, y: int) -> int:
-        """Привязка Y координаты."""
-        return self.snap(y, self.ys)
-
-    def snap_pt(self, p: Pt) -> Pt:
-        """Привязка точки к сетке."""
-        return Pt(self.snap_x(p.x), self.snap_y(p.y))
-
-    def snap_rect(self, r: Rect) -> Rect:
-        """Привязка прямоугольника к сетке."""
-        return Rect(
-            self.snap_x(r.x1), self.snap_y(r.y1),
-            self.snap_x(r.x2), self.snap_y(r.y2),
-            r.rect_id
-        )
+@dataclass
+class Room:
+    points: List[Point]
+    room_id: str = field(default_factory=lambda: f"room-{uuid.uuid4()}")
+    name: str = "Room"
 
 
 # ============================================================
-# КОЛЛЕКЦИЯ СЕГМЕНТОВ (с объединением и пересечением)
+# UTILITIES
 # ============================================================
 
-class SegmentCollection:
-    """
-    Коллекция выровненных по осям сегментов с функциями:
-    - Автоматическое объединение перекрывающихся сегментов
-    - Детекция пересечений между горизонтальными и вертикальными линиями
-    - Детекция проёмов
-    """
-
-    def __init__(self):
-        # Горизонтальные: y -> список (x_начало, x_конец)
-        self.h_segs: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
-        # Вертикальные: x -> список (y_начало, y_конец)
-        self.v_segs: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
-
-    def add_h(self, y: int, x1: int, x2: int):
-        """Добавление горизонтального сегмента."""
-        if x1 > x2:
-            x1, x2 = x2, x1
-        if x1 == x2:
-            return
-        self.h_segs[y].append((x1, x2))
-
-    def add_v(self, x: int, y1: int, y2: int):
-        """Добавление вертикального сегмента."""
-        if y1 > y2:
-            y1, y2 = y2, y1
-        if y1 == y2:
-            return
-        self.v_segs[x].append((y1, y2))
-
-    def merge_all(self):
-        """Объединение перекрывающихся сегментов на каждой линии."""
-        for y in self.h_segs:
-            self.h_segs[y] = self._merge_segments(self.h_segs[y])
-        for x in self.v_segs:
-            self.v_segs[x] = self._merge_segments(self.v_segs[x])
-
-    def _merge_segments(self, segs: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-        """Объединение перекрывающихся/смежных сегментов."""
-        if len(segs) <= 1:
-            return segs
-        segs = sorted(segs)
-        result = [segs[0]]
-        for s, e in segs[1:]:
-            ls, le = result[-1]
-            if s <= le + 1:  # Перекрытие или смежность
-                result[-1] = (ls, max(le, e))
-            else:
-                result.append((s, e))
-        return result
-
-    def find_intersections(self) -> Set[Pt]:
-        """Поиск всех точек пересечения горизонтальных и вертикальных сегментов."""
-        intersections = set()
-
-        for y, h_list in self.h_segs.items():
-            for x, v_list in self.v_segs.items():
-                # Проверка пересечения любого H сегмента на y с x
-                for hx1, hx2 in h_list:
-                    if hx1 <= x <= hx2:
-                        # Проверка пересечения любого V сегмента на x с y
-                        for vy1, vy2 in v_list:
-                            if vy1 <= y <= vy2:
-                                intersections.add(Pt(x, y))
-
-        return intersections
-
-    def extend_to_intersections(self, intersections: Set[Pt], max_extend: int = 10):
-        """
-        Расширение концов сегментов до ближайших пересечений.
-        Исправляет стены, которые почти достигают, но не соединяются.
-        """
-        # Расширение горизонтальных сегментов
-        for y in list(self.h_segs.keys()):
-            new_segs = []
-            for x1, x2 in self.h_segs[y]:
-                # Проверка пересечений около x1 и x2
-                for pt in intersections:
-                    if pt.y == y:
-                        if 0 < x1 - pt.x <= max_extend:
-                            x1 = pt.x
-                        if 0 < pt.x - x2 <= max_extend:
-                            x2 = pt.x
-                new_segs.append((x1, x2))
-            self.h_segs[y] = self._merge_segments(new_segs)
-
-        # Расширение вертикальных сегментов
-        for x in list(self.v_segs.keys()):
-            new_segs = []
-            for y1, y2 in self.v_segs[x]:
-                for pt in intersections:
-                    if pt.x == x:
-                        if 0 < y1 - pt.y <= max_extend:
-                            y1 = pt.y
-                        if 0 < pt.y - y2 <= max_extend:
-                            y2 = pt.y
-                new_segs.append((y1, y2))
-            self.v_segs[x] = self._merge_segments(new_segs)
-
-    def split_at_intersections(self, intersections: Set[Pt]):
-        """
-        Разделение сегментов в точках пересечения.
-        Создаёт правильные угловые вершины.
-        """
-        # Разделение горизонтальных
-        for y in list(self.h_segs.keys()):
-            x_splits = sorted([pt.x for pt in intersections if pt.y == y])
-            new_segs = []
-            for x1, x2 in self.h_segs[y]:
-                # Поиск точек разделения внутри сегмента
-                splits = [x for x in x_splits if x1 < x < x2]
-                if not splits:
-                    new_segs.append((x1, x2))
-                else:
-                    # Разделение сегмента
-                    prev = x1
-                    for sx in splits:
-                        if prev < sx:
-                            new_segs.append((prev, sx))
-                        prev = sx
-                    if prev < x2:
-                        new_segs.append((prev, x2))
-            self.h_segs[y] = new_segs
-
-        # Разделение вертикальных
-        for x in list(self.v_segs.keys()):
-            y_splits = sorted([pt.y for pt in intersections if pt.x == x])
-            new_segs = []
-            for y1, y2 in self.v_segs[x]:
-                splits = [y for y in y_splits if y1 < y < y2]
-                if not splits:
-                    new_segs.append((y1, y2))
-                else:
-                    prev = y1
-                    for sy in splits:
-                        if prev < sy:
-                            new_segs.append((prev, sy))
-                        prev = sy
-                    if prev < y2:
-                        new_segs.append((prev, y2))
-            self.v_segs[x] = new_segs
-
-    def get_gaps(self, min_gap: int = 15, max_gap: int = 300) -> List[Opening]:
-        """Поиск проёмов в линиях стен."""
-        gaps = []
-
-        # Проёмы в горизонтальных линиях
-        for y, segs in self.h_segs.items():
-            for i in range(len(segs) - 1):
-                gap_start = segs[i][1]
-                gap_end = segs[i + 1][0]
-                if min_gap <= gap_end - gap_start <= max_gap:
-                    gaps.append(Opening(gap_start, y, gap_end, y))
-
-        # Проёмы в вертикальных линиях
-        for x, segs in self.v_segs.items():
-            for i in range(len(segs) - 1):
-                gap_start = segs[i][1]
-                gap_end = segs[i + 1][0]
-                if min_gap <= gap_end - gap_start <= max_gap:
-                    gaps.append(Opening(x, gap_start, x, gap_end))
-
-        return gaps
-
-    def get_all_corners(self) -> Set[Pt]:
-        """Получение всех конечных точек сегментов как углов."""
-        corners = set()
-        for y, segs in self.h_segs.items():
-            for x1, x2 in segs:
-                corners.add(Pt(x1, y))
-                corners.add(Pt(x2, y))
-        for x, segs in self.v_segs.items():
-            for y1, y2 in segs:
-                corners.add(Pt(x, y1))
-                corners.add(Pt(x, y2))
-        return corners
-
-    def stats(self) -> Tuple[int, int]:
-        """Возвращает (кол-во горизонтальных, кол-во вертикальных) сегментов."""
-        nh = sum(len(segs) for segs in self.h_segs.values())
-        nv = sum(len(segs) for segs in self.v_segs.values())
-        return nh, nv
+def parse_rectangle(rect: Dict) -> Tuple[float, float, float, float]:
+    if all(k in rect for k in ['x1', 'y1', 'x2', 'y2']):
+        return rect['x1'], rect['y1'], rect['x2'], rect['y2']
+    elif all(k in rect for k in ['x', 'y', 'width', 'height']):
+        return rect['x'], rect['y'], rect['x'] + rect['width'], rect['y'] + rect['height']
+    elif all(k in rect for k in ['x', 'y', 'w', 'h']):
+        return rect['x'], rect['y'], rect['x'] + rect['w'], rect['y'] + rect['h']
+    else:
+        raise ValueError(f"Unknown rectangle format: {rect.keys()}")
 
 
 # ============================================================
-# ЭКСТРАКТОР ВНЕШНИХ СТЕН
+# STRUCTURAL WALL CONVERTER
 # ============================================================
 
-class ExternalWallExtractor:
-    """
-    Извлечение внешних (обращённых к комнате) стен.
-    Устраняет внутренние стены, скрытые в массе стен.
-    """
+class StructuralWallConverter:
+    def __init__(self, pixels_to_cm: float = 2.54, min_thickness: float = 5.0):
+        self.pixels_to_cm = pixels_to_cm
+        self.min_thickness = min_thickness
 
-    def __init__(self, grid: Grid, test_offset: int = 2):
-        """
-        Инициализация экстрактора.
-
-        Параметры:
-            grid: Координатная сетка
-            test_offset: Смещение для тестовой точки
-        """
-        self.grid = grid
-        self.test_offset = test_offset
-        self.rects: List[Rect] = []
-        self.segments = SegmentCollection()
-
-    def add_rect(self, r: Rect):
-        """Добавление прямоугольника (привязанного к сетке)."""
-        self.rects.append(self.grid.snap_rect(r))
-
-    def _is_external(self, p1: Pt, p2: Pt, side: str, source: Rect) -> bool:
-        """Проверка, обращена ли грань наружу."""
-        mx = (p1.x + p2.x) // 2
-        my = (p1.y + p2.y) // 2
-
-        # Тестовая точка снаружи грани
-        if side == 'top':
-            tx, ty = mx, my - self.test_offset
-        elif side == 'bottom':
-            tx, ty = mx, my + self.test_offset
-        elif side == 'left':
-            tx, ty = mx - self.test_offset, my
-        else:  # right
-            tx, ty = mx + self.test_offset, my
-
-        # Проверка, находится ли точка внутри другого прямоугольника
-        for r in self.rects:
-            if r.rect_id == source.rect_id:
-                continue
-            if r.contains(tx, ty):
-                return False
-        return True
-
-    def extract(self) -> SegmentCollection:
-        """Извлечение внешних стен."""
-        ext_count = 0
-        int_count = 0
-
-        for rect in self.rects:
-            for p1, p2, side in rect.get_edges():
-                if self._is_external(p1, p2, side, rect):
-                    if side in ('top', 'bottom'):
-                        self.segments.add_h(p1.y, p1.x, p2.x)
-                    else:
-                        self.segments.add_v(p1.x, p1.y, p2.y)
-                    ext_count += 1
-                else:
-                    int_count += 1
-
-        # Объединение перекрывающихся сегментов
-        self.segments.merge_all()
-
-        return self.segments
-
-
-# ============================================================
-# ГРАФ УГЛОВ
-# ============================================================
-
-class CornerGraph:
-    """Граф углов и стен."""
-
-    def __init__(self):
-        self.corners: Dict[Pt, int] = {}  # Точка -> id
-        self.corner_pts: Dict[int, Pt] = {}  # id -> Точка
-        self._next_id = 0
-
-        self.walls: List[Tuple[int, int]] = []
-        self._wall_set: Set[Tuple[int, int]] = set()
-
-    def get_corner(self, p: Pt) -> int:
-        """Получение или создание угла."""
-        if p in self.corners:
-            return self.corners[p]
-        cid = self._next_id
-        self._next_id += 1
-        self.corners[p] = cid
-        self.corner_pts[cid] = p
-        return cid
-
-    def add_wall(self, p1: Pt, p2: Pt) -> bool:
-        """Добавление стены между точками."""
-        c1 = self.get_corner(p1)
-        c2 = self.get_corner(p2)
-        if c1 == c2:
-            return False
-        key = (min(c1, c2), max(c1, c2))
-        if key in self._wall_set:
-            return False
-        self._wall_set.add(key)
-        self.walls.append((c1, c2))
-        return True
-
-    def build_from_segments(self, segs: SegmentCollection):
-        """Построение графа из коллекции сегментов."""
-        for y, seg_list in segs.h_segs.items():
-            for x1, x2 in seg_list:
-                self.add_wall(Pt(x1, y), Pt(x2, y))
-
-        for x, seg_list in segs.v_segs.items():
-            for y1, y2 in seg_list:
-                self.add_wall(Pt(x, y1), Pt(x, y2))
-
-
-# ============================================================
-# КЛАССИФИКАТОР ПРОЁМОВ
-# ============================================================
-
-class OpeningClassifier:
-    """Классификация проёмов на двери и окна."""
-
-    @staticmethod
-    def classify(gaps: List[Opening],
-                 yolo_doors: List = None,
-                 yolo_windows: List = None) -> List[Opening]:
-        """
-        Классификация проёмов на основе YOLO детекций.
-
-        Параметры:
-            gaps: Список обнаруженных проёмов
-            yolo_doors: Список дверей от YOLO
-            yolo_windows: Список окон от YOLO
-        """
-
-        def iou(b1, b2):
-            """Расчёт Intersection over Union для двух bbox."""
-            x1 = max(b1[0], b2[0])
-            y1 = max(b1[1], b2[1])
-            x2 = min(b1[2], b2[2])
-            y2 = min(b1[3], b2[3])
-            if x2 <= x1 or y2 <= y1:
-                return 0.0
-            inter = (x2 - x1) * (y2 - y1)
-            a1 = max(1, (b1[2] - b1[0]) * (b1[3] - b1[1]))
-            a2 = max(1, (b2[2] - b2[0]) * (b2[3] - b2[1]))
-            return inter / (a1 + a2 - inter)
-
-        for gap in gaps:
-            # Расширение для сопоставления
-            box = (gap.x1 - 20, gap.y1 - 20, gap.x2 + 20, gap.y2 + 20)
-
-            max_door = 0.0
-            max_win = 0.0
-
-            if yolo_doors:
-                for d in yolo_doors:
-                    bbox = d if isinstance(d, (list, tuple)) else d[:4]
-                    max_door = max(max_door, iou(box, tuple(bbox)))
-
-            if yolo_windows:
-                for w in yolo_windows:
-                    bbox = w if isinstance(w, (list, tuple)) else w[:4]
-                    max_win = max(max_win, iou(box, tuple(bbox)))
-
-            if max_door > 0.05 or max_door > max_win:
-                gap.opening_type = 'door'
-            elif max_win > 0.05:
-                gap.opening_type = 'window'
-
-        return gaps
-
-
-# ============================================================
-# ЭКСПОРТЁР BLUEPRINT3D
-# ============================================================
-
-class Blueprint3DExporter:
-    """Экспорт в формат Blueprint3D."""
-
-    def __init__(self,
-                 px_to_cm: float = 1.0,
-                 wall_height: float = 300.0,
-                 window_width_in: float = 48.0,
-                 door_width_in: float = 65.0):
-        """
-        Инициализация экспортёра.
-
-        Параметры:
-            px_to_cm: Коэффициент преобразования пикселей в сантиметры
-            wall_height: Высота стен в сантиметрах
-            window_width_in: Ширина окна по умолчанию в дюймах
-            door_width_in: Ширина двери по умолчанию в дюймах
-        """
-        self.px_to_cm = px_to_cm
-        self.wall_height = wall_height
-        self.window_width = window_width_in
-        self.door_width = door_width_in
-        self.graph: Optional[CornerGraph] = None
-        self.items: List[Dict] = []
-
-    def set_graph(self, g: CornerGraph):
-        """Установка графа углов и стен."""
-        self.graph = g
-
-    def _cm(self, x: int, y: int) -> Tuple[float, float]:
-        """Преобразование координат в сантиметры."""
-        return (x * self.px_to_cm, y * self.px_to_cm)
-
-    def add_window(self, op: Opening):
-        """Добавление окна."""
-        cx, cy = op.center
-        cx_cm, cy_cm = self._cm(int(cx), int(cy))
-
-        rotation = 0.0 if op.is_horizontal else math.pi / 2
-
-        gap_cm = op.size * self.px_to_cm
-        model_cm = self.window_width * INCHES_TO_CM
-        scale = max(0.4, min(2.5, gap_cm / model_cm)) if model_cm > 0 else 1.0
-
-        self.items.append({
-            "item_name": "Window",
-            "item_type": int(ItemType.IN_WALL),
-            "model_url": MODELS["window"],
-            "xpos": round(cx_cm, 2),
-            "ypos": round(self.wall_height * 0.55, 2),
-            "zpos": round(cy_cm, 2),
-            "rotation": round(rotation, 4),
-            "scale_x": round(scale, 3),
-            "scale_y": 1.0,
-            "scale_z": 1.0,
-            "fixed": False
-        })
-
-    def add_door(self, op: Opening):
-        """Добавление двери."""
-        cx, cy = op.center
-        cx_cm, cy_cm = self._cm(int(cx), int(cy))
-
-        # Дверь: поворот на 90° от окна (перпендикулярно стене)
-        rotation = math.pi / 2 if op.is_horizontal else 0.0
-
-        gap_cm = op.size * self.px_to_cm
-        model_cm = self.door_width * INCHES_TO_CM
-        scale = max(0.4, min(2.5, gap_cm / model_cm)) if model_cm > 0 else 1.0
-
-        self.items.append({
-            "item_name": "Open Door",
-            "item_type": int(ItemType.WALL_FLOOR),
-            "model_url": MODELS["open_door"],
-            "xpos": round(cx_cm, 2),
-            "ypos": 0.0,
-            "zpos": round(cy_cm, 2),
-            "rotation": round(rotation, 4),
-            "scale_x": round(scale, 3),
-            "scale_y": 1.0,
-            "scale_z": 1.0,
-            "fixed": False
-        })
-
-    def export(self) -> Dict:
-        """Экспорт в формат Blueprint3D."""
-        if not self.graph:
-            raise ValueError("Граф не установлен")
-
-        # Генерация UUID для углов
-        uuids = {cid: str(uuid.uuid4()) for cid in self.graph.corner_pts}
-
-        # Углы
-        corners = {}
-        for cid, pt in self.graph.corner_pts.items():
-            x_cm, y_cm = self._cm(pt.x, pt.y)
-            corners[uuids[cid]] = {
-                "x": round(x_cm, 2),
-                "y": round(y_cm, 2),
-                "elevation": 0.0
-            }
-
-        # Стены
+    def convert(self, rectangles: List[Dict]) -> List[Wall]:
         walls = []
-        for c1, c2 in self.graph.walls:
-            walls.append({
-                "corner1": uuids[c1],
-                "corner2": uuids[c2],
-                "frontTexture": dict(WALL_TEXTURE),
-                "backTexture": dict(WALL_TEXTURE)
-            })
 
-        return {
-            "floorplan": {
-                "corners": corners,
-                "walls": walls,
-                "rooms": {},
-                "wallTextures": [],
-                "floorTextures": {},
-                "newFloorTextures": {}
-            },
-            "items": self.items
-        }
+        for rect in rectangles:
+            x1, y1, x2, y2 = parse_rectangle(rect)
+            x1 *= self.pixels_to_cm
+            y1 *= self.pixels_to_cm
+            x2 *= self.pixels_to_cm
+            y2 *= self.pixels_to_cm
 
-    def stats(self) -> Dict:
-        """Статистика экспорта."""
-        wins = sum(1 for i in self.items if i['item_type'] == ItemType.IN_WALL)
-        doors = sum(1 for i in self.items if i['item_type'] == ItemType.WALL_FLOOR)
-        return {
-            'corners': len(self.graph.corner_pts) if self.graph else 0,
-            'walls': len(self.graph.walls) if self.graph else 0,
-            'windows': wins,
-            'doors': doors
-        }
+            width = abs(x2 - x1)
+            height = abs(y2 - y1)
+
+            if width >= height:
+                thickness = max(height, self.min_thickness)
+                center_y = (y1 + y2) / 2
+                start = Point(min(x1, x2), center_y)
+                end = Point(max(x1, x2), center_y)
+            else:
+                thickness = max(width, self.min_thickness)
+                center_x = (x1 + x2) / 2
+                start = Point(center_x, min(y1, y2))
+                end = Point(center_x, max(y1, y2))
+
+            wall = Wall(
+                start=start,
+                end=end,
+                thickness=thickness,
+                is_structural=True
+            )
+            walls.append(wall)
+
+        return walls
 
 
 # ============================================================
-# ПОСТРОИТЕЛЬ ПЛАНИРОВКИ
+# THICKNESS NORMALIZER
 # ============================================================
 
-class FloorplanBuilder:
-    """
-    Главный построитель с правильной обработкой пересечений.
+class ThicknessNormalizer:
+    def __init__(self, structural_walls: List[Wall], search_radius: float = 100.0):
+        self.structural_walls = [w for w in structural_walls if w.is_structural]
+        self.search_radius = search_radius
 
-    Алгоритм:
-    1. Построение сетки из прямоугольников
-    2. Привязка прямоугольников
-    3. Извлечение внешних стен
-    4. Объединение перекрывающихся сегментов
-    5. Поиск всех H/V пересечений
-    6. Расширение стен до пересечений
-    7. Разделение стен в пересечениях (создание углов)
-    8. Детекция проёмов
-    9. Классификация проёмов
-    10. Построение графа
-    11. Соединение проёмов стенами
-    12. Экспорт
-    """
+    def get_thickness_for_segment(self, start: Point, end: Point) -> float:
+        midpoint = Point((start.x + end.x) / 2, (start.y + end.y) / 2)
+        is_horizontal = abs(end.x - start.x) > abs(end.y - start.y)
 
-    def __init__(self,
-                 wall_height_cm: float = 300.0,
-                 snap_distance_px: int = 5,
-                 extend_distance_px: int = 15,
-                 default_window_width_inches: float = 48.0,
-                 default_door_width_inches: float = 65.0,
-                 min_gap_px: int = 15,
-                 max_gap_px: int = 300,
-                 # Совместимость с предыдущими версиями
-                 corner_snap_tolerance_px: float = None,
-                 line_merge_tolerance_px: float = None,
-                 min_wall_length_cm: float = None,
-                 skip_bbox_check: bool = True):
-        """
-        Инициализация построителя.
-
-        Параметры:
-            wall_height_cm: Высота стен в сантиметрах
-            snap_distance_px: Расстояние привязки в пикселях
-            extend_distance_px: Расстояние расширения в пикселях
-            default_window_width_inches: Ширина окна по умолчанию в дюймах
-            default_door_width_inches: Ширина двери по умолчанию в дюймах
-            min_gap_px: Минимальный размер проёма в пикселях
-            max_gap_px: Максимальный размер проёма в пикселях
-        """
-        self.wall_height = wall_height_cm
-        self.snap_dist = snap_distance_px
-        self.extend_dist = extend_distance_px
-        self.window_width = default_window_width_inches
-        self.door_width = default_door_width_inches
-        self.min_gap = min_gap_px
-        self.max_gap = max_gap_px
-
-        self.grid: Optional[Grid] = None
-        self.segments: Optional[SegmentCollection] = None
-        self.graph: Optional[CornerGraph] = None
-        self.exporter: Optional[Blueprint3DExporter] = None
-
-    def build(self,
-              rectangles: List,
-              pixels_to_cm: float = 1.0,
-              algo_windows: List = None,
-              yolo_doors: List = None,
-              yolo_windows: List = None,
-              pre_detected_openings: List = None) -> Dict:
-        """
-        Построение планировки и экспорт в Blueprint3D.
-
-        Параметры:
-            rectangles: Список прямоугольников стен
-            pixels_to_cm: Масштаб в см/пиксель
-            algo_windows: Окна от алгоритмической детекции
-            yolo_doors: Двери от YOLO
-            yolo_windows: Окна от YOLO
-            pre_detected_openings: Предварительно обнаруженные проёмы
-        """
-        # Преобразование входных данных
-        rects = self._convert_rects(rectangles)
-
-        # Шаг 1: Построение координатной сетки
-        self.grid = Grid(self.snap_dist)
-        self.grid.build(rects)
-
-        # Шаг 2: Извлечение внешних стен
-        extractor = ExternalWallExtractor(self.grid)
-        for r in rects:
-            extractor.add_rect(r)
-        self.segments = extractor.extract()
-
-        # Шаг 3: Поиск пересечений
-        intersections = self.segments.find_intersections()
-
-        # Шаг 4: Расширение стен до пересечений
-        self.segments.extend_to_intersections(intersections, self.extend_dist)
-
-        # Шаг 5: Повторное объединение после расширения
-        self.segments.merge_all()
-
-        # Шаг 6: Повторный поиск пересечений после расширения
-        intersections = self.segments.find_intersections()
-
-        # Шаг 7: Разделение в пересечениях
-        self.segments.split_at_intersections(intersections)
-
-        # Шаг 8: Детекция проёмов
-        if pre_detected_openings:
-            gaps = self._convert_openings(pre_detected_openings)
-        else:
-            gaps = self.segments.get_gaps(self.min_gap, self.max_gap)
-
-        # Шаг 9: Классификация проёмов
-        gaps = OpeningClassifier.classify(gaps, yolo_doors, yolo_windows)
-
-        # Шаг 10: Соединение проёмов (добавление сегментов в проёмах)
-        for gap in gaps:
-            if gap.is_horizontal:
-                y = (gap.y1 + gap.y2) // 2
-                self.segments.add_h(y, gap.x1, gap.x2)
-            else:
-                x = (gap.x1 + gap.x2) // 2
-                self.segments.add_v(x, gap.y1, gap.y2)
-
-        # Шаг 11: Построение графа
-        self.graph = CornerGraph()
-        self.graph.build_from_segments(self.segments)
-
-        # Шаг 12: Настройка экспортёра
-        self.exporter = Blueprint3DExporter(
-            px_to_cm=pixels_to_cm,
-            wall_height=self.wall_height,
-            window_width_in=self.window_width,
-            door_width_in=self.door_width
-        )
-        self.exporter.set_graph(self.graph)
-
-        # Шаг 13: Добавление объектов (двери/окна)
-        for gap in gaps:
-            if gap.opening_type == 'door':
-                self.exporter.add_door(gap)
-            elif gap.opening_type == 'window':
-                self.exporter.add_window(gap)
-
-        # Добавление алгоритмических окон
-        if algo_windows:
-            self._add_algo_windows(algo_windows, gaps)
-
-        # Добавление YOLO дверей
-        if yolo_doors:
-            self._add_yolo_doors(yolo_doors, gaps)
-
-        return self.exporter.export()
-
-    def _convert_rects(self, rectangles: List) -> List[Rect]:
-        """Преобразование входных прямоугольников в внутренний формат."""
-        result = []
-        for i, r in enumerate(rectangles):
-            if hasattr(r, 'x1'):
-                result.append(Rect(int(r.x1), int(r.y1), int(r.x2), int(r.y2), i))
-            elif isinstance(r, dict):
-                x1 = int(r.get('x1', r.get('x', 0)))
-                y1 = int(r.get('y1', r.get('y', 0)))
-                x2 = int(r.get('x2', x1 + r.get('width', 0)))
-                y2 = int(r.get('y2', y1 + r.get('height', 0)))
-                result.append(Rect(x1, y1, x2, y2, i))
-        return result
-
-    def _convert_openings(self, openings: List) -> List[Opening]:
-        """Преобразование входных проёмов во внутренний формат."""
-        result = []
-        for op in openings:
-            if hasattr(op, 'x1'):
-                result.append(Opening(
-                    int(op.x1), int(op.y1), int(op.x2), int(op.y2),
-                    getattr(op, 'type', getattr(op, 'opening_type', 'unknown'))
-                ))
-            elif isinstance(op, dict):
-                result.append(Opening(
-                    int(op.get('x1', 0)), int(op.get('y1', 0)),
-                    int(op.get('x2', 0)), int(op.get('y2', 0)),
-                    op.get('type', op.get('opening_type', 'unknown'))
-                ))
-        return result
-
-    def _add_algo_windows(self, algo_windows: List, existing: List[Opening]):
-        """Добавление алгоритмических окон, избегая дублирования."""
-        for w in algo_windows:
-            if hasattr(w, 'x'):
-                x, y, ww, h = w.x, w.y, w.w, w.h
-            elif isinstance(w, dict):
-                x = w.get('x', 0)
-                y = w.get('y', 0)
-                ww = w.get('w', w.get('width', 0))
-                h = w.get('h', w.get('height', 0))
-            else:
+        candidates = []
+        for wall in self.structural_walls:
+            perp_dist = wall.perpendicular_distance(midpoint)
+            if perp_dist > self.search_radius:
                 continue
 
-            cx, cy = x + ww/2, y + h/2
-            covered = any(
-                g.opening_type == 'window' and
-                math.hypot(cx - g.center[0], cy - g.center[1]) < 30
-                for g in existing
-            )
-            if not covered:
-                op = Opening(int(x), int(y), int(x+ww), int(y+h), 'window')
-                # Добавление сегмента
-                if op.is_horizontal:
-                    self.segments.add_h((op.y1+op.y2)//2, op.x1, op.x2)
-                else:
-                    self.segments.add_v((op.x1+op.x2)//2, op.y1, op.y2)
-                self.exporter.add_window(op)
+            t, _ = wall.project_point(midpoint)
+            if t < -0.5 or t > 1.5:
+                continue
 
-    def _add_yolo_doors(self, yolo_doors: List, existing: List[Opening]):
-        """Добавление YOLO дверей, избегая дублирования."""
-        for d in yolo_doors:
-            bbox = d if isinstance(d, (list, tuple)) else d[:4]
-            x1, y1, x2, y2 = map(int, bbox)
-            cx, cy = (x1+x2)/2, (y1+y2)/2
-            covered = any(
-                g.opening_type == 'door' and
-                math.hypot(cx - g.center[0], cy - g.center[1]) < 30
-                for g in existing
-            )
-            if not covered:
-                op = Opening(x1, y1, x2, y2, 'door')
-                if op.is_horizontal:
-                    self.segments.add_h((op.y1+op.y2)//2, op.x1, op.x2)
-                else:
-                    self.segments.add_v((op.x1+op.x2)//2, op.y1, op.y2)
-                self.exporter.add_door(op)
+            orientation_match = (wall.is_horizontal == is_horizontal)
+            priority = 0 if orientation_match else 1
+            candidates.append((priority, perp_dist, wall.thickness))
 
-    def save(self, path: str):
-        """Сохранение результата в файл."""
-        if self.exporter:
-            data = self.exporter.export()
-            with open(path, 'w') as f:
-                json.dump(data, f, indent=2)
+        if not candidates:
+            return DEFAULT_WALL_THICKNESS
+
+        candidates.sort(key=lambda x: (x[0], x[1]))
+        return candidates[0][2]
 
 
 # ============================================================
-# УДОБНЫЕ ФУНКЦИИ
+# PARENT WALL FINDER
 # ============================================================
 
-def export_floorplan_to_blueprint3d(
-    rectangles: List,
-    output_path: str,
-    pixels_to_cm: float = 1.0,
-    algo_windows: List = None,
-    yolo_doors: List = None,
-    yolo_windows: List = None,
-    wall_height_cm: float = 300.0,
-    snap_distance_px: int = 5,
-    extend_distance_px: int = 15,
-    **kwargs
-) -> Dict:
-    """
-    Экспорт планировки в формат Blueprint3D.
+class ParentWallFinder:
+    def __init__(self, walls: List[Wall], tolerance: float = PARENT_WALL_SEARCH_TOLERANCE):
+        self.walls = walls
+        self.tolerance = tolerance
 
-    Параметры:
-        rectangles: Список прямоугольников стен
-        output_path: Путь для сохранения файла
-        pixels_to_cm: Масштаб в см/пиксель
-        algo_windows: Окна от алгоритмической детекции
-        yolo_doors: Двери от YOLO
-        yolo_windows: Окна от YOLO
-        wall_height_cm: Высота стен в см
-        snap_distance_px: Расстояние привязки в пикселях
-        extend_distance_px: Расстояние расширения в пикселях
+    def find_parent(self, center: Point, opening_width: float, is_horizontal: bool) -> Optional[Wall]:
+        best_wall = None
+        best_distance = float('inf')
+
+        for wall in self.walls:
+            if wall.is_horizontal != is_horizontal:
+                continue
+
+            margin = (opening_width / 2) / wall.length if wall.length > 0 else 0.5
+            t, proj = wall.project_point(center)
+
+            if t < -margin or t > 1 + margin:
+                continue
+
+            perp_dist = center.distance_to(proj)
+
+            if perp_dist < self.tolerance and perp_dist < best_distance:
+                best_distance = perp_dist
+                best_wall = wall
+
+        return best_wall
+
+
+# ============================================================
+# OPENING PROCESSOR
+# ============================================================
+
+class OpeningProcessor:
+    def __init__(self, pixels_to_cm: float = 2.54):
+        self.pixels_to_cm = pixels_to_cm
+
+    def process(
+        self,
+        structural_walls: List[Wall],
+        door_rects: Optional[List[Dict]] = None,
+        window_rects: Optional[List[Dict]] = None,
+        gap_rects: Optional[List[Dict]] = None
+    ) -> Tuple[List[Wall], List[Opening]]:
+        parent_finder = ParentWallFinder(structural_walls)
+        thickness_normalizer = ThicknessNormalizer(structural_walls)
+
+        new_walls = []
+        openings = []
+        processed_centers: List[Point] = []
+
+        all_rects = []
+        if window_rects:
+            all_rects.extend([(r, OpeningType.WINDOW) for r in window_rects])
+        if gap_rects:
+            all_rects.extend([(r, OpeningType.GAP) for r in gap_rects])
+        if door_rects:
+            all_rects.extend([(r, OpeningType.DOOR) for r in door_rects])
+
+        for rect, opening_type in all_rects:
+            result = self._process_single(
+                rect, opening_type, parent_finder, thickness_normalizer
+            )
+
+            if result is None:
+                continue
+
+            opening, wall = result
+
+            is_duplicate = False
+            for prev_center in processed_centers:
+                if opening.center.distance_to(prev_center) < 20.0:
+                    is_duplicate = True
+                    break
+
+            if is_duplicate:
+                continue
+
+            processed_centers.append(opening.center)
+            openings.append(opening)
+            if wall:
+                new_walls.append(wall)
+
+        return new_walls, openings
+
+    def _process_single(
+        self,
+        rect: Dict,
+        opening_type: OpeningType,
+        parent_finder: ParentWallFinder,
+        thickness_normalizer: ThicknessNormalizer
+    ) -> Optional[Tuple[Opening, Optional[Wall]]]:
+
+        x1, y1, x2, y2 = parse_rectangle(rect)
+        x1 *= self.pixels_to_cm
+        y1 *= self.pixels_to_cm
+        x2 *= self.pixels_to_cm
+        y2 *= self.pixels_to_cm
+
+        bbox_width = abs(x2 - x1)
+        bbox_height = abs(y2 - y1)
+        center = Point((x1 + x2) / 2, (y1 + y2) / 2)
+        is_horizontal = bbox_width >= bbox_height
+
+        if opening_type == OpeningType.WINDOW:
+            opening_width = DEFAULT_WINDOW_WIDTH
+            opening_height = DEFAULT_WINDOW_HEIGHT
+            elevation = DEFAULT_WINDOW_ELEVATION
+            wall_thickness_param = 0.7352941
+            wall_distance_param = 0.0
+            model = "3/window85x163/window85x163.obj"
+            icon = "2"
+        elif opening_type == OpeningType.GAP:
+            # GAP (геометрически обнаруженные окна) используют параметры дверей для стен
+            opening_width = DEFAULT_WINDOW_WIDTH
+            opening_height = DEFAULT_WINDOW_HEIGHT
+            elevation = DEFAULT_WINDOW_ELEVATION
+            wall_thickness_param = 0.51724136  # Как у дверей
+            wall_distance_param = 0.06896552   # Как у дверей
+            model = "3/window85x163/window85x163.obj"
+            icon = "2"
+        else:  # DOOR
+            opening_width = DEFAULT_DOOR_WIDTH
+            opening_height = DEFAULT_DOOR_HEIGHT
+            elevation = 0.0
+            wall_thickness_param = 0.51724136
+            wall_distance_param = 0.06896552
+            model = "1/door/door.obj"
+            icon = "0"
+
+        parent_wall = parent_finder.find_parent(center, max(bbox_width, bbox_height), is_horizontal)
+
+        new_wall = None
+        if parent_wall:
+            parent_wall_id = parent_wall.wall_id
+            depth = parent_wall.thickness
+            angle = parent_wall.angle
+        else:
+            thickness = thickness_normalizer.get_thickness_for_segment(
+                Point(x1, (y1 + y2) / 2) if is_horizontal else Point((x1 + x2) / 2, y1),
+                Point(x2, (y1 + y2) / 2) if is_horizontal else Point((x1 + x2) / 2, y2)
+            )
+
+            if is_horizontal:
+                extent = bbox_width * (1 + WALL_EXTENSION_FACTOR * 2)
+                half_extent = extent / 2
+                start = Point(center.x - half_extent, center.y)
+                end = Point(center.x + half_extent, center.y)
+                angle = 0.0
+            else:
+                extent = bbox_height * (1 + WALL_EXTENSION_FACTOR * 2)
+                half_extent = extent / 2
+                start = Point(center.x, center.y - half_extent)
+                end = Point(center.x, center.y + half_extent)
+                angle = math.pi / 2
+
+            new_wall = Wall(
+                start=start,
+                end=end,
+                thickness=thickness,
+                is_structural=False
+            )
+            parent_wall_id = new_wall.wall_id
+            depth = thickness
+
+        opening = Opening(
+            opening_type=opening_type,
+            center=center,
+            width=opening_width,
+            height=opening_height,
+            depth=depth,
+            angle=angle,
+            elevation=elevation,
+            parent_wall_id=parent_wall_id,
+            wall_thickness=wall_thickness_param,
+            wall_distance=wall_distance_param,
+            model=model,
+            icon=icon
+        )
+
+        return (opening, new_wall)
+
+
+# ============================================================
+# ROOM DETECTOR
+# ============================================================
+
+class RoomDetector:
+    def __init__(self, tolerance: float = 1.0):
+        self.tolerance = tolerance
+
+    def detect(self, walls: List[Wall]) -> List[Room]:
+        if len(walls) < 3:
+            return []
+
+        graph = self._build_graph(walls)
+        if not graph:
+            return []
+
+        cycles = self._find_minimal_cycles(graph)
+
+        rooms = []
+        for i, cycle in enumerate(cycles):
+            if len(cycle) >= 3:
+                points = [Point(x, y) for x, y in cycle]
+                rooms.append(Room(points=points, name=f"Room {i + 1}"))
+
+        return rooms
+
+    def _build_graph(self, walls: List[Wall]) -> Dict[Tuple[float, float], Set[Tuple[float, float]]]:
+        graph = defaultdict(set)
+        for wall in walls:
+            start_key = (round(wall.start.x, 1), round(wall.start.y, 1))
+            end_key = (round(wall.end.x, 1), round(wall.end.y, 1))
+            if start_key != end_key:
+                graph[start_key].add(end_key)
+                graph[end_key].add(start_key)
+        return graph
+
+    def _find_minimal_cycles(self, graph: Dict) -> List[List[Tuple[float, float]]]:
+        cycles = []
+
+        def dfs(start, current, path, depth):
+            if depth > 12:
+                return
+            for neighbor in graph[current]:
+                edge = tuple(sorted([current, neighbor]))
+                if neighbor == start and len(path) >= 3:
+                    cycles.append(path[:])
+                elif neighbor not in path:
+                    path.append(neighbor)
+                    dfs(start, neighbor, path, depth + 1)
+                    path.pop()
+
+        for start_node in graph:
+            dfs(start_node, start_node, [start_node], 0)
+
+        return self._remove_duplicate_cycles(cycles)
+
+    def _remove_duplicate_cycles(self, cycles: List[List]) -> List[List]:
+        unique = []
+        seen = set()
+        for cycle in cycles:
+            min_idx = cycle.index(min(cycle))
+            normalized = tuple(cycle[min_idx:] + cycle[:min_idx])
+            reversed_cycle = list(reversed(cycle))
+            min_idx_rev = reversed_cycle.index(min(reversed_cycle))
+            normalized_rev = tuple(reversed_cycle[min_idx_rev:] + reversed_cycle[:min_idx_rev])
+            key = min(normalized, normalized_rev)
+            if key not in seen:
+                seen.add(key)
+                unique.append(cycle)
+        return unique
+
+
+# ============================================================
+# XML GENERATOR
+# ============================================================
+
+class SH3DXMLGenerator:
+    def __init__(self, wall_height: float = DEFAULT_WALL_HEIGHT):
+        self.wall_height = wall_height
+
+    def generate(
+        self,
+        walls: List[Wall],
+        openings: List[Opening],
+        rooms: List[Room],
+        name: str = "floor_plan"
+    ) -> str:
+        root = ET.Element('home')
+        root.set('version', '7400')
+        root.set('name', name)
+        root.set('camera', 'topCamera')
+        root.set('wallHeight', str(self.wall_height))
+
+        # Properties
+        prop = ET.SubElement(root, 'property')
+        prop.set('name', 'com.eteks.sweethome3d.SweetHome3D.PlanScale')
+        prop.set('value', '0.02')
+
+        env = ET.SubElement(root, 'environment')
+        env.set('groundColor', '00A8A8A8')
+        env.set('skyColor', '00CCE4FC')
+        env.set('lightColor', '00D0D0D0')
+
+        camera = ET.SubElement(root, 'camera')
+        camera.set('attribute', 'topCamera')
+        camera.set('lens', 'PINHOLE')
+        camera.set('x', '500.0')
+        camera.set('y', '500.0')
+        camera.set('z', '1500.0')
+        camera.set('yaw', '0.0')
+        camera.set('pitch', '1.4')
+        camera.set('fieldOfView', '1.0')
+
+        for room in rooms:
+            self._add_room(root, room)
+
+        for opening in openings:
+            self._add_opening(root, opening)
+
+        for wall in walls:
+            self._add_wall(root, wall)
+
+        xml_str = ET.tostring(root, encoding='unicode')
+        return xml_str
+
+    def _add_wall(self, root: ET.Element, wall: Wall):
+        elem = ET.SubElement(root, 'wall')
+        elem.set('id', wall.wall_id)
+        elem.set('xStart', f"{wall.start.x:.4f}")
+        elem.set('yStart', f"{wall.start.y:.4f}")
+        elem.set('xEnd', f"{wall.end.x:.4f}")
+        elem.set('yEnd', f"{wall.end.y:.4f}")
+        elem.set('height', str(wall.height))
+        elem.set('thickness', f"{wall.thickness:.4f}")
+        elem.set('pattern', wall.pattern)
+
+        if wall.wall_at_start:
+            elem.set('wallAtStart', wall.wall_at_start)
+        if wall.wall_at_end:
+            elem.set('wallAtEnd', wall.wall_at_end)
+
+    def _add_opening(self, root: ET.Element, opening: Opening):
+        elem = ET.SubElement(root, 'doorOrWindow')
+        elem.set('id', opening.opening_id)
+
+        if opening.opening_type in (OpeningType.DOOR, OpeningType.GAP):
+            elem.set('catalogId', 'eteks-door')
+            elem.set('name', 'Door')
+        else:
+            elem.set('catalogId', 'eteks-window85x163')
+            elem.set('name', 'Window')
+
+        elem.set('creator', 'eTeks')
+        elem.set('model', opening.model)
+        elem.set('icon', opening.icon)
+        elem.set('x', f"{opening.center.x:.4f}")
+        elem.set('y', f"{opening.center.y:.4f}")
+
+        if opening.elevation > 0:
+            elem.set('elevation', str(opening.elevation))
+
+        elem.set('angle', str(opening.angle))
+        elem.set('width', str(opening.width))
+        elem.set('depth', f"{opening.depth:.4f}")
+        elem.set('height', str(opening.height))
+        elem.set('movable', 'false')
+
+        elem.set('wallThickness', str(opening.wall_thickness))
+        elem.set('wallDistance', str(opening.wall_distance))
+        elem.set('cutOutShape', 'M0,0 v1 h1 v-1 z')
+        elem.set('wallCutOutOnBothSides', 'true')
+
+        sash = ET.SubElement(elem, 'sash')
+        if opening.opening_type in (OpeningType.DOOR, OpeningType.GAP):
+            sash.set('xAxis', '0.05464481')
+            sash.set('yAxis', '0.5862069')
+            sash.set('width', '0.89071035')
+        else:
+            sash.set('xAxis', '0.021978023')
+            sash.set('yAxis', '0.7352941')
+            sash.set('width', '0.94505495')
+        sash.set('startAngle', '0.0')
+        sash.set('endAngle', '-1.5707964')
+
+    def _add_room(self, root: ET.Element, room: Room):
+        elem = ET.SubElement(root, 'room')
+        elem.set('id', room.room_id)
+        elem.set('name', room.name)
+        elem.set('areaVisible', 'true')
+        elem.set('floorColor', '-3355444')
+
+        for point in room.points:
+            pt = ET.SubElement(elem, 'point')
+            pt.set('x', f"{point.x:.4f}")
+            pt.set('y', f"{point.y:.4f}")
+
+
+# ============================================================
+# MAIN EXPORTER
+# ============================================================
+
+class SweetHome3DExporter:
     """
-    builder = FloorplanBuilder(
-        wall_height_cm=wall_height_cm,
-        snap_distance_px=snap_distance_px,
-        extend_distance_px=extend_distance_px,
+    Основной класс экспортёра в формат Sweet Home 3D.
+
+    Функциональность:
+    - Преобразование сегментов стен в геометрию Sweet Home 3D
+    - Создание и позиционирование проёмов (дверей/окон)
+    - Выравнивание стен с проёмами относительно структурных стен
+    - Автоматическое соединение стен в углах
+    - Генерация XML для .sh3d файлов
+    - Упаковка всех ресурсов в итоговый .sh3d архив
+    """
+    """
+    Sweet Home 3D Floor Plan Exporter - Version 6.6
+    """
+
+    def __init__(
+        self,
+        min_wall_thickness: float = 5.0,
+        pixels_to_cm: float = 2.54,
+        wall_height_cm: float = DEFAULT_WALL_HEIGHT,
+        snap_tolerance: float = SNAP_TOLERANCE,
+        wall_overlap: float = WALL_OVERLAP
+    ):
+        self.pixels_to_cm = pixels_to_cm
+        self.wall_height = wall_height_cm
+        self.snap_tolerance = snap_tolerance
+        self.wall_overlap = wall_overlap
+
+        self.wall_converter = StructuralWallConverter(pixels_to_cm, min_wall_thickness)
+        self.opening_processor = OpeningProcessor(pixels_to_cm)
+        self.xml_generator = SH3DXMLGenerator(wall_height_cm)
+
+    def export_to_sh3d(
+        self,
+        wall_rectangles: List[Dict],
+        output_path: str,
+        door_rectangles: Optional[List[Dict]] = None,
+        window_rectangles: Optional[List[Dict]] = None,
+        gap_rectangles: Optional[List[Dict]] = None,
         **kwargs
-    )
+    ):
+        # Step 1: Convert structural walls
+        structural_walls = self.wall_converter.convert(wall_rectangles)
 
-    result = builder.build(
-        rectangles=rectangles,
-        pixels_to_cm=pixels_to_cm,
-        algo_windows=algo_windows,
-        yolo_doors=yolo_doors,
-        yolo_windows=yolo_windows
-    )
+        # Step 2: Process openings - creates opening walls
+        opening_walls, openings = self.opening_processor.process(
+            structural_walls,
+            door_rects=door_rectangles,
+            window_rects=window_rectangles,
+            gap_rects=gap_rectangles
+        )
 
-    with open(output_path, 'w') as f:
-        json.dump(result, f, indent=2)
+        # Step 3: Combine all walls
+        all_walls = structural_walls + opening_walls
 
-    return result
+        # Step 4: MOVE opening walls to align with adjacent structural walls
+        self._move_opening_walls_to_structural_centerlines(opening_walls, structural_walls)
+
+        # Step 5: Extend all walls to connect with overlaps
+        self._extend_walls_to_connect(all_walls)
+
+        # Step 6: Final pass - extend walls close to other wall boxes
+        self._extend_walls_into_nearby_boxes(all_walls)
+
+        # Step 7: Connect walls
+        self._connect_walls(all_walls)
+
+        # Step 8: Update openings to match moved walls
+        self._update_openings_from_walls(openings, all_walls)
+
+        # Step 9: Detect rooms
+        room_detector = RoomDetector()
+        rooms = room_detector.detect(all_walls)
+
+        # Step 10: Generate XML
+        xml_content = self.xml_generator.generate(
+            walls=all_walls,
+            openings=openings,
+            rooms=rooms,
+            name=output_path
+        )
+
+        # Step 11: Write file
+        self._write_sh3d_file(output_path, xml_content)
+
+    def _move_opening_walls_to_structural_centerlines(
+            self,
+            opening_walls: List[Wall],
+            structural_walls: List[Wall]
+    ):
+        """
+        Move each opening wall to snap between two structural walls that form
+        the smallest non-zero gap that isn't already occupied by another wall.
+        """
+        horiz_structural = [w for w in structural_walls if w.is_horizontal]
+        vert_structural = [w for w in structural_walls if not w.is_horizontal]
+
+        for ow in opening_walls:
+            if ow.length < 0.1:
+                continue
+
+            old_start = ow.start.copy()
+            old_end = ow.end.copy()
+
+            if ow.is_horizontal:
+                # === HORIZONTAL OPENING WALL ===
+                # Opening runs left-right, need to find two VERTICAL walls to snap between
+                ow_y = ow.get_centerline_y()
+                ow_center_x = (ow.get_min_x() + ow.get_max_x()) / 2
+
+                # Find the best pair of vertical walls (left and right) with smallest gap
+                best_gap = float('inf')
+                best_left_x = None
+                best_right_x = None
+
+                # Get all vertical walls that could be candidates (near our Y level)
+                left_candidates = []  # walls to the left of center
+                right_candidates = []  # walls to the right of center
+
+                for sw in vert_structural:
+                    sw_x = sw.get_centerline_x()
+                    sw_y_min = sw.get_min_y()
+                    sw_y_max = sw.get_max_y()
+
+                    # Check if this wall spans our Y level
+                    if not (sw_y_min - CENTERLINE_SEARCH_RADIUS <= ow_y <= sw_y_max + CENTERLINE_SEARCH_RADIUS):
+                        continue
+
+                    dist_from_center = abs(sw_x - ow_center_x)
+                    if dist_from_center > CENTERLINE_SEARCH_RADIUS:
+                        continue
+
+                    if sw_x < ow_center_x:
+                        left_candidates.append((sw_x, sw))
+                    else:
+                        right_candidates.append((sw_x, sw))
+
+                # Try all pairs of (left_wall, right_wall) to find smallest non-zero gap
+                for left_x, left_wall in left_candidates:
+                    for right_x, right_wall in right_candidates:
+                        gap = right_x - left_x
+
+                        # Must be positive (right is actually to the right of left)
+                        if gap <= 0:
+                            continue
+
+                        # Skip if gap is too small (walls touching)
+                        if gap < 5.0:
+                            continue
+
+                        # Check if this gap is already occupied by another wall
+                        is_occupied = False
+                        for other_ow in opening_walls:
+                            if other_ow.wall_id == ow.wall_id:
+                                continue
+                            if not other_ow.is_horizontal:
+                                continue
+                            # Check if other opening wall is in this gap
+                            other_y = other_ow.get_centerline_y()
+                            if abs(other_y - ow_y) < 20.0:  # Same Y level
+                                other_min_x = other_ow.get_min_x()
+                                other_max_x = other_ow.get_max_x()
+                                # Check overlap with gap
+                                if other_min_x < right_x and other_max_x > left_x:
+                                    is_occupied = True
+                                    break
+
+                        # Also check structural walls in the gap
+                        if not is_occupied:
+                            for sw in horiz_structural:
+                                sw_y = sw.get_centerline_y()
+                                if abs(sw_y - ow_y) < 20.0:
+                                    sw_min_x = sw.get_min_x()
+                                    sw_max_x = sw.get_max_x()
+                                    # Check if structural wall fills this gap
+                                    if sw_min_x <= left_x + 5 and sw_max_x >= right_x - 5:
+                                        is_occupied = True
+                                        break
+
+                        if is_occupied:
+                            continue
+
+                        # This gap is valid - check if it's the smallest
+                        if gap < best_gap:
+                            best_gap = gap
+                            best_left_x = left_x
+                            best_right_x = right_x
+
+                # Apply the best gap found
+                if best_left_x is not None and best_right_x is not None:
+                    ow.start.x = best_left_x
+                    ow.end.x = best_right_x
+
+                # Now find the best Y position (snap to nearest horizontal structural wall)
+                best_y = None
+                best_y_dist = CENTERLINE_SEARCH_RADIUS
+
+                for sw in horiz_structural:
+                    sw_y = sw.get_centerline_y()
+                    dist = abs(sw_y - ow_y)
+
+                    sw_x_min = sw.get_min_x()
+                    sw_x_max = sw.get_max_x()
+
+                    # Check if wall overlaps with our X range
+                    has_overlap = not (ow.get_max_x() < sw_x_min - 20 or ow.get_min_x() > sw_x_max + 20)
+
+                    if has_overlap and dist < best_y_dist:
+                        best_y = sw_y
+                        best_y_dist = dist
+
+                if best_y is not None:
+                    ow.start.y = best_y
+                    ow.end.y = best_y
+
+            else:
+                # === VERTICAL OPENING WALL ===
+                # Opening runs top-bottom, need to find two HORIZONTAL walls to snap between
+                ow_x = ow.get_centerline_x()
+                ow_center_y = (ow.get_min_y() + ow.get_max_y()) / 2
+
+                # Find the best pair of horizontal walls (top and bottom) with smallest gap
+                best_gap = float('inf')
+                best_top_y = None
+                best_bottom_y = None
+
+                # Get all horizontal walls that could be candidates (near our X level)
+                top_candidates = []  # walls above center (smaller Y)
+                bottom_candidates = []  # walls below center (larger Y)
+
+                for sw in horiz_structural:
+                    sw_y = sw.get_centerline_y()
+                    sw_x_min = sw.get_min_x()
+                    sw_x_max = sw.get_max_x()
+
+                    # Check if this wall spans our X level
+                    if not (sw_x_min - CENTERLINE_SEARCH_RADIUS <= ow_x <= sw_x_max + CENTERLINE_SEARCH_RADIUS):
+                        continue
+
+                    dist_from_center = abs(sw_y - ow_center_y)
+                    if dist_from_center > CENTERLINE_SEARCH_RADIUS:
+                        continue
+
+                    if sw_y < ow_center_y:
+                        top_candidates.append((sw_y, sw))
+                    else:
+                        bottom_candidates.append((sw_y, sw))
+
+                # Try all pairs of (top_wall, bottom_wall) to find smallest non-zero gap
+                for top_y, top_wall in top_candidates:
+                    for bottom_y, bottom_wall in bottom_candidates:
+                        gap = bottom_y - top_y
+
+                        # Must be positive
+                        if gap <= 0:
+                            continue
+
+                        # Skip if gap is too small
+                        if gap < 5.0:
+                            continue
+
+                        # Check if this gap is already occupied
+                        is_occupied = False
+                        for other_ow in opening_walls:
+                            if other_ow.wall_id == ow.wall_id:
+                                continue
+                            if other_ow.is_horizontal:
+                                continue
+                            # Check if other opening wall is in this gap
+                            other_x = other_ow.get_centerline_x()
+                            if abs(other_x - ow_x) < 20.0:  # Same X level
+                                other_min_y = other_ow.get_min_y()
+                                other_max_y = other_ow.get_max_y()
+                                if other_min_y < bottom_y and other_max_y > top_y:
+                                    is_occupied = True
+                                    break
+
+                        # Also check structural walls in the gap
+                        if not is_occupied:
+                            for sw in vert_structural:
+                                sw_x = sw.get_centerline_x()
+                                if abs(sw_x - ow_x) < 20.0:
+                                    sw_min_y = sw.get_min_y()
+                                    sw_max_y = sw.get_max_y()
+                                    if sw_min_y <= top_y + 5 and sw_max_y >= bottom_y - 5:
+                                        is_occupied = True
+                                        break
+
+                        if is_occupied:
+                            continue
+
+                        # This gap is valid - check if it's the smallest
+                        if gap < best_gap:
+                            best_gap = gap
+                            best_top_y = top_y
+                            best_bottom_y = bottom_y
+
+                # Apply the best gap found
+                if best_top_y is not None and best_bottom_y is not None:
+                    # Preserve start/end direction
+                    if ow.start.y < ow.end.y:
+                        ow.start.y = best_top_y
+                        ow.end.y = best_bottom_y
+                    else:
+                        ow.start.y = best_bottom_y
+                        ow.end.y = best_top_y
+
+                # Now find the best X position (snap to nearest vertical structural wall)
+                best_x = None
+                best_x_dist = CENTERLINE_SEARCH_RADIUS
+
+                for sw in vert_structural:
+                    sw_x = sw.get_centerline_x()
+                    dist = abs(sw_x - ow_x)
+
+                    sw_y_min = sw.get_min_y()
+                    sw_y_max = sw.get_max_y()
+
+                    # Check if wall overlaps with our Y range
+                    has_overlap = not (ow.get_max_y() < sw_y_min - 20 or ow.get_min_y() > sw_y_max + 20)
+
+                    if has_overlap and dist < best_x_dist:
+                        best_x = sw_x
+                        best_x_dist = dist
+
+                if best_x is not None:
+                    ow.start.x = best_x
+                    ow.end.x = best_x
+
+    def _extend_walls_to_connect(
+    self, walls: List[Wall]):
+        """
+        Расширение стен вдоль их направления для соединения с близлежащими стенами.
+
+        Выполняется в несколько проходов для постепенного достижения соединений.
+        Проверяет каждый конец стены и расширяет его при обнаружении близкой цели.
+
+        Параметры:
+            walls: Список стен для обработки
+        """
+        for _ in range(3):
+            for wall in walls:
+                if wall.length < 0.1:
+                    continue
+
+                dx, dy = wall.direction_vector()
+
+                for endpoint_name in ('start', 'end'):
+                    p = getattr(wall, endpoint_name)
+
+                    if endpoint_name == 'start':
+                        ext_dir = (-dx, -dy)
+                    else:
+                        ext_dir = (dx, dy)
+
+                    best_target = None
+                    best_dist = self.snap_tolerance
+
+                    for other in walls:
+                        if other.wall_id == wall.wall_id:
+                            continue
+
+                        result = self._calc_extension_to_wall(p, ext_dir, other)
+                        if result is not None:
+                            dist, target_pt = result
+                            if dist < best_dist:
+                                best_dist = dist
+                                best_target = target_pt
+
+                    if best_target is not None:
+                        new_x = best_target.x + ext_dir[0] * self.wall_overlap
+                        new_y = best_target.y + ext_dir[1] * self.wall_overlap
+
+                        if endpoint_name == 'start':
+                            wall.start = Point(new_x, new_y)
+                        else:
+                            wall.end = Point(new_x, new_y)
+
+    def _calc_extension_to_wall(
+        self,
+        p: Point,
+        direction: Tuple[float, float],
+        target: Wall
+    ) -> Optional[Tuple[float, Point]]:
+        """Calculate extension from point p in direction to reach target wall."""
+        dx, dy = direction
+
+        t1x, t1y = target.start.x, target.start.y
+        t2x, t2y = target.end.x, target.end.y
+        tdx, tdy = t2x - t1x, t2y - t1y
+
+        denom = dx * tdy - dy * tdx
+
+        if abs(denom) < 1e-6:
+            perp = target.perpendicular_distance(p)
+            if perp < 5.0:
+                d1 = (t1x - p.x) * dx + (t1y - p.y) * dy
+                d2 = (t2x - p.x) * dx + (t2y - p.y) * dy
+                candidates = []
+                if d1 > 0.01:
+                    candidates.append((d1, Point(t1x, t1y)))
+                if d2 > 0.01:
+                    candidates.append((d2, Point(t2x, t2y)))
+                if candidates:
+                    return min(candidates, key=lambda x: x[0])
+            return None
+
+        diff_x = t1x - p.x
+        diff_y = t1y - p.y
+
+        t = (diff_x * tdy - diff_y * tdx) / denom
+        s = (diff_x * dy - diff_y * dx) / denom
+
+        if t > 0.01 and -0.2 <= s <= 1.2:
+            ix = p.x + dx * t
+            iy = p.y + dy * t
+            return (t, Point(ix, iy))
+
+        return None
+
+    def _extend_walls_into_nearby_boxes(self, walls: List[Wall]):
+        """
+        Final pass: if wall endpoint is close to another wall's thickness box,
+        extend the wall to penetrate into that box.
+        """
+        for wall in walls:
+            if wall.length < 0.1:
+                continue
+
+            dx, dy = wall.direction_vector()
+
+            for endpoint_name in ('start', 'end'):
+                p = getattr(wall, endpoint_name)
+
+                if endpoint_name == 'start':
+                    ext_dx, ext_dy = -dx, -dy
+                else:
+                    ext_dx, ext_dy = dx, dy
+
+                for other in walls:
+                    if other.wall_id == wall.wall_id:
+                        continue
+
+                    half_t = other.thickness / 2.0
+
+                    if other.is_horizontal:
+                        box_x_min = other.get_min_x()
+                        box_x_max = other.get_max_x()
+                        box_y_min = other.get_centerline_y() - half_t
+                        box_y_max = other.get_centerline_y() + half_t
+                    else:
+                        box_x_min = other.get_centerline_x() - half_t
+                        box_x_max = other.get_centerline_x() + half_t
+                        box_y_min = other.get_min_y()
+                        box_y_max = other.get_max_y()
+
+                    dist_to_box = self._point_to_box_distance(p, box_x_min, box_y_min, box_x_max, box_y_max)
+
+                    if 0.5 < dist_to_box < BOX_PROXIMITY_TOLERANCE:
+                        extension = dist_to_box + BOX_EXTENSION_AMOUNT
+
+                        new_x = p.x + ext_dx * extension
+                        new_y = p.y + ext_dy * extension
+
+                        if endpoint_name == 'start':
+                            wall.start = Point(new_x, new_y)
+                        else:
+                            wall.end = Point(new_x, new_y)
+                        break
+
+    def _point_to_box_distance(
+        self,
+        p: Point,
+        x_min: float, y_min: float,
+        x_max: float, y_max: float
+    ) -> float:
+        """Calculate distance from point to axis-aligned box."""
+        if x_min <= p.x <= x_max and y_min <= p.y <= y_max:
+            return 0.0
+
+        dx = max(x_min - p.x, 0, p.x - x_max)
+        dy = max(y_min - p.y, 0, p.y - y_max)
+
+        return math.hypot(dx, dy)
+
+    def _connect_walls(
+        self, walls: List[Wall]):
+        """
+        Установка связей между стенами (wall-to-wall connections).
+
+        Определяет какие стены соединены в углах и обновляет атрибуты
+        wall_at_start и wall_at_end для корректного рендеринга соединений.
+
+        Параметры:
+            walls: Список стен
+        """
+        eps = self.wall_overlap + 2.0
+
+        for i, wall1 in enumerate(walls):
+            for j, wall2 in enumerate(walls):
+                if i >= j:
+                    continue
+
+                if wall1.end.distance_to(wall2.start) < eps:
+                    wall1.wall_at_end = wall2.wall_id
+                    wall2.wall_at_start = wall1.wall_id
+                elif wall1.start.distance_to(wall2.end) < eps:
+                    wall1.wall_at_start = wall2.wall_id
+                    wall2.wall_at_end = wall1.wall_id
+                elif wall1.end.distance_to(wall2.end) < eps:
+                    wall1.wall_at_end = wall2.wall_id
+                    wall2.wall_at_end = wall1.wall_id
+                elif wall1.start.distance_to(wall2.start) < eps:
+                    wall1.wall_at_start = wall2.wall_id
+                    wall2.wall_at_start = wall1.wall_id
+
+    def _update_openings_from_walls(self, openings: List[Opening], walls: List[Wall]):
+        """Update opening positions based on final wall positions."""
+        wall_by_id = {w.wall_id: w for w in walls}
+
+        for opening in openings:
+            parent = wall_by_id.get(opening.parent_wall_id)
+            if not parent:
+                continue
+
+            # Move opening center to wall midpoint
+            opening.center = parent.midpoint
+            opening.angle = parent.angle
+
+            # For non-structural walls (opening walls), make the opening object
+            # slightly shorter than the wall
+            if not parent.is_structural:
+                opening.width = parent.length * OPENING_TO_WALL_RATIO
+
+    def _write_sh3d_file(self, output_path: str, xml_content: str):
+        if not output_path.endswith('.sh3d'):
+            output_path += '.sh3d'
+
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr('Home.xml', xml_content)
+            zf.writestr('1/door/door.obj', DOOR_OBJ_CONTENT)
+            zf.writestr('3/window85x163/window85x163.obj', WINDOW_OBJ_CONTENT)
+            zf.writestr('0', base64.b64decode(DUMMY_PNG_B64))
+            zf.writestr('2', base64.b64decode(DUMMY_PNG_B64))
 
 
-# ============================================================
-# ИНТЕРФЕЙС КОМАНДНОЙ СТРОКИ
-# ============================================================
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Экспорт планировки в формат Blueprint3D"
-    )
-    parser.add_argument('--rectangles', '-r', required=True,
-                        help='JSON файл с прямоугольниками стен')
-    parser.add_argument('--windows', '-w',
-                        help='JSON файл с окнами')
-    parser.add_argument('--doors', '-d',
-                        help='JSON файл с дверями')
-    parser.add_argument('--output', '-o', default='floorplan.blueprint3d',
-                        help='Выходной файл')
-    parser.add_argument('--pixels-to-cm', type=float, default=1.0,
-                        help='Масштаб в см/пиксель')
-    parser.add_argument('--wall-height', type=float, default=300.0,
-                        help='Высота стен в см')
-    parser.add_argument('--snap-distance', type=int, default=5,
-                        help='Расстояние привязки в пикселях')
-    parser.add_argument('--extend-distance', type=int, default=15,
-                        help='Расстояние расширения в пикселях')
-
-    args = parser.parse_args()
-
-    # Загрузка данных
-    with open(args.rectangles) as f:
-        rects = json.load(f)
-
-    wins = None
-    if args.windows:
-        with open(args.windows) as f:
-            wins = json.load(f)
-
-    doors = None
-    if args.doors:
-        with open(args.doors) as f:
-            doors = json.load(f)
-
-    # Экспорт
-    export_floorplan_to_blueprint3d(
-        rects, args.output,
-        pixels_to_cm=args.pixels_to_cm,
-        algo_windows=wins,
-        yolo_doors=doors,
-        wall_height_cm=args.wall_height,
-        snap_distance_px=args.snap_distance,
-        extend_distance_px=args.extend_distance
-    )
+# Backward compatibility
+FixedSweetHome3DExporter = SweetHome3DExporter
