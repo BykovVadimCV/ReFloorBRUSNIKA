@@ -1,12 +1,12 @@
 """
 Система анализа планировок помещений - Модуль анализа размеров помещений
-Версия: 3.9
+Версия: 4.0
 Автор: Быков Вадим Олегович
 Дата: 01.28.2026
 
 Детекция контура квартиры через raytracing по оригинальному изображению, определение
 внешних стен (outer crust) и формы квартиры, OCR (docTR) с объединением боксов и стратегией "largest area",
-расчёт пиксельного масштаба, измерение длин стен в метрах и классификация внешних стен
+расчёт пиксельного масштаба (включая стены), измерение длин стен в метрах и классификация внешних стен
 """
 
 import cv2
@@ -49,7 +49,8 @@ class RoomMeasurements:
     Атрибуты:
         area_m2: Общая площадь в квадратных метрах
         pixel_scale: Масштаб в метрах на пиксель
-        living_space_pixels: Количество пикселей жилой площади
+        apartment_area_pixels: Количество пикселей всей квартиры (включая стены)
+        living_space_pixels: Количество пикселей жилой площади (без стен)
         walls: Список измеренных стен
         outer_crust: Маска внешней корки стен
         apartment_boundary: Маска границы квартиры
@@ -59,6 +60,7 @@ class RoomMeasurements:
     """
     area_m2: float
     pixel_scale: float
+    apartment_area_pixels: int
     living_space_pixels: int
     walls: List[Dict]
     outer_crust: np.ndarray
@@ -457,7 +459,7 @@ class RoomSizeAnalyzer:
         return final_crust, exterior_mask, interior_mask
 
     # ============================================================
-    # ДЕТЕКЦИЯ УГЛОВ И ЖИЛОЙ ПЛОЩАДИ
+    # ДЕТЕКЦИЯ УГЛОВ И РАСЧЁТ ПЛОЩАДЕЙ
     # ============================================================
 
     def detect_inner_corners(self,
@@ -572,6 +574,18 @@ class RoomSizeAnalyzer:
         cv2.drawContours(apartment_shape, [largest], -1, 255, -1)
 
         return apartment_shape
+
+    def calculate_apartment_area_pixels(self, apartment_boundary: np.ndarray) -> int:
+        """
+        Расчёт общей площади квартиры в пикселях (включая стены).
+
+        Параметры:
+            apartment_boundary: Маска границы квартиры
+
+        Возвращает:
+            Количество пикселей всей квартиры
+        """
+        return int(np.sum(apartment_boundary > 0))
 
     def calculate_living_space(self,
                                apartment_shape: np.ndarray,
@@ -815,22 +829,26 @@ class RoomSizeAnalyzer:
             return []
 
     def calculate_pixel_scale(self,
-                              living_space_pixels: int,
+                              apartment_area_pixels: int,
                               total_area_m2: float) -> float:
         """
         Расчёт пиксельного масштаба (метров на пиксель).
 
+        Масштаб рассчитывается на основе полной площади квартиры,
+        включая стены, что соответствует стандартному измерению
+        общей площади на архитектурных планах.
+
         Параметры:
-            living_space_pixels: Количество пикселей жилой площади
+            apartment_area_pixels: Количество пикселей всей квартиры (включая стены)
             total_area_m2: Общая площадь квартиры в м²
 
         Возвращает:
             Масштаб в метрах на пиксель
         """
-        if living_space_pixels <= 0 or total_area_m2 <= 0:
+        if apartment_area_pixels <= 0 or total_area_m2 <= 0:
             return 0.0
 
-        pixel_scale = np.sqrt(total_area_m2 / living_space_pixels)
+        pixel_scale = np.sqrt(total_area_m2 / apartment_area_pixels)
         return pixel_scale
 
     def measure_walls(self,
@@ -918,9 +936,9 @@ class RoomSizeAnalyzer:
         Этапы:
         1. Трассировка лучей по оригинальному изображению для контура
         2. Детекция внутренних углов
-        3. Расчёт жилой площади
+        3. Расчёт площади квартиры (включая стены) и жилой площади
         4. OCR для определения общей площади
-        5. Расчёт пиксельного масштаба
+        5. Расчёт пиксельного масштаба (на основе полной площади)
         6. Измерение стен
         7. Сохранение визуализаций для отладки
 
@@ -960,12 +978,16 @@ class RoomSizeAnalyzer:
         # Этап 2: Детекция внутренних углов
         inner_corners = self.detect_inner_corners(apartment_boundary, wall_mask)
 
-        # Этап 3: Расчёт жилой площади
+        # Этап 3: Расчёт площадей
+        # Полная площадь квартиры (включая стены) - используется для масштаба
+        apartment_area_pixels = self.calculate_apartment_area_pixels(apartment_boundary)
+
+        # Жилая площадь (без стен) - информационно
         living_space_pixels, living_mask = self.calculate_living_space(
             apartment_boundary, wall_mask
         )
 
-        if living_space_pixels == 0:
+        if apartment_area_pixels == 0:
             return None
 
         # Этап 4: Определение общей площади
@@ -978,8 +1000,8 @@ class RoomSizeAnalyzer:
                 return None
             total_area_m2 = float(sum(r['area_m2'] for r in room_areas))
 
-        # Этап 5: Расчёт масштаба
-        pixel_scale = self.calculate_pixel_scale(living_space_pixels, total_area_m2)
+        # Этап 5: Расчёт масштаба (на основе полной площади включая стены)
+        pixel_scale = self.calculate_pixel_scale(apartment_area_pixels, total_area_m2)
 
         if pixel_scale == 0:
             return None
@@ -992,12 +1014,14 @@ class RoomSizeAnalyzer:
             output_dir, img_path, image,
             outer_crust, apartment_boundary, wall_mask,
             living_mask, room_areas, measured_walls, pixel_scale,
-            exterior_mask, interior_mask, inner_corners
+            exterior_mask, interior_mask, inner_corners,
+            apartment_area_pixels, living_space_pixels
         )
 
         return RoomMeasurements(
             area_m2=total_area_m2,
             pixel_scale=pixel_scale,
+            apartment_area_pixels=apartment_area_pixels,
             living_space_pixels=living_space_pixels,
             walls=measured_walls,
             outer_crust=outer_crust,
@@ -1020,7 +1044,9 @@ class RoomSizeAnalyzer:
                            pixel_scale: float,
                            exterior_mask: np.ndarray,
                            interior_mask: np.ndarray,
-                           inner_corners: np.ndarray) -> None:
+                           inner_corners: np.ndarray,
+                           apartment_area_pixels: int,
+                           living_space_pixels: int) -> None:
         """
         Сохранение отладочных визуализаций.
 
@@ -1063,10 +1089,22 @@ class RoomSizeAnalyzer:
 
         # Добавление текстовой информации
         total_area = float(sum(r['area_m2'] for r in room_areas)) if room_areas else 0.0
-        info = f"Площадь: {total_area:.1f} м² | Масштаб: {pixel_scale * 100:.3f} см/пкс"
-        cv2.putText(overlay, info, (10, 30),
+
+        # Расчёт площади стен
+        wall_area_pixels = apartment_area_pixels - living_space_pixels
+        wall_area_m2 = wall_area_pixels * (pixel_scale ** 2)
+        living_area_m2 = living_space_pixels * (pixel_scale ** 2)
+
+        info1 = f"Общая площадь: {total_area:.1f} м² | Масштаб: {pixel_scale * 100:.3f} см/пкс"
+        info2 = f"Жилая: {living_area_m2:.1f} м² | Стены: {wall_area_m2:.1f} м²"
+
+        cv2.putText(overlay, info1, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3)
-        cv2.putText(overlay, info, (10, 30),
+        cv2.putText(overlay, info1, (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
+        cv2.putText(overlay, info2, (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
+        cv2.putText(overlay, info2, (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
         cv2.imwrite(os.path.join(debug_dir, f"{base}_8_overlay.png"), overlay)

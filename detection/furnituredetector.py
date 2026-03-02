@@ -139,6 +139,22 @@ def letterbox(im, new_shape=(1048, 1048), color=(114, 114, 114), auto=True, scal
 # ДЕТЕКТОР
 # ============================================================
 
+def _iou_xyxy(
+    a: Tuple[float, float, float, float],
+    b: Tuple[float, float, float, float],
+) -> float:
+    """Intersection-over-Union for two (x1,y1,x2,y2) boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter == 0.0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0.0 else 0.0
+
+
 class YOLODoorWindowDetector:
     """
     YOLO-детектор дверей и окон на базе нативного YOLOv9.
@@ -158,7 +174,8 @@ class YOLODoorWindowDetector:
                  model_path: str,
                  conf_threshold: float = 0.25,
                  iou_threshold: float = 0.45,
-                 device: str = "cpu"):
+                 device: str = "cpu",
+                 max_door_area_fraction: float = 0.05):
         """
         Инициализация YOLO-детектора.
 
@@ -167,10 +184,19 @@ class YOLODoorWindowDetector:
             conf_threshold: Порог уверенности для детекции
             iou_threshold: Порог IoU для NMS (Non-Maximum Suppression)
             device: Устройство для инференса (cpu/cuda/0/1/...)
+            max_door_area_fraction: Maximum fraction of total image area that a
+                single door or window bbox may occupy.  Detections exceeding this
+                threshold are almost certainly whole-room false positives produced
+                when YOLO pattern-matches an enclosed corridor or hallway to a wide
+                doorway.  At typical Brusnika floor-plan scale a real door leaf
+                occupies < 2 % of the image; the default of 5 % gives comfortable
+                headroom while still killing corridor-sized false positives that
+                typically span 10–20 % of the image.
         """
         self.model_path = Path(model_path)
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold
+        self.max_door_area_fraction = max_door_area_fraction
         self.device = select_device(device)
 
         # Проверка существования файла модели
@@ -190,6 +216,30 @@ class YOLODoorWindowDetector:
 
         except Exception as e:
             raise RuntimeError(f"Ошибка загрузки модели: {e}")
+
+    @staticmethod
+    def _box_nms(detections: List[YOLODetection], iou_thresh: float = 0.40) -> List[YOLODetection]:
+        """
+        Per-class greedy NMS sorted by descending box area.
+        Removes duplicate YOLO detections of the same physical opening
+        that survived the model's own cross-class NMS pass.
+        """
+        if len(detections) <= 1:
+            return detections
+        sorted_dets = sorted(
+            detections,
+            key=lambda d: (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1]),
+            reverse=True,
+        )
+        kept: List[YOLODetection] = []
+        kept_boxes: List[Tuple[float, float, float, float]] = []
+        for d in sorted_dets:
+            b = (float(d.bbox[0]), float(d.bbox[1]),
+                 float(d.bbox[2]), float(d.bbox[3]))
+            if all(_iou_xyxy(b, kb) < iou_thresh for kb in kept_boxes):
+                kept.append(d)
+                kept_boxes.append(b)
+        return kept
 
     def detect(self, img: np.ndarray, verbose: bool = False) -> YOLOResults:
         """
@@ -280,6 +330,26 @@ class YOLODoorWindowDetector:
                 elif class_id == 1:  # Окно
                     windows.append(detection)
                     combined_window_mask = cv2.bitwise_or(combined_window_mask, bbox_mask)
+
+        doors = self._box_nms(doors)
+        windows = self._box_nms(windows)
+
+        # ── Physical-size gate ────────────────────────────────────────────
+        # Reject any detection whose bbox area exceeds max_door_area_fraction
+        # of the full image.  Whole-room false positives (e.g. a narrow corridor
+        # that YOLO mistakes for a wide door) always produce oversized boxes,
+        # whereas genuine door/window leaves stay well under this limit.
+        img_area = h0 * w0
+        def _oversized(det: YOLODetection) -> bool:
+            bw = det.bbox[2] - det.bbox[0]
+            bh = det.bbox[3] - det.bbox[1]
+            return (bw * bh) / img_area > self.max_door_area_fraction
+
+        doors   = [d for d in doors   if not _oversized(d)]
+        windows = [w for w in windows if not _oversized(w)]
+        # ─────────────────────────────────────────────────────────────────
+
+        all_detections = doors + windows
 
         return YOLOResults(
             doors=doors,

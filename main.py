@@ -1,125 +1,754 @@
 """
-Система анализа планировок помещений - Основной модуль
-Версия: 4.2 (Edge-Based Wall Length Measurements)
-Автор: Быков Вадим Олегович
-Дата: 01.29.2026
-Модификация: 02.05.2026
+================================================================================
+СИСТЕМА АВТОМАТИЧЕСКОГО АНАЛИЗА ПЛАНИРОВОК КВАРТИР «БРУСНИКА»
+Модуль: Главный оркестратор и визуализация (main.py)
+Версия: 5.3 — Clean Visuals Edition + Door Arc Detection
+Автор: BykovVadimCV
+Дата:  23 февраля 2026 г.
 
-КЛЮЧЕВОЕ ИЗМЕНЕНИЕ v4.2:
-Измерение длин стен на основе прямых линий, образованных объединёнными
-прямоугольниками, а не по центральным линиям отдельных прямоугольников.
+Описание пайплайна:
+  1. Загрузка изображения планировки формата «Брусника»
+  2. Детекция стен по цвету #8E8780 (VersatileWallDetector)
+  3. Детекция дверей и окон (YOLODoorWindowDetector + AlgorithmicWindowDetector)
+  4. Геометрический поиск проёмов (GeometricOpeningDetector)
+  4.5 Детекция дуг открывания дверей (AlgorithmicDoorArcDetector)  ← NEW
+  5. OCR + калибровка масштаба по площадям помещений (RoomSizeAnalyzer)
+  6. Измерение длин стен по комнатам — пиксели и метры
+  7. Экспорт в SweetHome3D (.sh3d) и OBJ
+  8. Визуализации (matplotlib, белый фон, минималистичный стиль)
 
-Основной модуль системы анализа стен (CV) и дверей/окон (YOLO + CV алгоритмы)
-с измерением размеров, отображением размеров стен и экспортом в Sweet Home 3D формат.
+Цветовые коды формата «Брусника»:
+  Стены         #8E8780  (общий с круглыми метками — фильтруются морфологией)
+  Мебель        #E2DFDD  (R > 0x8E — исключается из расчётов)
+  Окна          #E2DFDD  (два параллельных отрезка + белый зазор ½ толщины)
+  Двери         #E2DFDD  (линия/прямоугольник + дуга открывания)
+  Метки площади чёрные цифры внутри помещений
+
+Принципы:
+  - Single Responsibility: каждый класс решает одну задачу
+  - Все цвета, шрифты и константы — только в классе Theme
+  - Сбой одного этапа не прерывает обработку изображения
+================================================================================
 """
 
 import cv2
 import numpy as np
 import argparse
 import os
-import json
+import re
+import math
+import logging
 from pathlib import Path
-from typing import Dict, List, Optional
-import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
+from typing import Dict, List, Optional, Set, Tuple
 
-# Внутренние модули
-from detection.walldetector import ColorBasedWallDetector, WallRectangle
+import warnings
+
+# ====================== WARNING SUPPRESSION ======================
+warnings.filterwarnings(
+    "ignore",
+    message=".*pkg_resources is deprecated.*"
+)
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+    message=r".*torch\.load.*weights_only=False.*"
+)
+# ================================================================
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import matplotlib.patheffects as pe
+from matplotlib.gridspec import GridSpec
+from matplotlib.patches import Polygon as MplPolygon, Rectangle as MplRect
+
+from rich.console import Console
+from rich.progress import (
+    Progress, BarColumn, TextColumn, TaskProgressColumn, TimeElapsedColumn,
+)
+from rich.text import Text
+
+from detection.walldetector import VersatileWallDetector, WallRectangle
 from detection.furnituredetector import YOLODoorWindowDetector, YOLOResults
 from detection.windowdetector import AlgorithmicWindowDetector
 from detection.space import RoomSizeAnalyzer, RoomMeasurements
 from detection.gap import GeometricOpeningDetector
-from floorplanexporter import SweetHome3DExporter
-from objexporter import ImprovedOBJExporter
+from floorplanexporter import (
+    SweetHome3DExporter, Point, Wall, Room, Opening, OpeningType,
+    DebugVisualizer, SCALE_FACTOR,
+)
 
+# === DOOR ARC INTEGRATION — Import ===
+from detection.doordetector import AlgorithmicDoorArcDetector
+
+logger = logging.getLogger("main")
+_console = Console()
+
+
+# ============================================================
+# Дизайн-система — цвета, шрифты, константы
+# ============================================================
+
+class Theme:
+    FIG_BG = 'white'
+    AXES_EDGE = '#cccccc'
+    TITLE_COLOR = '#1a1a1a'
+    CAPTION_COLOR = '#666666'
+
+    ROOM_FILLS: List[str] = [
+        '#ddeeff', '#ddf5e8', '#fff8dc',
+        '#fde8e8', '#ede8f8', '#e0f4f4',
+        '#fdeedd', '#e8f5e8', '#fce8f4',
+    ]
+    ROOM_BORDERS: List[str] = [
+        '#2980b9', '#27ae60', '#c8960c',
+        '#c0392b', '#7d3c98', '#148f77',
+        '#ca6f1e', '#1e8449', '#943126',
+    ]
+
+    WALL_OUTER_CV2 = (50, 130, 80)
+    WALL_INNER_CV2 = (100, 100, 100)
+    WALL_OUTER_SHADOW_CV2 = (20, 60, 35)
+    WALL_INNER_SHADOW_CV2 = (55, 55, 55)
+    WALL_LABEL_BG_OUTER = (232, 245, 237)
+    WALL_LABEL_BG_INNER = (238, 238, 238)
+    WINDOW_TINT_CV2 = (185, 225, 225)
+    WINDOW_BORDER_CV2 = (0, 140, 140)
+    DOOR_BORDER_CV2 = (175, 95, 55)
+    GAP_BORDER_CV2 = (170, 155, 45)
+
+    WALL_OUTER_MPL = '#2e7d52'
+    WALL_INNER_MPL = '#646464'
+    DOOR_MPL = '#af6035'
+    WINDOW_MPL = '#007070'
+    OPENING_MPL = '#8a7800'
+    OCR_NUMERIC_MPL = '#1a5c32'
+    OCR_TEXT_MPL = '#555555'
+
+    WATERMARK = 'ReFloor · Brusnika v5.3'
+    PIPELINE_STAGES: List[str] = [
+        'loading',
+        'detecting walls',
+        'detecting openings',
+        'detecting door arcs',       # === DOOR ARC INTEGRATION — new stage ===
+        'measuring rooms',
+        'exporting',
+        'rendering',
+    ]
+
+
+# ============================================================
+# Вспомогательные функции координат
+# ============================================================
+
+def cm_to_px(val_cm: float, pixels_to_cm: float) -> float:
+    return val_cm / pixels_to_cm
+
+
+def room_points_to_px(
+    room: Room, pixels_to_cm: float
+) -> List[Tuple[float, float]]:
+    return [
+        (cm_to_px(p.x, pixels_to_cm), cm_to_px(p.y, pixels_to_cm))
+        for p in room.points
+    ]
+
+
+def polygon_area_from_tuples(pts: List[Tuple[float, float]]) -> float:
+    n = len(pts)
+    if n < 3:
+        return 0.0
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += pts[i][0] * pts[j][1] - pts[j][0] * pts[i][1]
+    return abs(area) / 2.0
+
+
+def point_in_polygon(
+    px: float, py: float, pts: List[Tuple[float, float]]
+) -> bool:
+    n = len(pts)
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = pts[i]
+        xj, yj = pts[j]
+        if ((yi > py) != (yj > py)) and (
+            px < (xj - xi) * (py - yi) / (yj - yi + 1e-12) + xi
+        ):
+            inside = not inside
+        j = i
+    return inside
+
+
+def parse_ocr_area_m2(text: str) -> Optional[float]:
+    cleaned = text.strip().replace(',', '.').replace('²', '2')
+    match = re.search(
+        r'(\d{1,4}(?:\.\d{1,3})?)\s*(?:м2|m2|кв\.?м|sq\.?m)?',
+        cleaned, re.IGNORECASE,
+    )
+    if match:
+        value = float(match.group(1))
+        if 1.0 <= value <= 9999.0:
+            return value
+    return None
+
+
+def format_wall_length(length_cm: float) -> str:
+    if length_cm >= 100:
+        return f'{length_cm / 100:.2f}m'
+    return f'{int(length_cm)}cm'
+
+
+def _iou_xyxy(
+    a: Tuple[float, float, float, float],
+    b: Tuple[float, float, float, float],
+) -> float:
+    """Intersection-over-Union for two (x1,y1,x2,y2) boxes."""
+    ix1 = max(a[0], b[0])
+    iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2])
+    iy2 = min(a[3], b[3])
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter == 0.0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0.0 else 0.0
+
+
+def _are_parallel_and_close(
+    a: Tuple[float, float, float, float],
+    b: Tuple[float, float, float, float],
+    gap_px: float = 6.0,
+) -> bool:
+    """
+    True when two axis-aligned boxes share the same orientation and their
+    parallel edges are within gap_px of each other with >50% length overlap.
+    Catches doubled detections of the same wall gap that IoU alone misses
+    because the boxes sit side-by-side rather than on top of each other.
+    """
+    aw, ah = a[2] - a[0], a[3] - a[1]
+    bw, bh = b[2] - b[0], b[3] - b[1]
+    a_horiz = aw >= ah
+    b_horiz = bw >= bh
+    if a_horiz != b_horiz:
+        return False
+    if a_horiz:
+        v_gap = max(a[1], b[1]) - min(a[3], b[3])
+        h_overlap = min(a[2], b[2]) - max(a[0], b[0])
+        return v_gap < gap_px and h_overlap > max(aw, bw) * 0.5
+    else:
+        h_gap = max(a[0], b[0]) - min(a[2], b[2])
+        v_overlap = min(a[3], b[3]) - max(a[1], b[1])
+        return h_gap < gap_px and v_overlap > max(ah, bh) * 0.5
+
+
+def deduplicate_boxes(
+    yolo_results: Optional[object],
+    color_results: Dict,
+    iou_thresh: float = 0.30,
+    parallel_gap_px: float = 6.0,
+) -> None:
+    """
+    Collect every door/window bbox from every source, sort largest-first,
+    then drop anything that either overlaps (IoU >= iou_thresh) or is a
+    parallel near-duplicate of an already-kept box.  Writes back in-place.
+    Largest box wins — no source has priority.
+    """
+    tagged: List[Tuple] = []
+
+    if yolo_results:
+        for d in (yolo_results.doors or []):
+            b = tuple(float(v) for v in d.bbox)
+            tagged.append(((b[2]-b[0])*(b[3]-b[1]), b, 'yd', d))
+        for w in (yolo_results.windows or []):
+            b = tuple(float(v) for v in w.bbox)
+            tagged.append(((b[2]-b[0])*(b[3]-b[1]), b, 'yw', w))
+
+    for aw in color_results.get('algo_windows', []):
+        b = (float(aw.x), float(aw.y),
+             float(aw.x + aw.w), float(aw.y + aw.h))
+        tagged.append((float(aw.w * aw.h), b, 'aw', aw))
+
+    for op in color_results.get('openings', []):
+        if getattr(op, 'is_valid', True):
+            b = (float(op.x1), float(op.y1),
+                 float(op.x2), float(op.y2))
+            tagged.append(((b[2]-b[0])*(b[3]-b[1]), b, 'op', op))
+
+    if not tagged:
+        return
+
+    tagged.sort(key=lambda t: t[0], reverse=True)
+
+    kept_boxes: list = []
+    survivors: set = set()
+    for i, (_, box, _, _) in enumerate(tagged):
+        if not any(
+            _iou_xyxy(box, kb) >= iou_thresh
+            or _are_parallel_and_close(box, kb, parallel_gap_px)
+            for kb in kept_boxes
+        ):
+            kept_boxes.append(box)
+            survivors.add(i)
+
+    if yolo_results:
+        yolo_results.doors   = [t[3] for i, t in enumerate(tagged) if i in survivors and t[2] == 'yd']
+        yolo_results.windows = [t[3] for i, t in enumerate(tagged) if i in survivors and t[2] == 'yw']
+    color_results['algo_windows'] = [t[3] for i, t in enumerate(tagged) if i in survivors and t[2] == 'aw']
+    color_results['openings']     = [t[3] for i, t in enumerate(tagged) if i in survivors and t[2] == 'op']
+
+
+# ============================================================
+# Утилиты оформления осей matplotlib
+# ============================================================
+
+def _axes_clean(ax: plt.Axes, title: str = '') -> None:
+    for spine in ax.spines.values():
+        spine.set_edgecolor(Theme.AXES_EDGE)
+        spine.set_linewidth(0.5)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    if title:
+        ax.set_title(
+            title,
+            fontsize=9,
+            color=Theme.TITLE_COLOR,
+            fontfamily='sans-serif',
+            fontweight='normal',
+            loc='left',
+            pad=5,
+        )
+
+
+def _watermark(ax: plt.Axes) -> None:
+    ax.text(
+        0.995, 0.015, Theme.WATERMARK,
+        transform=ax.transAxes,
+        fontsize=4.9, color='#aaaaaa',
+        ha='right', va='bottom',
+        fontfamily='sans-serif', fontstyle='italic',
+    )
+
+
+# ============================================================
+# _build_wall_overlay — CV2-разметка поверх оригинала
+# ============================================================
+
+def _build_wall_overlay(
+    img: np.ndarray,
+    yolo_results: Optional[YOLOResults],
+    color_results: Dict,
+    measurements: Optional[RoomMeasurements],
+    pixels_to_cm: float,
+) -> np.ndarray:
+    overlay = img.copy()
+    segments = color_results.get('segments', [])
+    pixel_scale = (
+        measurements.pixel_scale if measurements else pixels_to_cm / 100.0
+    )
+    outer_ids: set = set()
+    if measurements:
+        outer_ids = {w['id'] for w in measurements.walls if w.get('is_outer')}
+
+    for i, seg in enumerate(segments):
+        is_outer = i in outer_ids
+        pt1 = (int(seg.x1), int(seg.y1))
+        pt2 = (int(seg.x2), int(seg.y2))
+        shadow = Theme.WALL_OUTER_SHADOW_CV2 if is_outer else Theme.WALL_INNER_SHADOW_CV2
+        fg = Theme.WALL_OUTER_CV2 if is_outer else Theme.WALL_INNER_CV2
+        cv2.line(overlay, pt1, pt2, shadow, 6)
+        cv2.line(overlay, pt1, pt2, fg, 3)
+
+        length_px = math.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1)
+        if length_px < 20:
+            continue
+
+        length_cm = length_px * pixel_scale * 100
+        txt = format_wall_length(length_cm)
+        mx = int((seg.x1 + seg.x2) / 2)
+        my = int((seg.y1 + seg.y2) / 2)
+        is_h = abs(seg.x2 - seg.x1) > abs(seg.y2 - seg.y1)
+        ox, oy = (0, -12) if is_h else (12, 3)
+
+        (tw, th), bl = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+        p = 2
+        rx1 = max(0, mx + ox - p)
+        ry1 = max(0, my + oy - th - p)
+        rx2 = min(img.shape[1], mx + ox + tw + p)
+        ry2 = min(img.shape[0], my + oy + bl + p)
+
+        sub = overlay[ry1:ry2, rx1:rx2]
+        if sub.size:
+            bg = (
+                Theme.WALL_LABEL_BG_OUTER
+                if is_outer else Theme.WALL_LABEL_BG_INNER
+            )
+            bg_layer = np.full_like(sub, bg)
+            cv2.addWeighted(sub, 0.15, bg_layer, 0.85, 0, sub)
+
+        cv2.putText(
+            overlay, txt, (mx + ox, my + oy),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+            (35, 35, 35), 1, cv2.LINE_AA,
+        )
+
+    for win in color_results.get('algo_windows', []):
+        x, y, ww, hh = win.x, win.y, win.w, win.h
+        sub = overlay[y:y + hh, x:x + ww]
+        if sub.size:
+            tint = np.full_like(sub, Theme.WINDOW_TINT_CV2)
+            cv2.addWeighted(sub, 0.55, tint, 0.45, 0, sub)
+        cv2.rectangle(overlay, (x, y), (x + ww, y + hh),
+                      Theme.WINDOW_BORDER_CV2, 2)
+
+    if yolo_results and yolo_results.doors:
+        for d in yolo_results.doors:
+            x1, y1, x2, y2 = map(int, d.bbox)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2),
+                          Theme.DOOR_BORDER_CV2, 2)
+
+    if yolo_results and yolo_results.windows:
+        for w in yolo_results.windows:
+            x1, y1, x2, y2 = map(int, w.bbox)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2),
+                          Theme.WINDOW_BORDER_CV2, 2)
+
+    for op in color_results.get('openings', []):
+        if getattr(op, 'is_valid', True):
+            cv2.rectangle(overlay, (op.x1, op.y1), (op.x2, op.y2),
+                          Theme.GAP_BORDER_CV2, 2)
+
+    # === DOOR ARC INTEGRATION — Step 2.4: Draw detected swing arcs ===
+    for arc in color_results.get('door_arcs', []):
+        AlgorithmicDoorArcDetector.draw_arc_on_image(
+            overlay, arc,
+            color=Theme.DOOR_BORDER_CV2,
+            thickness=3,
+            draw_hinge=True,
+            draw_label=False,
+        )
+
+    return overlay
+
+
+# ============================================================
+# render_summary — 2×2 белая сетка (оригинал / оверлей / маска / комнаты)
+# ============================================================
+
+def render_summary(
+        img_bgr: np.ndarray,
+        yolo_results: Optional[YOLOResults],
+        color_results: Dict,
+        measurements: Optional[RoomMeasurements],
+        pixels_to_cm: float,
+        output_path: str,
+) -> None:
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    h, w = img_bgr.shape[:2]
+    dpi = 160
+
+    fig = plt.figure(figsize=(17.8, 13.4), dpi=dpi, facecolor=Theme.FIG_BG)
+
+    gs = GridSpec(2, 2, figure=fig,
+                  left=0.025, right=0.975,
+                  top=0.905, bottom=0.055,
+                  hspace=0.10, wspace=0.030)
+
+    n_walls = len(color_results.get('segments', []))
+    n_doors = len(yolo_results.doors) if yolo_results else 0
+    n_windows = len(color_results.get('algo_windows', []))
+    n_arcs = len(color_results.get('door_arcs', []))     # === DOOR ARC INTEGRATION ===
+    area_str = f'{measurements.area_m2:.1f} m²' if measurements else '—'
+
+    fig.text(
+        0.5, 0.965, 'Floor Plan Analysis',
+        fontsize=13.5, color=Theme.TITLE_COLOR,
+        fontfamily='sans-serif', fontweight='semibold',
+        ha='center', va='top',
+    )
+    # === DOOR ARC INTEGRATION — show arc count in subtitle ===
+    fig.text(
+        0.5, 0.938,
+        f'{n_walls} walls  ·  {n_doors} doors  ·  {n_windows} windows'
+        f'  ·  {n_arcs} swing arcs  ·  {area_str}',
+        fontsize=8.8, color=Theme.CAPTION_COLOR,
+        fontfamily='sans-serif', ha='center', va='top',
+    )
+
+    ax_orig = fig.add_subplot(gs[0, 0])
+    ax_overlay = fig.add_subplot(gs[0, 1])
+    ax_mask = fig.add_subplot(gs[1, 0])
+    ax_rooms = fig.add_subplot(gs[1, 1])
+
+    ax_orig.imshow(img_rgb, interpolation='bilinear')
+    _axes_clean(ax_orig, 'Original')
+    _watermark(ax_orig)
+
+    overlay = _build_wall_overlay(
+        img_bgr, yolo_results, color_results, measurements, pixels_to_cm,
+    )
+    ax_overlay.imshow(
+        cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), interpolation='bilinear'
+    )
+    _axes_clean(ax_overlay, 'Walls & Openings')
+    _watermark(ax_overlay)
+
+    mask = color_results.get(
+        'outline_mask', np.zeros(img_bgr.shape[:2], np.uint8)
+    )
+    ax_mask.imshow(mask, cmap='binary', interpolation='nearest')
+    _axes_clean(ax_mask, 'Wall Structure Mask')
+    _watermark(ax_mask)
+
+    ax_rooms.imshow(img_rgb, interpolation='bilinear', alpha=0.36)
+    ax_rooms.set_xlim(0, w)
+    ax_rooms.set_ylim(h, 0)
+    _axes_clean(ax_rooms, 'Detected Rooms')
+    _watermark(ax_rooms)
+
+    fig.savefig(
+        output_path, dpi=dpi, bbox_inches='tight',
+        facecolor=Theme.FIG_BG, edgecolor='none', pad_inches=0.015,
+    )
+    plt.close(fig)
+
+
+# ============================================================
+# render_room_ocr_overlay — комнаты + OCR (отдельный файл)
+# ============================================================
+
+def render_room_ocr_overlay(
+    img_bgr: np.ndarray,
+    rooms: List[Room],
+    openings: List[Opening],
+    ocr_labels: Optional[List[Tuple[str, int, int, int, int]]],
+    pixels_to_cm: float,
+    output_path: str,
+    door_arcs: Optional[List] = None,    # === DOOR ARC INTEGRATION — optional param ===
+) -> None:
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    h, w = img_bgr.shape[:2]
+    dpi = 150
+
+    fig, ax = plt.subplots(
+        1, 1,
+        figsize=(w / dpi + 0.3, h / dpi + 0.5),
+        dpi=dpi, facecolor=Theme.FIG_BG,
+    )
+    fig.subplots_adjust(left=0.01, right=0.99, top=0.95, bottom=0.01)
+
+    fig.text(
+        0.01, 0.98, 'Rooms & OCR labels',
+        fontsize=8, color=Theme.TITLE_COLOR,
+        fontfamily='sans-serif', fontweight='semibold', va='top',
+    )
+
+    ax.imshow(img_rgb, interpolation='bilinear')
+    ax.set_xlim(0, w)
+    ax.set_ylim(h, 0)
+    _axes_clean(ax)
+    _watermark(ax)
+
+    for i, room in enumerate(rooms):
+        fill = Theme.ROOM_FILLS[i % len(Theme.ROOM_FILLS)]
+        border = Theme.ROOM_BORDERS[i % len(Theme.ROOM_BORDERS)]
+        pts_px = room_points_to_px(room, pixels_to_cm)
+        if len(pts_px) < 3:
+            continue
+
+        poly = MplPolygon(
+            pts_px, closed=True,
+            facecolor=fill, alpha=0.28,
+            edgecolor=border, linewidth=1.6,
+            zorder=2,
+        )
+        ax.add_patch(poly)
+
+        cx = sum(p[0] for p in pts_px) / len(pts_px)
+        cy = sum(p[1] for p in pts_px) / len(pts_px)
+        ax.text(
+            cx, cy, room.name,
+            fontsize=6, color=border,
+            fontfamily='sans-serif', fontweight='semibold',
+            ha='center', va='center',
+            bbox=dict(
+                boxstyle='round,pad=0.22',
+                facecolor='white', alpha=0.80,
+                edgecolor=border, linewidth=0.6,
+            ),
+            zorder=5,
+        )
+
+    for opening in openings:
+        ox = cm_to_px(opening.center.x, pixels_to_cm)
+        oy = cm_to_px(opening.center.y, pixels_to_cm)
+        if opening.opening_type == OpeningType.DOOR:
+            color, marker = Theme.DOOR_MPL, 's'
+        elif opening.opening_type == OpeningType.WINDOW:
+            color, marker = Theme.WINDOW_MPL, 'D'
+        else:
+            color, marker = Theme.OPENING_MPL, 'o'
+        ax.plot(ox, oy, marker, color=color, markersize=4.5,
+                markeredgecolor='white', markeredgewidth=0.5,
+                alpha=0.85, zorder=4)
+
+    if ocr_labels:
+        for text, x1, y1, x2, y2 in ocr_labels:
+            is_num = parse_ocr_area_m2(text) is not None
+            ec = Theme.OCR_NUMERIC_MPL if is_num else Theme.OCR_TEXT_MPL
+            ax.add_patch(MplRect(
+                (x1, y1), x2 - x1, y2 - y1,
+                linewidth=0.6 if is_num else 0.35,
+                edgecolor=ec, facecolor='none',
+                linestyle='-' if is_num else ':',
+                zorder=3,
+            ))
+            ax.text(
+                x1 + 1, y1 - 2, text,
+                fontsize=4.5, color=ec, va='bottom',
+                fontweight='semibold' if is_num else 'normal',
+                fontfamily='sans-serif', zorder=4,
+            )
+
+    # === DOOR ARC INTEGRATION — Draw arcs on room/OCR overlay ===
+    if door_arcs:
+        # Convert BGR overlay drawing to matplotlib: draw arcs as
+        # matplotlib Arc patches for clean vector rendering
+        from matplotlib.patches import Arc as MplArc
+        for arc in door_arcs:
+            cx, cy = arc.center
+            r = arc.radius_px
+            # matplotlib Arc uses diameter, angles in degrees
+            # Note: matplotlib y-axis is inverted in imshow, but we set
+            # ylim(h, 0) so angles work correctly with sign flip
+            arc_patch = MplArc(
+                (cx, cy), r * 2, r * 2,
+                angle=0,
+                theta1=arc.start_angle_deg,
+                theta2=arc.end_angle_deg,
+                color=Theme.DOOR_MPL,
+                linewidth=1.9,
+                linestyle='--',
+                zorder=6,
+            )
+            ax.add_patch(arc_patch)
+            # Hinge marker
+            hx, hy = arc.hinge
+            ax.plot(hx, hy, 'd', color=Theme.DOOR_MPL, markersize=5.5,
+                    markeredgecolor='white', markeredgewidth=0.4,
+                    zorder=7)
+
+    fig.savefig(
+        output_path, dpi=dpi, bbox_inches='tight',
+        facecolor=Theme.FIG_BG, edgecolor='none',
+    )
+    plt.close(fig)
+
+
+# ============================================================
+# calibrate_scale_factor
+# ============================================================
+
+def calibrate_scale_factor(
+    rooms: List[Room],
+    ocr_labels: List[Tuple[str, int, int, int, int]],
+    pixels_to_cm: float,
+    current_scale_factor: float,
+) -> Optional[float]:
+    if not rooms or not ocr_labels:
+        return None
+    parsed: List[Tuple[float, float, float]] = []
+    for text, x1, y1, x2, y2 in ocr_labels:
+        area = parse_ocr_area_m2(text)
+        if area is not None:
+            parsed.append((area, (x1 + x2) / 2.0, (y1 + y2) / 2.0))
+    if not parsed:
+        return None
+    m_per_px = pixels_to_cm / 100.0
+    ratios: List[float] = []
+    for room in rooms:
+        pts_px = room_points_to_px(room, pixels_to_cm)
+        if len(pts_px) < 3:
+            continue
+        matched = [
+            a for a, cx, cy in parsed
+            if point_in_polygon(cx, cy, pts_px)
+        ]
+        if len(matched) != 1:
+            continue
+        area_px2 = polygon_area_from_tuples(pts_px)
+        if area_px2 < 1.0:
+            continue
+        ratios.append(math.sqrt(area_px2 * (m_per_px ** 2) / matched[0]))
+    if not ratios:
+        return None
+    return float(np.median(ratios))
+
+
+# ============================================================
+# _SegmentStub
+# ============================================================
+
+class _SegmentStub:
+    def __init__(
+        self,
+        x1: int, y1: int, x2: int, y2: int,
+        thickness_mean: float = 0.0,
+    ) -> None:
+        self.x1 = x1
+        self.y1 = y1
+        self.x2 = x2
+        self.y2 = y2
+        self.thickness_mean = thickness_mean
+
+
+# ============================================================
+# HybridWallAnalyzer
+# ============================================================
 
 class HybridWallAnalyzer:
-    """
-    Гибридный анализатор стен и проемов с измерением размеров.
-    Объединяет YOLO детекцию с алгоритмами компьютерного зрения для комплексного анализа планировок.
-    Экспортирует результаты в формат Sweet Home 3D (.sh3d).
 
-    v4.2 МОДИФИКАЦИЯ:
-    - Измерение длин стен по объединённым прямоугольникам вместо центральных линий
-    - Группировка выровненных прямоугольников
-    - Использование внешних границ для расчёта длины
-    """
-
-    class _SegmentStub:
-        """Псевдо-сегмент стены для расчета измерений."""
-        def __init__(self, x1: int, y1: int, x2: int, y2: int, thickness_mean: float = 0.0):
-            self.x1 = x1
-            self.y1 = y1
-            self.x2 = x2
-            self.y2 = y2
-            self.thickness_mean = thickness_mean
-
-    def __init__(self,
-                 yolo_model_path: str,
-                 wall_color_hex: str = "8E8780",
-                 color_tolerance: int = 3,
-                 yolo_conf_threshold: float = 0.5,
-                 device: str = "cpu",
-                 auto_wall_color: bool = False,
-                 enable_measurements: bool = True,
-                 edge_distance_ratio: float = 0.15,
-                 debug_ocr: bool = False,
-                 enable_visuals: bool = True,
-                 min_window_len: int = 15,
-                 edge_expansion_tolerance: int = 8,
-                 max_edge_expansion_px: int = 10,
-                 enable_sh3d_export: bool = True,
-                 skip_bbox_check: bool = True,
-                 wall_height_cm: float = 243.84,
-                 snap_tolerance_px: float = 5.0,
-                 min_wall_thickness_px: float = 5.0,
-                 pixels_to_cm: float = 2.54,
-                 auto_create_room: bool = True,
-                 show_wall_sizes: bool = True,
-                 enable_obj_export: bool = True,
-                 obj_include_floor: bool = True,
-                 obj_include_ceiling: bool = False):
-        """
-        Инициализация гибридного анализатора стен.
-
-        Параметры:
-            yolo_model_path: Путь к весам YOLO модели
-            wall_color_hex: HEX код цвета стен для детекции
-            color_tolerance: Допуск RGB для определения цвета
-            yolo_conf_threshold: Порог уверенности YOLO
-            device: Устройство обработки ('cpu' или 'cuda')
-            auto_wall_color: Автоматическое определение цвета стен
-            enable_measurements: Включить измерение площади помещений
-            edge_distance_ratio: Коэффициент для определения внешних стен
-            debug_ocr: Включить отладочный вывод OCR
-            enable_visuals: Включить визуализацию результатов
-            min_window_len: Минимальная длина окна для детекции
-            edge_expansion_tolerance: Допуск для расширения краёв стен
-            max_edge_expansion_px: Максимальное расширение краёв в пикселях
-            enable_sh3d_export: Включить экспорт в Sweet Home 3D формат
-            skip_bbox_check: Пропускать проверку bbox при детекции проёмов
-            wall_height_cm: Высота стен в сантиметрах для Sweet Home 3D
-            snap_tolerance_px: Допуск привязки в пикселях
-            min_wall_thickness_px: Минимальная толщина стены в пикселях
-            pixels_to_cm: Коэффициент преобразования пикселей в сантиметры
-            auto_create_room: Автоматически создавать полигон комнаты
-            show_wall_sizes: Отображать размеры стен на визуализации
-            enable_obj_export: Включить экспорт в OBJ формат (v2.0 - Sweet Home 3D compatible)
-            obj_include_floor: Включить плоскость пола в OBJ экспорт
-            obj_include_ceiling: Включить плоскость потолка в OBJ экспорт
-        """
-        # Инициализация OCR модели docTR
+    def __init__(
+        self,
+        yolo_model_path: str,
+        wall_color_hex: str = '8E8780',
+        color_tolerance: int = 3,
+        yolo_conf_threshold: float = 0.5,
+        device: str = 'cpu',
+        auto_wall_color: bool = False,
+        enable_measurements: bool = True,
+        edge_distance_ratio: float = 0.15,
+        debug_ocr: bool = False,
+        min_window_len: int = 15,
+        edge_expansion_tolerance: int = 8,
+        max_edge_expansion_px: int = 10,
+        wall_height_cm: float = 243.84,
+        min_wall_thickness_px: float = 5.0,
+        pixels_to_cm: float = 2.54,
+        enable_obj_export: bool = True,
+        obj_include_floor: bool = True,
+        obj_include_ceiling: bool = False,
+        scale_factor: float = SCALE_FACTOR,
+        wall_detection_mode: str = 'hybrid',
+        structure_method: str = 'lines',
+        output_dir: str = 'output_v5',           # === DOOR ARC INTEGRATION — needed for debug path ===
+    ) -> None:
         self.ocr_model = self._init_doctr()
+        self.pixels_to_cm = pixels_to_cm
+        self.scale_factor = scale_factor
 
-        # Инициализация YOLO детектора
         self.yolo_detector = YOLODoorWindowDetector(
             model_path=yolo_model_path,
             conf_threshold=yolo_conf_threshold,
-            device=device
+            device=device,
         )
-
-        # Инициализация детектора стен по цвету
-        self.color_detector = ColorBasedWallDetector(
+        self.color_detector = VersatileWallDetector(
             wall_color_hex=wall_color_hex,
             color_tolerance=color_tolerance,
             auto_wall_color=auto_wall_color,
@@ -127,1206 +756,737 @@ class HybridWallAnalyzer:
             rect_visual_gap_px=3,
             ocr_model=self.ocr_model,
             edge_expansion_tolerance=edge_expansion_tolerance,
-            max_edge_expansion_px=max_edge_expansion_px
+            max_edge_expansion_px=max_edge_expansion_px,
+            wall_detection_mode=wall_detection_mode,
+            structure_method=structure_method,
         )
-
-        # Инициализация алгоритмического детектора окон
         self.algo_window_detector = AlgorithmicWindowDetector(
             min_window_len=min_window_len,
-            ocr_model=self.ocr_model
+            ocr_model=self.ocr_model,
         )
-
-        # Сохранение параметров конфигурации
-        self.enable_measurements = enable_measurements
-        self.enable_visuals = enable_visuals
-        self.enable_sh3d_export = enable_sh3d_export
-        self.skip_bbox_check = skip_bbox_check
-        self.wall_height_cm = wall_height_cm
-        self.snap_tolerance_px = snap_tolerance_px
-        self.min_wall_thickness_px = min_wall_thickness_px
-        self.pixels_to_cm = pixels_to_cm
-        self.auto_create_room = auto_create_room
-        self.show_wall_sizes = show_wall_sizes
-        self.enable_obj_export = enable_obj_export
-        self.obj_include_floor = obj_include_floor
-        self.obj_include_ceiling = obj_include_ceiling
-
-        self.size_analyzer = None
-        self.sh3d_exporter = None
-
-        # Инициализация детектора проёмов
         self.gap_detector = GeometricOpeningDetector(
-            max_extension_length=200,
-            small_rect_aspect_threshold=3.0,
-            small_rect_min_side=10,
-            merge_distance=3,
-            yolo_iou_threshold=0.3
+            max_extension_length=300,
+            small_rect_aspect_threshold=2.0,
+            small_rect_min_side=3,
+            merge_distance=8,
+            yolo_iou_threshold=0.0,
+        )
+        # Relaxed detector used during YOLO-targeted re-detection.
+        # yolo_iou_threshold=0.0 prevents the detector from suppressing gaps
+        # that coincide with a YOLO box — which is exactly what we need here,
+        # since we're searching *inside* those boxes.
+        # merge_distance is wider to bridge scan-line breaks caused by
+        # painting the door leaf white.
+        self.gap_detector_targeted = GeometricOpeningDetector(
+            max_extension_length=300,
+            small_rect_aspect_threshold=2.5,
+            small_rect_min_side=3,
+            merge_distance=8,
+            yolo_iou_threshold=0.0,
         )
 
-        # Инициализация анализатора размеров помещения
-        if enable_measurements:
-            self.size_analyzer = RoomSizeAnalyzer(
+        # === DOOR ARC INTEGRATION — Step 2.1: Instantiate arc detector ===
+        self.arc_detector = AlgorithmicDoorArcDetector(
+            min_arc_radius_m=0.6,
+            max_arc_radius_m=1.2,
+            attachment_proximity_px=12,
+            enable_furniture_filter=True,
+            debug=False,                                              # set True during first tests
+            debug_output_dir=os.path.join(output_dir, 'debug'),       # creates subfolder if needed
+        )
+
+        self.enable_measurements = enable_measurements
+        self.size_analyzer: Optional[RoomSizeAnalyzer] = (
+            RoomSizeAnalyzer(
                 edge_distance_ratio=edge_distance_ratio,
-                debug_ocr=debug_ocr
+                debug_ocr=debug_ocr,
             )
+            if enable_measurements else None
+        )
+        self.sh3d_exporter = SweetHome3DExporter(
+            min_wall_thickness=min_wall_thickness_px,
+            pixels_to_cm=pixels_to_cm,
+            wall_height_cm=wall_height_cm,
+            scale_factor=scale_factor,
+        )
 
-        # Инициализация Sweet Home 3D экспортера
-        if enable_sh3d_export:
-            self.sh3d_exporter = SweetHome3DExporter(
-                min_wall_thickness=min_wall_thickness_px,
-                pixels_to_cm=pixels_to_cm,
-                wall_height_cm=wall_height_cm
-            )
-
-        # Инициализация OBJ экспортера v2.0 (Sweet Home 3D compatible)
-        self.obj_exporter = None
-        if enable_obj_export:
-            self.obj_exporter = ImprovedOBJExporter(
-                pixels_to_cm=pixels_to_cm,
-                wall_height_cm=wall_height_cm,
-                include_floor=obj_include_floor,
-                include_ceiling=obj_include_ceiling
-            )
-
-    def _init_doctr(self) -> Optional[object]:
-        """Инициализация модели docTR для распознавания текста."""
+    @staticmethod
+    def _init_doctr():
         try:
             from doctr.models import ocr_predictor
             return ocr_predictor(pretrained=True)
         except Exception:
             return None
 
-    # ============================================================
-    # МОДИФИЦИРОВАННЫЕ МЕТОДЫ v4.2 - EDGE-BASED MEASUREMENTS
-    # ============================================================
-
-    def _rectangles_to_segments(self, rectangles: List[WallRectangle]) -> List[_SegmentStub]:
-        """
-        Преобразование прямоугольников стен в сегменты для измерений.
-        Объединяет соседние прямоугольники в единые линии стен.
-
-        МОДИФИКАЦИЯ v4.2: Использует внешние границы объединённых прямоугольников
-        вместо центральных линий отдельных прямоугольников.
-
-        Параметры:
-            rectangles: Список обнаруженных прямоугольников стен
-
-        Возвращает:
-            Список сегментов с информацией о толщине
-        """
+    def _rectangles_to_segments(
+        self, rectangles: List[WallRectangle],
+    ) -> List[_SegmentStub]:
         if not rectangles:
             return []
+        h_rects = [
+            r for r in rectangles
+            if r.width >= r.height and r.width > 0 and r.height > 0
+        ]
+        v_rects = [
+            r for r in rectangles
+            if r.width < r.height and r.width > 0 and r.height > 0
+        ]
+        segs: List[_SegmentStub] = []
+        if h_rects:
+            segs.extend(self._merge_aligned(h_rects, True))
+        if v_rects:
+            segs.extend(self._merge_aligned(v_rects, False))
+        return segs
 
-        # Группировка прямоугольников по ориентации
-        horizontal_rects = []
-        vertical_rects = []
-
-        for r in rectangles:
-            if r.width <= 0 or r.height <= 0:
-                continue
-
-            if r.width >= r.height:
-                horizontal_rects.append(r)
-            else:
-                vertical_rects.append(r)
-
-        segments: List[HybridWallAnalyzer._SegmentStub] = []
-
-        # Обработка горизонтальных стен
-        if horizontal_rects:
-            segments.extend(self._merge_aligned_rectangles(horizontal_rects, is_horizontal=True))
-
-        # Обработка вертикальных стен
-        if vertical_rects:
-            segments.extend(self._merge_aligned_rectangles(vertical_rects, is_horizontal=False))
-
-        return segments
-
-    def _merge_aligned_rectangles(self, rectangles: List[WallRectangle], is_horizontal: bool) -> List[_SegmentStub]:
-        """
-        Объединение выровненных прямоугольников в единые линейные сегменты.
-
-        Алгоритм:
-        1. Группировка прямоугольников по выравниванию (Y для горизонтальных, X для вертикальных)
-        2. Сортировка прямоугольников в каждой группе
-        3. Объединение непрерывных прямоугольников в сегменты
-        4. Расчёт длины по внешним границам
-
-        Параметры:
-            rectangles: Список прямоугольников одной ориентации
-            is_horizontal: True для горизонтальных, False для вертикальных
-
-        Возвращает:
-            Список объединённых сегментов
-        """
-        if not rectangles:
-            return []
-
-        # Допуск для выравнивания (пиксели)
-        alignment_tolerance = 5
-        # Максимальный зазор для объединения (пиксели)
-        gap_tolerance = 3
-
-        # Группировка прямоугольников по выравниванию
-        groups = []
-
-        for rect in rectangles:
+    def _merge_aligned(
+        self, rects: List[WallRectangle], is_h: bool,
+    ) -> List[_SegmentStub]:
+        tol, gap_tol = 5, 3
+        groups: List[List[WallRectangle]] = []
+        for r in rects:
             placed = False
-
-            for group in groups:
-                # Проверка выравнивания с существующей группой
-                if self._can_merge_into_group(rect, group, is_horizontal, alignment_tolerance):
-                    group.append(rect)
+            for g in groups:
+                align_val = r.y2 if is_h else r.x2
+                ref_vals = [rr.y2 if is_h else rr.x2 for rr in g]
+                if any(abs(align_val - rv) <= tol for rv in ref_vals):
+                    g.append(r)
                     placed = True
                     break
-
             if not placed:
-                groups.append([rect])
+                groups.append([r])
+        segs: List[_SegmentStub] = []
+        for g in groups:
+            g.sort(key=lambda r: r.x1 if is_h else r.y1)
+            cur: List[WallRectangle] = []
+            for r in g:
+                if not cur:
+                    cur.append(r)
+                    continue
+                gap = (r.x1 - cur[-1].x2) if is_h else (r.y1 - cur[-1].y2)
+                if gap <= gap_tol:
+                    cur.append(r)
+                else:
+                    segs.append(self._build_seg(cur, is_h))
+                    cur = [r]
+            if cur:
+                segs.append(self._build_seg(cur, is_h))
+        return segs
 
-        # Преобразование групп в сегменты
-        segments = []
+    @staticmethod
+    def _build_seg(
+        rects: List[WallRectangle], is_h: bool,
+    ) -> _SegmentStub:
+        x1 = min(r.x1 for r in rects)
+        x2 = max(r.x2 for r in rects)
+        y1 = min(r.y1 for r in rects)
+        y2 = max(r.y2 for r in rects)
+        avg_t = sum(r.height if is_h else r.width for r in rects) / len(rects)
+        if is_h:
+            return _SegmentStub(int(x1), int(y2), int(x2), int(y2), float(avg_t))
+        return _SegmentStub(int(x2), int(y1), int(x2), int(y2), float(avg_t))
 
-        for group in groups:
-            if not group:
-                continue
-
-            # Сортировка прямоугольников в группе
-            if is_horizontal:
-                group.sort(key=lambda r: r.x1)
-            else:
-                group.sort(key=lambda r: r.y1)
-
-            # Объединение прямоугольников в непрерывные сегменты
-            merged_segments = self._create_merged_segments(group, is_horizontal, gap_tolerance)
-            segments.extend(merged_segments)
-
-        return segments
-
-    def _can_merge_into_group(self, rect: WallRectangle, group: List[WallRectangle],
-                              is_horizontal: bool, tolerance: int) -> bool:
-        """
-        Проверка возможности добавления прямоугольника в группу.
-
-        Использует края прямоугольников для выравнивания:
-        - Горизонтальные стены: проверка по Y-координатам (нижний край)
-        - Вертикальные стены: проверка по X-координатам (правый край)
-
-        Параметры:
-            rect: Проверяемый прямоугольник
-            group: Группа прямоугольников
-            is_horizontal: Ориентация группы
-            tolerance: Допуск выравнивания
-
-        Возвращает:
-            True если прямоугольник выровнен с группой
-        """
-        if not group:
-            return True
-
-        # Для горизонтальных: проверка выравнивания по Y
-        # Для вертикальных: проверка выравнивания по X
-
-        if is_horizontal:
-            # Используем нижний край для выравнивания (более стабильный)
-            rect_align = rect.y2
-            group_align_values = [r.y2 for r in group]
-        else:
-            # Используем правый край для выравнивания
-            rect_align = rect.x2
-            group_align_values = [r.x2 for r in group]
-
-        # Проверка выравнивания с любым прямоугольником в группе
-        for align_val in group_align_values:
-            if abs(rect_align - align_val) <= tolerance:
-                return True
-
-        return False
-
-    def _create_merged_segments(self, group: List[WallRectangle],
-                                is_horizontal: bool, gap_tolerance: int) -> List[_SegmentStub]:
-        """
-        Создание объединённых сегментов из группы выровненных прямоугольников.
-
-        Прямоугольники объединяются если зазор между ними не превышает gap_tolerance.
-        Это позволяет игнорировать небольшие визуальные разрывы (например, от дверей).
-
-        Параметры:
-            group: Группа выровненных прямоугольников (уже отсортированных)
-            is_horizontal: Ориентация группы
-            gap_tolerance: Максимальный зазор для объединения
-
-        Возвращает:
-            Список непрерывных сегментов
-        """
-        if not group:
-            return []
-
-        segments = []
-        current_segment = []
-
-        for rect in group:
-            if not current_segment:
-                current_segment.append(rect)
-                continue
-
-            # Проверка непрерывности с последним прямоугольником
-            last_rect = current_segment[-1]
-
-            if is_horizontal:
-                gap = rect.x1 - last_rect.x2
-            else:
-                gap = rect.y1 - last_rect.y2
-
-            if gap <= gap_tolerance:
-                # Продолжение текущего сегмента
-                current_segment.append(rect)
-            else:
-                # Создание нового сегмента
-                segments.append(self._build_segment_from_rectangles(current_segment, is_horizontal))
-                current_segment = [rect]
-
-        # Добавление последнего сегмента
-        if current_segment:
-            segments.append(self._build_segment_from_rectangles(current_segment, is_horizontal))
-
-        return segments
-
-    def _build_segment_from_rectangles(self, rects: List[WallRectangle],
-                                       is_horizontal: bool) -> _SegmentStub:
-        """
-        Построение единого сегмента из списка прямоугольников.
-        Использует внешние границы объединённых прямоугольников.
-
-        КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: Длина сегмента определяется расстоянием между
-        крайними точками объединённых прямоугольников, а не суммой отдельных длин.
-
-        Параметры:
-            rects: Список прямоугольников для объединения
-            is_horizontal: Ориентация сегмента
-
-        Возвращает:
-            Объединённый сегмент с координатами внешних границ
-        """
-        if not rects:
-            raise ValueError("Empty rectangle list")
-
-        # Вычисление границ объединённой области
-        x1_min = min(r.x1 for r in rects)
-        x2_max = max(r.x2 for r in rects)
-        y1_min = min(r.y1 for r in rects)
-        y2_max = max(r.y2 for r in rects)
-
-        # Средняя толщина
-        avg_thickness = sum(r.height if is_horizontal else r.width for r in rects) / len(rects)
-
-        if is_horizontal:
-            # Горизонтальный сегмент: от левого до правого края
-            # Используем нижний край стены (y2_max) для более точного представления
-            y_line = y2_max
-            return HybridWallAnalyzer._SegmentStub(
-                x1=int(x1_min),
-                y1=int(y_line),
-                x2=int(x2_max),
-                y2=int(y_line),
-                thickness_mean=float(avg_thickness)
-            )
-        else:
-            # Вертикальный сегмент: от верхнего до нижнего края
-            # Используем правый край стены (x2_max)
-            x_line = x2_max
-            return HybridWallAnalyzer._SegmentStub(
-                x1=int(x_line),
-                y1=int(y1_min),
-                x2=int(x_line),
-                y2=int(y2_max),
-                thickness_mean=float(avg_thickness)
-            )
-
-    # ============================================================
-    # ОСТАЛЬНЫЕ МЕТОДЫ БЕЗ ИЗМЕНЕНИЙ
-    # ============================================================
-
-    def _convert_segments_to_wall_segments(self, segments) -> List[Dict]:
-        """Преобразование сегментов в словари для измерений."""
-        wall_segments = []
-        for i, seg in enumerate(segments):
-            length = float(np.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1))
-            wall_segments.append({
+    def _segments_to_dicts(
+        self, segments: List[_SegmentStub],
+    ) -> List[Dict]:
+        return [
+            {
                 'id': i,
-                'x1': int(seg.x1), 'y1': int(seg.y1),
-                'x2': int(seg.x2), 'y2': int(seg.y2),
-                'length_pixels': length,
-                'thickness': float(getattr(seg, "thickness_mean", 0.0))
-            })
-        return wall_segments
+                'x1': int(s.x1), 'y1': int(s.y1),
+                'x2': int(s.x2), 'y2': int(s.y2),
+                'length_pixels': float(math.hypot(s.x2 - s.x1, s.y2 - s.y1)),
+                'thickness': float(s.thickness_mean),
+            }
+            for i, s in enumerate(segments)
+        ]
 
-    def _refine_living_space_with_doors(self, measurements, wall_mask, yolo_results, non_interior_threshold=0.02):
-        """
-        Уточнение границ жилой площади на основе расположения дверей.
-
-        Параметры:
-            measurements: Данные измерений помещения
-            wall_mask: Бинарная маска стен
-            yolo_results: Результаты YOLO детекции
-            non_interior_threshold: Порог для определения нежилого пространства
-        """
-        if yolo_results is None or not getattr(yolo_results, "doors", None):
-            return
-        ab = getattr(measurements, "apartment_boundary", None)
-        if ab is None:
-            return
-
-        if ab.ndim == 3:
-            ab_gray = cv2.cvtColor(ab, cv2.COLOR_BGR2GRAY)
-        else:
-            ab_gray = ab
-
-        interior_mask = ab_gray > 0
-        h, w = interior_mask.shape
-        remove_mask = np.zeros_like(interior_mask, dtype=bool)
-
-        for det in yolo_results.doors:
-            x1, y1, x2, y2 = det.bbox
-            x1, x2 = sorted((int(np.floor(x1)), int(np.ceil(x2))))
-            y1, y2 = sorted((int(np.floor(y1)), int(np.ceil(y2))))
-            x1 = max(0, min(w - 1, x1))
-            x2 = max(0, min(w, x2))
-            y1 = max(0, min(h - 1, y1))
-            y2 = max(0, min(h, y2))
-
-            if x2 <= x1 or y2 <= y1:
-                continue
-            sub = interior_mask[y1:y2, x1:x2]
-            if sub.size == 0:
-                continue
-
-            frac = (sub.size - int(sub.sum())) / float(sub.size)
-            if frac > non_interior_threshold:
-                remove_mask[y1:y2, x1:x2] = True
-
-        if remove_mask.any():
-            new_ab = ab_gray.copy()
-            new_ab[remove_mask] = 0
-            measurements.apartment_boundary = new_ab
-            px_scale = float(getattr(measurements, "pixel_scale", 0.0) or 0.0)
-            if px_scale > 0:
-                measurements.area_m2 = float((new_ab > 0).sum()) * (px_scale ** 2)
-
-    def _convert_rectangles_for_sh3d(self, rectangles: List[WallRectangle]) -> List[Dict]:
-        """Преобразование объектов WallRectangle в словари для Sweet Home 3D формата."""
+    def _rects_for_sh3d(
+        self, rectangles: List[WallRectangle],
+    ) -> List[Dict]:
         return self.color_detector.rectangles_to_dict_list(rectangles)
 
-    def _convert_openings_for_sh3d(self, openings: List) -> List[Dict]:
-        """Преобразование обнаруженных проёмов в Sweet Home 3D совместимый формат."""
-        converted = []
-        for op in openings:
-            opening_dict = {
-                'x1': int(op.x1),
-                'y1': int(op.y1),
-                'x2': int(op.x2),
-                'y2': int(op.y2),
-                'opening_type': getattr(op, 'type', getattr(op, 'opening_type', 'unknown')),
-                'is_valid': getattr(op, 'is_valid', True)
-            }
-            converted.append(opening_dict)
-        return converted
+    @staticmethod
+    def _doors_for_sh3d(
+        yolo_results: Optional[YOLOResults],
+    ) -> Optional[List[Dict]]:
+        if not yolo_results or not yolo_results.doors:
+            return None
+        return [
+            {'x1': float(d.bbox[0]), 'y1': float(d.bbox[1]),
+             'x2': float(d.bbox[2]), 'y2': float(d.bbox[3])}
+            for d in yolo_results.doors
+        ]
 
-    def _convert_algo_windows_for_sh3d(self, algo_windows: List) -> List[Dict]:
-        """Преобразование алгоритмических окон в Sweet Home 3D совместимый формат."""
-        converted = []
-        for win in algo_windows:
-            win_dict = {
-                'x': int(win.x),
-                'y': int(win.y),
-                'w': int(win.w),
-                'h': int(win.h),
-                'id': getattr(win, 'id', 0)
-            }
-            converted.append(win_dict)
-        return converted
+    @staticmethod
+    def _algo_windows_for_sh3d(algo_wins) -> List[Dict]:
+        return [
+            {'x': int(w.x), 'y': int(w.y),
+             'width': int(w.w), 'height': int(w.h)}
+            for w in algo_wins
+        ]
 
-    def _convert_yolo_doors_for_sh3d(self, yolo_doors: List) -> List[Dict]:
-        """Преобразование YOLO дверей в Sweet Home 3D совместимый формат."""
-        converted = []
-        for door in yolo_doors:
-            bbox = door.bbox if hasattr(door, 'bbox') else door[:4]
-            x1, y1, x2, y2 = map(float, bbox)
-            converted.append({
-                'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2
-            })
-        return converted
+    @staticmethod
+    def _yolo_windows_for_sh3d(
+        yolo_results: Optional[YOLOResults],
+    ) -> List[Dict]:
+        if not yolo_results or not yolo_results.windows:
+            return []
+        return [
+            {'x1': float(w.bbox[0]), 'y1': float(w.bbox[1]),
+             'x2': float(w.bbox[2]), 'y2': float(w.bbox[3])}
+            for w in yolo_results.windows
+        ]
 
-    def _convert_yolo_windows_for_sh3d(self, yolo_windows: List) -> List[Dict]:
-        """Преобразование YOLO окон в Sweet Home 3D совместимый формат."""
-        converted = []
-        for window in yolo_windows:
-            bbox = window.bbox if hasattr(window, 'bbox') else window[:4]
-            x1, y1, x2, y2 = map(float, bbox)
-            converted.append({
-                'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2
-            })
-        return converted
-
-    def _export_sh3d(
+    def _all_windows_for_sh3d(
         self,
+        yolo_results: Optional[YOLOResults],
+        algo_wins,
+    ) -> Optional[List[Dict]]:
+        out = self._algo_windows_for_sh3d(algo_wins)
+        out.extend(self._yolo_windows_for_sh3d(yolo_results))
+        return out or None
+
+    def _gap_doors_for_sh3d(self, openings) -> List[Dict]:
+        return [
+            {'x1': int(o.x1), 'y1': int(o.y1),
+             'x2': int(o.x2), 'y2': int(o.y2)}
+            for o in openings if getattr(o, 'is_valid', True)
+        ]
+
+    # ------------------------------------------------------------------
+    # YOLO-door → gap-door resolution
+    def _resolve_yolo_doors_to_gaps(
+        self,
+        img: np.ndarray,
         color_results: Dict,
-        yolo_results: YOLOResults,
+        yolo_results: Optional[YOLOResults],
+        pixel_scale: Optional[float],
+        match_margin_px: int = 25,
+    ) -> List[Dict]:
+        """
+        Replace raw YOLO door bboxes with precisely-located wall-gap bboxes.
+
+        Algorithm
+        ---------
+        Phase 1 — match from existing gap openings.
+            For each YOLO door, check whether any gap opening already found by
+            GeometricOpeningDetector has its centre inside the YOLO bbox
+            expanded by ``match_margin_px``.  Greedy: closest centre wins;
+            each gap may be claimed by at most one YOLO door.
+
+        Phase 2 — paint + re-detect for any still-unmatched YOLO doors.
+            Paint each unmatched YOLO bbox white on a copy of the image so the
+            wall detector sees a solid opening there.  Re-run wall detection
+            and then the relaxed ``gap_detector_targeted`` restricted to those
+            areas.  Attempt matching again with the same spatial rule.
+
+        Phase 3 — fallback.
+            Any YOLO door still unmatched keeps its raw bbox so no detection is
+            silently dropped.
+
+        Standalone gap openings not claimed by any YOLO door (passageways,
+        archways, etc.) are preserved unchanged.
+
+        Returns
+        -------
+        A flat list of door rect dicts ready for ``OpeningProcessor``.
+        Every rect has keys ``x1, y1, x2, y2``.
+        """
+        existing_gaps = [
+            o for o in color_results.get('openings', [])
+            if getattr(o, 'is_valid', True)
+        ]
+        yolo_doors = yolo_results.doors if yolo_results else []
+
+        # Indices of gaps that have been claimed by a YOLO door
+        claimed_gap_indices: Set[int] = set()
+        # yolo_door_index → resolved rect dict
+        matched: Dict[int, Dict] = {}
+
+        def _expanded(door, margin: int) -> Tuple[float, float, float, float]:
+            x1, y1, x2, y2 = door.bbox
+            return x1 - margin, y1 - margin, x2 + margin, y2 + margin
+
+        def _gap_center(gap) -> Tuple[float, float]:
+            return (gap.x1 + gap.x2) / 2.0, (gap.y1 + gap.y2) / 2.0
+
+        def _center_inside(cx, cy, ex1, ey1, ex2, ey2) -> bool:
+            return ex1 <= cx <= ex2 and ey1 <= cy <= ey2
+
+        def _gap_to_rect(gap) -> Dict:
+            return {
+                'x1': int(gap.x1), 'y1': int(gap.y1),
+                'x2': int(gap.x2), 'y2': int(gap.y2),
+            }
+
+        # ── Phase 1: match from existing gap openings ────────────────────
+        for yi, ydoor in enumerate(yolo_doors):
+            bx1, by1, bx2, by2 = ydoor.bbox
+            ycx = (bx1 + bx2) / 2.0
+            ycy = (by1 + by2) / 2.0
+            ex1, ey1, ex2, ey2 = _expanded(ydoor, match_margin_px)
+
+            candidates = []
+            for gi, gap in enumerate(existing_gaps):
+                if gi in claimed_gap_indices:
+                    continue
+                gcx, gcy = _gap_center(gap)
+                if _center_inside(gcx, gcy, ex1, ey1, ex2, ey2):
+                    dist = math.hypot(gcx - ycx, gcy - ycy)
+                    candidates.append((dist, gi, gap))
+
+            if candidates:
+                candidates.sort(key=lambda t: t[0])
+                _, best_gi, best_gap = candidates[0]
+                claimed_gap_indices.add(best_gi)
+                matched[yi] = _gap_to_rect(best_gap)
+                logger.debug(
+                    "Phase1: YOLO door #%d matched gap gi=%d dist=%.1f px",
+                    yi, best_gi, candidates[0][0],
+                )
+
+        # ── Phase 2: paint white + re-detect for unmatched YOLO doors ────
+        unmatched_indices = [yi for yi in range(len(yolo_doors)) if yi not in matched]
+
+        if unmatched_indices:
+            logger.debug(
+                "Phase2: %d YOLO door(s) unmatched — running targeted re-detection",
+                len(unmatched_indices),
+            )
+            img_w = img.copy()
+            for yi in unmatched_indices:
+                x1, y1, x2, y2 = yolo_doors[yi].bbox
+                # Paint the door leaf area white so the wall colour detector
+                # sees a gap in the wall rather than a filled rectangle.
+                img_w[y1:y2, x1:x2] = 255
+
+            try:
+                _, new_rects, _ = self.color_detector.process(img_w)
+
+                # Pass yolo_results=None so the targeted detector does NOT
+                # suppress openings that overlap the (now-whitened) YOLO areas.
+                new_gaps = self.gap_detector_targeted.detect_openings(
+                    rectangles=new_rects,
+                    yolo_results=None,
+                    pixel_scale=pixel_scale,
+                    image=img_w,
+                )
+                new_gaps = [g for g in new_gaps if getattr(g, 'is_valid', True)]
+                logger.debug(
+                    "Phase2: targeted detector found %d gap(s)", len(new_gaps)
+                )
+
+                # Match new gaps to unmatched YOLO doors
+                used_new: Set[int] = set()
+                for yi in list(unmatched_indices):
+                    ydoor = yolo_doors[yi]
+                    bx1, by1, bx2, by2 = ydoor.bbox
+                    ycx = (bx1 + bx2) / 2.0
+                    ycy = (by1 + by2) / 2.0
+                    ex1, ey1, ex2, ey2 = _expanded(ydoor, match_margin_px)
+
+                    candidates = []
+                    for gi, gap in enumerate(new_gaps):
+                        if gi in used_new:
+                            continue
+                        gcx, gcy = _gap_center(gap)
+                        if _center_inside(gcx, gcy, ex1, ey1, ex2, ey2):
+                            dist = math.hypot(gcx - ycx, gcy - ycy)
+                            candidates.append((dist, gi, gap))
+
+                    if candidates:
+                        candidates.sort(key=lambda t: t[0])
+                        _, best_gi, best_gap = candidates[0]
+                        used_new.add(best_gi)
+                        matched[yi] = _gap_to_rect(best_gap)
+                        unmatched_indices.remove(yi)
+                        logger.debug(
+                            "Phase2: YOLO door #%d matched new gap gi=%d dist=%.1f px",
+                            yi, best_gi, candidates[0][0],
+                        )
+
+            except Exception as exc:
+                logger.warning(
+                    "Targeted gap re-detection failed (non-fatal): %s", exc
+                )
+
+        # ── Phase 3: fallback — keep raw YOLO bbox ───────────────────────
+        for yi in unmatched_indices:
+            ydoor = yolo_doors[yi]
+            matched[yi] = {
+                'x1': float(ydoor.bbox[0]), 'y1': float(ydoor.bbox[1]),
+                'x2': float(ydoor.bbox[2]), 'y2': float(ydoor.bbox[3]),
+            }
+            logger.debug("Phase3: YOLO door #%d kept as raw fallback bbox", yi)
+
+        # ── Assemble final door rect list ─────────────────────────────────
+        # Resolved YOLO doors (gap-located or raw fallback), in original order
+        result: List[Dict] = [matched[yi] for yi in range(len(yolo_doors))]
+
+        # Standalone gap openings not claimed by any YOLO door are passageways
+        # or openings with no corresponding YOLO detection — keep them all.
+        for gi, gap in enumerate(existing_gaps):
+            if gi not in claimed_gap_indices:
+                result.append(_gap_to_rect(gap))
+
+        return result
+
+    # ------------------------------------------------------------------
+    # Overlap suppression helpers
+    def _do_sh3d_export(
+        self,
+        img: np.ndarray,
+        color_results: Dict,
+        yolo_results: Optional[YOLOResults],
         measurements: Optional[RoomMeasurements],
         output_dir: str,
-        base_name: str
-    ) -> Optional[str]:
-        """
-        Экспорт планировки в формат Sweet Home 3D.
+        base_name: str,
+    ) -> Tuple[Optional[str], List[Room], List, float]:
+        rects = color_results.get('rectangles')
+        if not rects:
+            return None, [], [], self.pixels_to_cm
 
-        Параметры:
-            color_results: Результаты детекции стен по цвету
-            yolo_results: Результаты YOLO детекции
-            measurements: Данные измерений помещения
-            output_dir: Директория для вывода
-            base_name: Базовое имя файла
+        sh3d_dir = os.path.join(output_dir, 'sh3d')
+        os.makedirs(sh3d_dir, exist_ok=True)
+        sh3d_path = os.path.join(sh3d_dir, f'{base_name}.sh3d')
 
-        Возвращает:
-            Путь к созданному .sh3d файлу при успехе, None при ошибке
-        """
-        if not self.enable_sh3d_export or not self.sh3d_exporter:
-            return None
+        ptc = self.pixels_to_cm
+        if measurements and measurements.pixel_scale:
+            ptc = measurements.pixel_scale * 100.0
+            self.sh3d_exporter.update_scale(ptc)
 
-        if not color_results or 'rectangles' not in color_results:
-            return None
+        door_rects = self._resolve_yolo_doors_to_gaps(
+            img, color_results, yolo_results,
+            pixel_scale=measurements.pixel_scale if measurements else None,
+        ) or None
+        win_rects = self._all_windows_for_sh3d(
+            yolo_results, color_results.get('algo_windows', []),
+        )
+        ocr_labels = self.color_detector.get_ocr_texts_with_coords(img)
 
-        try:
-            # Создание директории вывода
-            sh3d_dir = os.path.join(output_dir, 'sh3d')
-            os.makedirs(sh3d_dir, exist_ok=True)
-            sh3d_path = os.path.join(sh3d_dir, f"{base_name}.sh3d")
+        # === DOOR ARC INTEGRATION — Step 2.3: Pass arcs to exporter ===
+        door_arcs = color_results.get('door_arcs', [])
 
-            # Обновление коэффициента преобразования пикселей в см, если доступны измерения
-            pixels_to_cm = self.pixels_to_cm
-            if measurements and measurements.pixel_scale:
-                pixels_to_cm = measurements.pixel_scale * 100.0
-                # Обновляем экспортер с новым масштабом
-                self.sh3d_exporter.pixels_to_cm = pixels_to_cm
+        rooms = self.sh3d_exporter.export_to_sh3d(
+            wall_rectangles=self._rects_for_sh3d(rects),
+            output_path=sh3d_path,
+            door_rectangles=door_rects or None,
+            window_rectangles=win_rects,
+            original_image=None,
+            ocr_labels=None,
+            debug_image_path=None,
+        )
+        return sh3d_path, rooms or [], ocr_labels or [], ptc
 
-            # Преобразование данных в Sweet Home 3D совместимые форматы
-            rectangles_sh3d = self._convert_rectangles_for_sh3d(
-                color_results['rectangles']
-            )
+    @staticmethod
+    def _refine_living_space(
+        measurements: RoomMeasurements,
+        yolo_results: Optional[YOLOResults],
+    ) -> None:
+        if not yolo_results or not yolo_results.doors:
+            return
+        ab = getattr(measurements, 'apartment_boundary', None)
+        if ab is None:
+            return
+        ab_gray = (
+            cv2.cvtColor(ab, cv2.COLOR_BGR2GRAY) if ab.ndim == 3 else ab
+        )
+        interior = ab_gray > 0
+        h, w = interior.shape
+        remove = np.zeros_like(interior, dtype=bool)
+        for det in yolo_results.doors:
+            x1, y1, x2, y2 = det.bbox
+            x1, x2 = sorted((max(0, int(x1)), min(w, int(math.ceil(x2)))))
+            y1, y2 = sorted((max(0, int(y1)), min(h, int(math.ceil(y2)))))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            sub = interior[y1:y2, x1:x2]
+            if sub.size and (sub.size - int(sub.sum())) / sub.size > 0.02:
+                remove[y1:y2, x1:x2] = True
+        if remove.any():
+            new_ab = ab_gray.copy()
+            new_ab[remove] = 0
+            measurements.apartment_boundary = new_ab
+            ps = float(getattr(measurements, 'pixel_scale', 0) or 0)
+            if ps > 0:
+                measurements.area_m2 = float((new_ab > 0).sum()) * (ps ** 2)
 
-            # Собираем все окна (алгоритмические + YOLO)
-            window_rects = []
-
-            # Алгоритмические окна
-            algo_windows = color_results.get('algo_windows', [])
-            for win in algo_windows:
-                window_rects.append({
-                    'x': int(win.x),
-                    'y': int(win.y),
-                    'width': int(win.w),
-                    'height': int(win.h)
-                })
-
-            # YOLO окна
-            if yolo_results and yolo_results.windows:
-                yolo_windows_sh3d = self._convert_yolo_windows_for_sh3d(yolo_results.windows)
-                for win in yolo_windows_sh3d:
-                    window_rects.append({
-                        'x1': win['x1'],
-                        'y1': win['y1'],
-                        'x2': win['x2'],
-                        'y2': win['y2']
-                    })
-
-            # Собираем все двери (YOLO + проёмы)
-            door_rects = []
-
-            # YOLO двери
-            if yolo_results and yolo_results.doors:
-                yolo_doors_sh3d = self._convert_yolo_doors_for_sh3d(yolo_results.doors)
-                for door in yolo_doors_sh3d:
-                    door_rects.append({
-                        'x1': door['x1'],
-                        'y1': door['y1'],
-                        'x2': door['x2'],
-                        'y2': door['y2']
-                    })
-
-            # Проёмы как двери
-            openings = color_results.get('openings', [])
-            for opening in openings:
-                if getattr(opening, 'is_valid', True):
-                    door_rects.append({
-                        'x1': int(opening.x1),
-                        'y1': int(opening.y1),
-                        'x2': int(opening.x2),
-                        'y2': int(opening.y2)
-                    })
-
-            # Экспорт в .sh3d
-            self.sh3d_exporter.export_to_sh3d(
-                wall_rectangles=rectangles_sh3d,
-                output_path=sh3d_path,
-                door_rectangles=door_rects if door_rects else None,
-                window_rectangles=window_rects if window_rects else None,
-                auto_create_room=self.auto_create_room
-            )
-
-            return sh3d_path
-
-        except Exception as e:
-            print(f"Sweet Home 3D export error: {e}")
-            return None
-
-    def process_image(self, img_path: str, output_dir: str, run_color_detection: bool = True):
-        """
-        Обработка одного изображения планировки.
-
-        Параметры:
-            img_path: Путь к входному изображению
-            output_dir: Директория для выходных файлов
-            run_color_detection: Включить детекцию стен по цвету
-
-        Возвращает:
-            Словарь с результатами детекции и измерениями
-        """
-        img_name = Path(img_path).name
+    def process_image(
+        self,
+        img_path: str,
+        output_dir: str,
+        run_color_detection: bool = True,
+        progress: Optional[Progress] = None,
+        task_id=None,
+    ) -> Dict:
         base_name = Path(img_path).stem
+
+        def _advance(stage: str) -> None:
+            if progress is not None and task_id is not None:
+                progress.advance(task_id)
+                progress.update(
+                    task_id,
+                    description=f'[dim]{base_name}[/dim]  {stage}',
+                )
+
         img = cv2.imread(img_path)
         if img is None:
-            raise ValueError(f"Cannot load image: {img_path}")
+            raise ValueError(f'Cannot load image: {img_path}')
+        _advance('detecting walls')
 
-        # Шаг 1: YOLO детекция дверей
-        yolo_results = self.yolo_detector.detect(img, verbose=False)
+        yolo_results: Optional[YOLOResults] = self.yolo_detector.detect(
+            img, verbose=False,
+        )
 
-        color_results = None
+        color_results: Dict = {}
         measurements: Optional[RoomMeasurements] = None
 
         if run_color_detection:
-            # Шаг 2: Детекция стен
-            wall_mask_raw, rectangles, outline_mask = self.color_detector.process(img)
-
-            # Шаг 3: Алгоритмическая детекция окон
-            door_bboxes = []
-            if yolo_results and yolo_results.doors:
-                door_bboxes = [det.bbox for det in yolo_results.doors]
-
+            wall_mask_raw, rectangles, outline_mask = (
+                self.color_detector.process(img)
+            )
+            door_bboxes = (
+                [d.bbox for d in yolo_results.doors]
+                if yolo_results and yolo_results.doors else []
+            )
             ocr_bboxes = self.color_detector.get_ocr_bboxes(img)
 
             algo_windows = self.algo_window_detector.detect(
-                img,
-                outline_mask,
+                img, outline_mask,
                 exclude_bboxes=door_bboxes,
-                ocr_bboxes=ocr_bboxes
+                ocr_bboxes=ocr_bboxes,
             )
+            algo_win_mask = self.algo_window_detector.get_mask(
+                img.shape, algo_windows,
+            )
+            _advance('detecting openings')
 
-            algo_win_mask = self.algo_window_detector.get_mask(img.shape, algo_windows)
-
-            # Шаг 4: Интеграция окон в стены
             wall_mask = wall_mask_raw.copy()
-            combined_opening_mask = np.zeros_like(wall_mask)
-            combined_opening_mask = cv2.bitwise_or(combined_opening_mask, algo_win_mask)
+            if np.count_nonzero(algo_win_mask):
+                kern = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+                expanded = cv2.dilate(algo_win_mask, kern, iterations=1)
+                wall_mask[expanded > 0] = 255
 
-            if np.count_nonzero(combined_opening_mask) > 0:
-                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-                win_mask_expanded = cv2.dilate(combined_opening_mask, kernel, iterations=1)
-                wall_mask[win_mask_expanded > 0] = 255
-
-            # Шаг 5: Построение результатов (с новым методом _rectangles_to_segments)
             segments = self._rectangles_to_segments(rectangles)
-
             color_results = {
                 'wall_mask': wall_mask,
                 'segments': segments,
-                'junctions': [],
                 'rectangles': rectangles,
                 'outline_mask': outline_mask,
                 'openings': [],
                 'algo_windows': algo_windows,
-                'algo_win_mask': algo_win_mask
+                'algo_win_mask': algo_win_mask,
+                'door_arcs': [],           # === DOOR ARC INTEGRATION — initialize key ===
             }
 
-            # Шаг 6: Начальная детекция проёмов
             if rectangles:
                 try:
-                    detected_openings = self.gap_detector.detect_openings(
-                        rectangles=rectangles,
-                        yolo_results=yolo_results
+                    color_results['openings'] = (
+                        self.gap_detector.detect_openings(
+                            rectangles=rectangles,
+                            yolo_results=yolo_results,
+                        )
                     )
-                    color_results['openings'] = detected_openings
                 except Exception:
                     pass
 
-            # Шаг 7: Сохранение промежуточных результатов
-            json_dir = os.path.join(output_dir, 'json')
-            os.makedirs(json_dir, exist_ok=True)
-
-            # Сохранение прямоугольников
-            with open(os.path.join(json_dir, f"{base_name}_rectangles.json"), "w") as f:
-                json.dump(self.color_detector.rectangles_to_dict_list(rectangles), f, indent=2)
-
-            # Сохранение окон
-            algo_win_list = [{"id": w.id, "x": w.x, "y": w.y, "w": w.w, "h": w.h} for w in algo_windows]
-            with open(os.path.join(json_dir, f"{base_name}_algo_windows.json"), "w") as f:
-                json.dump(algo_win_list, f, indent=2)
-
-            # Шаг 8: Измерения
             if self.enable_measurements and segments:
+                _advance('measuring rooms')
                 try:
-                    wall_segments_data = self._convert_segments_to_wall_segments(segments)
                     measurements = self.size_analyzer.process(
-                        img_path, wall_segments_data, output_dir,
-                        wall_mask=outline_mask, original_image=img
+                        img_path,
+                        self._segments_to_dicts(segments),
+                        output_dir,
+                        wall_mask=outline_mask,
+                        original_image=img,
                     )
                 except Exception:
                     pass
 
-            # Шаг 9: Финальная детекция проёмов с масштабом
             if rectangles:
                 try:
-                    pixel_scale = measurements.pixel_scale if measurements else None
-                    combined_boxes = []
-                    if yolo_results and yolo_results.doors:
-                        combined_boxes.extend(yolo_results.doors)
-
-                    detected_openings = self.gap_detector.detect_openings(
-                        rectangles=rectangles,
-                        yolo_results=yolo_results,
-                        pixel_scale=pixel_scale,
-                        image=img,
-                        door_window_boxes=combined_boxes
+                    ps = measurements.pixel_scale if measurements else None
+                    combined = (
+                        list(yolo_results.doors)
+                        if yolo_results and yolo_results.doors else []
                     )
-                    color_results['openings'] = detected_openings
-
+                    color_results['openings'] = (
+                        self.gap_detector.detect_openings(
+                            rectangles=rectangles,
+                            yolo_results=yolo_results,
+                            pixel_scale=ps,
+                            image=img,
+                            door_window_boxes=combined,
+                        )
+                    )
                 except Exception:
                     pass
 
-        # Уточнение жилой площади
+            # ====================== DETECT DOOR SWING ARCS ======================
+            # === DOOR ARC INTEGRATION — Step 2.2: Call the arc detector ===
+            _advance('detecting door arcs')
+            ptc_used = self.pixels_to_cm
+            if measurements and measurements.pixel_scale:
+                ptc_used = measurements.pixel_scale * 100.0
+            try:
+                color_results['door_arcs'] = self.arc_detector.detect(
+                    img=img,
+                    wall_outline_mask=outline_mask,
+                    candidate_gaps=color_results.get('openings', []),
+                    yolo_doors=yolo_results.doors if yolo_results else None,
+                    pixel_scale=ptc_used / 100.0,       # convert cm/px → m/px
+                    furniture_mask=color_results.get('furniture_mask'),
+                    ocr_boxes=(
+                        self.color_detector.get_ocr_bboxes(img)
+                        if hasattr(self.color_detector, 'get_ocr_bboxes')
+                        else None
+                    ),
+                    base_name=base_name,
+                )
+                logger.info(
+                    "Door arcs detected: %d", len(color_results['door_arcs'])
+                )
+            except Exception as e:
+                logger.warning("Door arc detection failed (non-fatal): %s", e)
+                color_results['door_arcs'] = []
+            # =====================================================================
+
+            # Single deduplication pass: drop overlapping and parallel-close boxes
+            deduplicate_boxes(yolo_results, color_results)
+
         if measurements and color_results:
-            self._refine_living_space_with_doors(
-                measurements, color_results['wall_mask'], yolo_results
+            self._refine_living_space(measurements, yolo_results)
+
+        sh3d_path: Optional[str] = None
+        rooms: List[Room] = []
+        ocr_labels: List = []
+        ptc_used = self.pixels_to_cm
+        _advance('exporting')
+
+        if color_results.get('rectangles'):
+            sh3d_path, rooms, ocr_labels, ptc_used = self._do_sh3d_export(
+                img, color_results, yolo_results,
+                measurements, output_dir, base_name,
             )
 
-        # Экспорт Sweet Home 3D
-        sh3d_path = self._export_sh3d(
-            color_results=color_results,
-            yolo_results=yolo_results,
-            measurements=measurements,
-            output_dir=output_dir,
-            base_name=base_name
-        )
+        if sh3d_path and rooms and ocr_labels:
+            new_sf = calibrate_scale_factor(
+                rooms, ocr_labels, ptc_used, self.scale_factor,
+            )
+            if new_sf is not None and abs(new_sf - self.scale_factor) > 1e-4:
+                try:
+                    os.remove(sh3d_path)
+                except OSError:
+                    pass
+                self.scale_factor = new_sf
+                self.sh3d_exporter.xml_generator.scale_factor = new_sf
+                sh3d_path, rooms, _, _ = self._do_sh3d_export(
+                    img, color_results, yolo_results,
+                    measurements, output_dir, base_name,
+                )
 
-        if sh3d_path and color_results:
+        if sh3d_path:
             color_results['sh3d_path'] = sh3d_path
 
-        # OBJ Export
-        if self.obj_exporter is not None and color_results and 'segments' in color_results:
-            obj_path = os.path.join(output_dir, f"{base_name}.obj")
-            self.obj_exporter.export_from_segments(color_results['segments'], obj_path)
-            color_results['obj_path'] = obj_path
-
-        # Визуализация
-        if self.enable_visuals:
-            if run_color_detection and color_results:
-                summary_path = os.path.join(output_dir, f"{base_name}_summary.png")
-                self._visualize_combined_results(
-                    img, yolo_results, color_results, summary_path, measurements
-                )
-
-                overlay_path = os.path.join(output_dir, f"{base_name}_overlay.png")
-                self._save_overlay_image(img, yolo_results, color_results, overlay_path, measurements)
-
-                masks_dir = os.path.join(output_dir, 'masks')
-                os.makedirs(masks_dir, exist_ok=True)
-                cv2.imwrite(
-                    os.path.join(masks_dir, f"{base_name}_algo_windows.png"),
-                    color_results['algo_win_mask']
-                )
-            else:
-                yolo_vis_path = os.path.join(output_dir, f"{base_name}_yolo.png")
-                self._visualize_yolo_results(img, yolo_results, yolo_vis_path)
-
-        # Сохранение масок
-        masks_dir = os.path.join(output_dir, 'masks')
-        os.makedirs(masks_dir, exist_ok=True)
-        cv2.imwrite(
-            os.path.join(masks_dir, f"{base_name}_yolo_doors.png"),
-            yolo_results.combined_door_mask
-        )
+        _advance('rendering')
 
         if run_color_detection and color_results:
-            cv2.imwrite(
-                os.path.join(masks_dir, f"{base_name}_color_walls.png"),
-                color_results['wall_mask']
+            render_summary(
+                img, yolo_results, color_results, measurements,
+                self.pixels_to_cm,
+                os.path.join(output_dir, f'{base_name}_summary.png'),
             )
-            cv2.imwrite(
-                os.path.join(masks_dir, f"{base_name}_rect_outline.png"),
-                color_results['outline_mask']
+
+        if rooms:
+            render_room_ocr_overlay(
+                img, rooms, [], ocr_labels, ptc_used,
+                os.path.join(output_dir, f'{base_name}_rooms_ocr.png'),
+                door_arcs=color_results.get('door_arcs', []),   # === DOOR ARC INTEGRATION ===
             )
+
+        _advance('done')
 
         return {
             'yolo': yolo_results,
             'color': color_results,
-            'measurements': measurements
+            'measurements': measurements,
         }
 
-    def _visualize_yolo_results(self, img: np.ndarray, yolo_results: YOLOResults, output_path: str):
-        """Visualization of YOLO detection results."""
-        fig = plt.figure(figsize=(12, 6))
-        gs = GridSpec(1, 2, figure=fig)
-
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        ax1.set_title('Original')
-        ax1.axis('off')
-
-        ax2 = fig.add_subplot(gs[0, 1])
-        yolo_vis = self.yolo_detector.visualize_detections(img, yolo_results)
-        ax2.imshow(cv2.cvtColor(yolo_vis, cv2.COLOR_BGR2RGB))
-        ax2.set_title('YOLO Results')
-        ax2.axis('off')
-
-        plt.tight_layout()
-        plt.savefig(output_path)
-        plt.close()
-
-    def _build_overlay(
-        self,
-        img: np.ndarray,
-        yolo_results: YOLOResults,
-        color_results: Dict,
-        measurements: Optional[RoomMeasurements]
-    ) -> np.ndarray:
-        """Build visualization overlay with all detection results."""
-        overlay = img.copy()
-        segments = color_results['segments']
-
-        # Determine scale for size display
-        pixel_scale = measurements.pixel_scale if measurements else self.pixels_to_cm / 100.0
-
-        # Step 1: Draw walls with measurements
-        outer_wall_ids = set()
-        if measurements:
-            outer_wall_ids = {w['id'] for w in measurements.walls if w['is_outer']}
-            # Draw outer crust if available
-            if measurements.outer_crust is not None:
-                crust_mask = measurements.outer_crust > 0
-                # Use semi-transparent overlay for outer walls
-                overlay_colored = overlay.copy()
-                overlay_colored[crust_mask] = [100, 200, 100]  # Light green
-                cv2.addWeighted(overlay, 0.7, overlay_colored, 0.3, 0, overlay)
-
-        # Draw wall segments
-        for i, seg in enumerate(segments):
-            is_outer = i in outer_wall_ids
-
-            # Wall line colors - more distinct
-            if is_outer:
-                wall_color = (0, 180, 0)  # Green for outer walls
-                line_thickness = 4
-            else:
-                wall_color = (100, 100, 100)  # Gray for inner walls
-                line_thickness = 3
-
-            # Draw wall line
-            pt1 = (int(seg.x1), int(seg.y1))
-            pt2 = (int(seg.x2), int(seg.y2))
-            cv2.line(overlay, pt1, pt2, wall_color, line_thickness)
-
-            # Calculate and display wall measurements
-            length_px = np.hypot(seg.x2 - seg.x1, seg.y2 - seg.y1)
-
-            # Skip very short segments
-            if length_px < 10:
-                continue
-
-            length_cm = length_px * pixel_scale * 100  # Convert to cm
-
-            # Format size text
-            if length_cm >= 100:
-                size_text = f"{length_cm/100:.1f}m"
-            else:
-                size_text = f"{int(length_cm)}cm"
-
-            # Calculate midpoint for text placement
-            mid_x = int((seg.x1 + seg.x2) / 2)
-            mid_y = int((seg.y1 + seg.y2) / 2)
-
-            # Determine wall orientation and text offset
-            dx = seg.x2 - seg.x1
-            dy = seg.y2 - seg.y1
-            angle = np.degrees(np.arctan2(dy, dx))
-
-            # Normalize angle to [-90, 90]
-            if angle > 90:
-                angle -= 180
-            elif angle < -90:
-                angle += 180
-
-            # Determine if wall is more horizontal or vertical
-            is_horizontal = abs(angle) < 45
-
-            if is_horizontal:
-                # Horizontal wall - place text above or below
-                text_offset_x = 0
-                text_offset_y = -15 if is_outer else -12
-            else:
-                # Vertical wall - place text to the side
-                text_offset_x = 15 if is_outer else 12
-                text_offset_y = 5
-
-            text_x = mid_x + text_offset_x
-            text_y = mid_y + text_offset_y
-
-            # Text styling
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = 0.45
-            font_thickness = 1
-
-            # Colors based on wall type
-            if is_outer:
-                text_color = (255, 255, 255)
-                bg_color = (0, 120, 0)
-            else:
-                text_color = (255, 255, 255)
-                bg_color = (60, 60, 60)
-
-            # Get text dimensions
-            (text_width, text_height), baseline = cv2.getTextSize(
-                size_text, font, font_scale, font_thickness
-            )
-
-            # Draw background rectangle with padding
-            padding = 3
-            bg_x1 = text_x - padding
-            bg_y1 = text_y - text_height - padding
-            bg_x2 = text_x + text_width + padding
-            bg_y2 = text_y + baseline + padding
-
-            # Ensure background is within image bounds
-            h, w = overlay.shape[:2]
-            bg_x1 = max(0, bg_x1)
-            bg_y1 = max(0, bg_y1)
-            bg_x2 = min(w, bg_x2)
-            bg_y2 = min(h, bg_y2)
-
-            # Draw semi-transparent background
-            overlay_bg = overlay.copy()
-            cv2.rectangle(overlay_bg, (bg_x1, bg_y1), (bg_x2, bg_y2), bg_color, -1)
-            cv2.addWeighted(overlay, 0.7, overlay_bg, 0.3, 0, overlay)
-
-            # Draw text
-            cv2.putText(overlay, size_text, (text_x, text_y),
-                       font, font_scale, text_color, font_thickness, cv2.LINE_AA)
-
-        # Step 2: Draw algorithmic windows (yellow highlights)
-        algo_windows = color_results.get('algo_windows', [])
-        for win in algo_windows:
-            x, y, w, h = win.x, win.y, win.w, win.h
-
-            # Ensure window is within bounds
-            img_h, img_w = overlay.shape[:2]
-            if y + h <= img_h and x + w <= img_w and y >= 0 and x >= 0:
-                # Semi-transparent yellow fill
-                sub = overlay[y:y+h, x:x+w]
-                if sub.size > 0:
-                    yellow_overlay = np.full_like(sub, (0, 255, 255))  # Yellow in BGR
-                    cv2.addWeighted(sub, 0.6, yellow_overlay, 0.4, 0, sub)
-
-                # Yellow border
-                cv2.rectangle(overlay, (x, y), (x+w, y+h), (0, 200, 255), 2)
-
-        # Step 3: Draw YOLO doors (blue boxes)
-        if yolo_results and yolo_results.doors:
-            for door in yolo_results.doors:
-                x1, y1, x2, y2 = map(int, door.bbox)
-                cv2.rectangle(overlay, (x1, y1), (x2, y2), (255, 100, 0), 2)  # Blue
-                # Add label
-                cv2.putText(overlay, "Door", (x1, y1 - 5),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 100, 0), 1, cv2.LINE_AA)
-
-        # Step 4: Draw YOLO windows (cyan boxes - if any detected)
-        if yolo_results and yolo_results.windows:
-            for window in yolo_results.windows:
-                x1, y1, x2, y2 = map(int, window.bbox)
-                cv2.rectangle(overlay, (x1, y1), (x2, y2), (255, 255, 0), 2)  # Cyan
-
-        # Step 5: Draw openings (orange boxes)
-        openings = color_results.get('openings', [])
-        if openings:
-            for opening in openings:
-                if getattr(opening, 'is_valid', True):
-                    x1, y1, x2, y2 = opening.x1, opening.y1, opening.x2, opening.y2
-                    cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 140, 255), 2)  # Orange
-
-        # Step 6: Add measurement info banner at top
-        if measurements:
-            # Create semi-transparent banner
-            banner_height = 35
-            banner = overlay[0:banner_height, :].copy()
-            banner_bg = np.zeros_like(banner)
-            banner_bg[:] = (40, 40, 40)
-            cv2.addWeighted(banner, 0.3, banner_bg, 0.7, 0, banner)
-            overlay[0:banner_height, :] = banner
-
-            # Add text to banner
-            info_text = f"Area: {measurements.area_m2:.1f} sq.m  |  Scale: {measurements.pixel_scale * 100:.2f} cm/px"
-            cv2.putText(overlay, info_text, (10, 22),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-
-        return overlay
-
-    def _save_overlay_image(self, img, yolo, color, path, meas):
-        """Сохранение изображения с наложением."""
-        overlay = self._build_overlay(img, yolo, color, meas)
-        cv2.imwrite(path, overlay)
-
-    def _visualize_combined_results(self, img, yolo, color, output_path, measurements):
-        """Create combined visualization of results with clean, professional layout."""
-        fig = plt.figure(figsize=(18, 10))
-        gs = GridSpec(2, 3, figure=fig, hspace=0.3, wspace=0.3)
-
-        # Title styling
-        title_props = {'fontsize': 11, 'fontweight': 'bold', 'pad': 10}
-
-        # Row 1: Main visualizations
-        # Original image
-        ax1 = fig.add_subplot(gs[0, 0])
-        ax1.imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-        ax1.set_title('Original Floor Plan', **title_props)
-        ax1.axis('off')
-
-        # Overlay with measurements
-        ax2 = fig.add_subplot(gs[0, 1])
-        overlay = self._build_overlay(img, yolo, color, measurements)
-        ax2.imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
-        ax2.set_title('Detected Elements & Measurements', **title_props)
-        ax2.axis('off')
-
-        # Window mask
-        ax3 = fig.add_subplot(gs[0, 2])
-        ax3.imshow(color['algo_win_mask'], cmap='gray')
-        window_count = len(color.get('algo_windows', []))
-        ax3.set_title(f'Window Detection ({window_count} found)', **title_props)
-        ax3.axis('off')
-
-        # Row 2: Analysis results
-        # Apartment boundary
-        ax4 = fig.add_subplot(gs[1, 0])
-        if measurements and measurements.apartment_boundary is not None:
-            ax4.imshow(measurements.apartment_boundary, cmap='viridis')
-            ax4.set_title('Apartment Boundary', **title_props)
-        else:
-            ax4.imshow(np.zeros_like(img[:, :, 0]), cmap='gray')
-            ax4.set_title('Apartment Boundary (N/A)', **title_props)
-        ax4.axis('off')
-
-        # Wall outline
-        ax5 = fig.add_subplot(gs[1, 1])
-        ax5.imshow(color['outline_mask'], cmap='gray')
-        ax5.set_title('Wall Structure Outline', **title_props)
-        ax5.axis('off')
-
-        # Information panel with legend
-        ax6 = fig.add_subplot(gs[1, 2])
-        ax6.axis('off')
-
-        # Build info text
-        info_lines = []
-        info_lines.append("═══ DETECTION SUMMARY ═══")
-        info_lines.append("")
-        info_lines.append(f"Doors (YOLO):     {len(yolo.doors)}")
-        info_lines.append(f"Windows (CV):     {len(color.get('algo_windows', []))}")
-        info_lines.append(f"Wall Segments:    {len(color.get('segments', []))}")
-        info_lines.append(f"Openings:         {len(color.get('openings', []))}")
-        info_lines.append("")
-
-        if measurements:
-            info_lines.append("═══ MEASUREMENTS ═══")
-            info_lines.append("")
-            info_lines.append(f"Total Area:       {measurements.area_m2:.1f} m²")
-            info_lines.append(f"Scale:            {measurements.pixel_scale*100:.2f} cm/px")
-
-            outer_walls = sum(1 for w in measurements.walls if w.get('is_outer', False))
-            inner_walls = len(measurements.walls) - outer_walls
-            info_lines.append(f"Outer Walls:      {outer_walls}")
-            info_lines.append(f"Inner Walls:      {inner_walls}")
-
-        info_lines.append("")
-        info_lines.append("═══ COLOR LEGEND ═══")
-        info_lines.append("")
-        info_lines.append("🟢 Green:  Outer walls")
-        info_lines.append("⚫ Gray:   Inner walls")
-        info_lines.append("🔵 Blue:   Doors (YOLO)")
-        info_lines.append("🟡 Yellow: Windows (CV)")
-        info_lines.append("🟠 Orange: Openings")
-
-        if 'sh3d_path' in color:
-            info_lines.append("")
-            info_lines.append("═══ EXPORT ═══")
-            info_lines.append("")
-            info_lines.append("Sweet Home 3D file created:")
-            sh3d_name = Path(color['sh3d_path']).name
-            # Split long filename if needed
-            if len(sh3d_name) > 25:
-                info_lines.append(sh3d_name[:25])
-                info_lines.append(sh3d_name[25:])
-            else:
-                info_lines.append(sh3d_name)
-
-        # Display info text
-        info_text = "\n".join(info_lines)
-        ax6.text(0.05, 0.98, info_text,
-                fontsize=9,
-                va='top',
-                ha='left',
-                family='monospace',
-                transform=ax6.transAxes,
-                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
-
-        # Add overall title
-        fig.suptitle('Floor Plan Analysis Results - v4.2 (Edge-Based Measurements)',
-                    fontsize=14, fontweight='bold', y=0.98)
-
-        plt.tight_layout(rect=[0, 0, 1, 0.96])
-        plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white')
-        plt.close()
-
 
 # ============================================================
-# ИНТЕРФЕЙС КОМАНДНОЙ СТРОКИ
+# CLI
 # ============================================================
 
-def main():
+def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Floor Plan Analysis System",
+        description='Floor Plan Analysis System v5.3',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python main.py --input image.png --yolo-model weights.pt --output results/
-  python main.py --input images/ --yolo-model weights.pt --wall-height 280 --pixels-to-cm 2.5
-  python main.py --input image.png --yolo-model weights.pt --no-wall-sizes  # Disable wall sizes
-  python main.py --input image.png --yolo-model weights.pt --include-ceiling  # OBJ with ceiling
-  python main.py --input image.png --yolo-model weights.pt --no-floor  # OBJ walls only
-
-v4.2 Changes:
-  - Wall lengths now calculated from merged rectangle edges
-  - Automatic grouping of aligned rectangles
-  - More accurate measurements for continuous walls
-
-OBJ Export v2.0 Features:
-  - Sweet Home 3D compatible format
-  - Y-up coordinate system (industry standard)
-  - Vertex normals for proper lighting
-  - Ground plane (optional with --no-floor)
-  - Ceiling plane (optional with --include-ceiling)
-  - Multi-group walls for material control
-        """
     )
-
-    # Input/output parameters
-    parser.add_argument('--input', type=str, required=True,
-                        help='Path to image or directory')
-    parser.add_argument('--output', type=str, default='output_sh3d',
-                        help='Output directory for results')
-
-    # YOLO configuration
-    parser.add_argument('--yolo-model', type=str, required=True,
-                        help='Path to YOLO model weights')
+    parser.add_argument('--input', required=True,
+                        help='Single image or directory')
+    parser.add_argument('--output', default='output_v5',
+                        help='Output directory (default: output_v5)')
+    parser.add_argument('--yolo-model', required=True,
+                        help='Path to YOLOv9 .pt weights')
     parser.add_argument('--yolo-conf', type=float, default=0.25,
                         help='YOLO confidence threshold (default: 0.25)')
-    parser.add_argument('--device', type=str, default='cpu',
-                        help='Processing device: cpu or cuda')
-
-    # Wall detection configuration
-    parser.add_argument('--wall-color', type=str, default='8E8780',
-                        help='Wall color HEX code (default: 8E8780)')
+    parser.add_argument('--device', default='cpu',
+                        help='cpu | cuda | mps (default: cpu)')
+    parser.add_argument('--wall-color', default='8E8780',
+                        help='Brusnika wall hex color (default: 8E8780)')
     parser.add_argument('--color-tolerance', type=int, default=3,
-                        help='RGB color tolerance (default: 3)')
+                        help='Per-channel color tolerance (default: 3)')
     parser.add_argument('--auto-wall-color', action='store_true',
-                        help='Automatic wall color detection')
+                        help='Auto-detect wall color from image')
     parser.add_argument('--skip-color', action='store_true',
-                        help='Skip CV wall detection (YOLO only)')
+                        help='Skip color-based wall detection')
+    parser.add_argument('--wall-mode', default='hybrid',
+                        choices=['color', 'structure', 'hybrid', 'auto'],
+                        help='Wall detection mode (default: hybrid)')
+    parser.add_argument('--structure-method', default='lines',
+                        choices=['lines', 'edges', 'contours'],
+                        help='Structural detection method (default: lines)')
 
-    # Measurement configuration
     parser.add_argument('--disable-measurements', action='store_true',
-                        help='Disable area measurements')
-    parser.add_argument('--edge-distance-ratio', type=float, default=0.15,
-                        help='Coefficient for outer wall detection (default: 0.15)')
-    parser.add_argument('--debug-ocr', action='store_true',
-                        help='Enable OCR debug output')
+                        help='Disable OCR room measurement')
+    parser.add_argument('--edge-distance-ratio', type=float, default=0.15)
+    parser.add_argument('--debug-ocr', action='store_true')
+    parser.add_argument('--min-window-len', type=int, default=15)
+    parser.add_argument('--edge-expansion-tolerance', type=int, default=8)
+    parser.add_argument('--max-edge-expansion', type=int, default=10)
+    parser.add_argument('--wall-height', type=float, default=243.84,
+                        help='Wall height cm for 3D export (default: 243.84)')
+    parser.add_argument('--min-wall-thickness', type=float, default=5.0)
+    parser.add_argument('--pixels-to-cm', type=float, default=2.54)
+    parser.add_argument('--scale-factor', type=float, default=SCALE_FACTOR)
+    parser.add_argument('--disable-obj', action='store_true')
+    parser.add_argument('--no-floor', action='store_true')
+    parser.add_argument('--include-ceiling', action='store_true')
 
-    # Window detection configuration
-    parser.add_argument('--min-window-len', type=int, default=15,
-                        help='Minimum window length for detection (default: 15)')
+    # === DOOR ARC INTEGRATION — CLI flag for debug mode ===
+    parser.add_argument('--debug-arcs', action='store_true',
+                        help='Save door arc detection debug images')
 
-    # Wall edge expansion configuration
-    parser.add_argument('--edge-expansion-tolerance', type=int, default=8,
-                        help='Color tolerance for wall edge expansion (default: 8)')
-    parser.add_argument('--max-edge-expansion', type=int, default=10,
-                        help='Maximum wall edge expansion in pixels (default: 10)')
-
-    # Visualization
-    parser.add_argument('--no-vis', action='store_true',
-                        help='Disable result visualization')
-    parser.add_argument('--no-wall-sizes', action='store_true',
-                        help='Do not display wall sizes on visualization')
-
-    # Sweet Home 3D export parameters
-    sh3d_group = parser.add_argument_group('Sweet Home 3D Export')
-    sh3d_group.add_argument('--disable-sh3d', action='store_true',
-                            help='Disable Sweet Home 3D export')
-    sh3d_group.add_argument('--no-skip-bbox-check', action='store_true',
-                            help='Enable bbox check in opening detector')
-    sh3d_group.add_argument('--wall-height', type=float, default=243.84,
-                            help='Wall height in centimeters (default: 243.84 = ~8 feet)')
-    sh3d_group.add_argument('--snap-tolerance', type=float, default=5.0,
-                            help='Snap tolerance in pixels (default: 5.0)')
-    sh3d_group.add_argument('--min-wall-thickness', type=float, default=5.0,
-                            help='Minimum wall thickness in pixels (default: 5.0)')
-    sh3d_group.add_argument('--pixels-to-cm', type=float, default=2.54,
-                            help='Pixels to cm conversion coefficient (default: 2.54 = 1 inch)')
-    sh3d_group.add_argument('--no-auto-room', action='store_true',
-                            help='Do not automatically create room polygon')
-
-    # OBJ export parameters
-    obj_group = parser.add_argument_group('OBJ Export')
-    obj_group.add_argument('--disable-obj', action='store_true',
-                           help='Disable OBJ export')
-    obj_group.add_argument('--no-floor', action='store_true',
-                           help='Do not include ground plane in OBJ export')
-    obj_group.add_argument('--include-ceiling', action='store_true',
-                           help='Include ceiling plane in OBJ export')
+    return parser
 
 
+def main() -> None:
+    parser = _build_arg_parser()
     args = parser.parse_args()
-
-    # Валидация коэффициента расстояния от края
-    if not 0.01 <= args.edge_distance_ratio <= 0.5:
-        args.edge_distance_ratio = max(0.01, min(0.5, args.edge_distance_ratio))
-
-    # Создание директории вывода
     os.makedirs(args.output, exist_ok=True)
 
-    # Сбор файлов изображений
-    input_path = Path(args.input)
-    if input_path.is_file():
-        image_files = [str(input_path)]
-    elif input_path.is_dir():
-        image_files = []
-        for ext in ['*.png', '*.jpg', '*.jpeg', '*.bmp']:
-            image_files.extend([str(f) for f in input_path.glob(ext)])
-        image_files.sort()
+    inp = Path(args.input)
+    if inp.is_file():
+        image_files = [str(inp)]
+    elif inp.is_dir():
+        image_files = sorted(
+            str(f)
+            for ext in ('*.png', '*.jpg', '*.jpeg', '*.bmp')
+            for f in inp.glob(ext)
+        )
     else:
-        raise ValueError(f"Path does not exist: {args.input}")
-
+        raise ValueError(f'Path not found: {args.input}')
     if not image_files:
-        raise ValueError(f"No images found: {args.input}")
-
-    # Создание анализатора
-    print(f"\n{'='*60}")
-    print(f"Floor Plan Analysis System")
-    print(f"Edge-Based Wall Length Measurements")
-    print(f"Sweet Home 3D Compatible OBJ Export")
-    print(f"{'='*60}\n")
+        raise ValueError(f'No images found at: {args.input}')
 
     analyzer = HybridWallAnalyzer(
         yolo_model_path=args.yolo_model,
@@ -1338,92 +1498,86 @@ OBJ Export v2.0 Features:
         enable_measurements=not args.disable_measurements,
         edge_distance_ratio=args.edge_distance_ratio,
         debug_ocr=args.debug_ocr,
-        enable_visuals=not args.no_vis,
         min_window_len=args.min_window_len,
         edge_expansion_tolerance=args.edge_expansion_tolerance,
         max_edge_expansion_px=args.max_edge_expansion,
-        enable_sh3d_export=not args.disable_sh3d,
-        skip_bbox_check=not args.no_skip_bbox_check,
         wall_height_cm=args.wall_height,
-        snap_tolerance_px=args.snap_tolerance,
         min_wall_thickness_px=args.min_wall_thickness,
         pixels_to_cm=args.pixels_to_cm,
-        auto_create_room=not args.no_auto_room,
-        show_wall_sizes=not args.no_wall_sizes,
         enable_obj_export=not args.disable_obj,
         obj_include_floor=not args.no_floor,
-        obj_include_ceiling=args.include_ceiling
+        obj_include_ceiling=args.include_ceiling,
+        scale_factor=args.scale_factor,
+        wall_detection_mode=args.wall_mode,
+        structure_method=args.structure_method,
+        output_dir=args.output,                    # === DOOR ARC INTEGRATION ===
     )
 
-    # Processing images
-    results = []
-    for idx, img_path in enumerate(image_files, 1):
-        print(f"\nProcessing [{idx}/{len(image_files)}]: {Path(img_path).name}")
-        try:
-            result = analyzer.process_image(
-                img_path,
-                args.output,
-                run_color_detection=not args.skip_color
+    # === DOOR ARC INTEGRATION — apply --debug-arcs flag ===
+    if args.debug_arcs:
+        analyzer.arc_detector.debug = True
+
+    n_stages = len(Theme.PIPELINE_STAGES)
+
+    _console.print()
+    _console.print(Text('  Floor Plan Analysis', style='italic'))
+    _console.print()
+
+    ok, fail = 0, 0
+
+    with Progress(
+        TextColumn('  {task.description}', justify='left', style='default'),
+        BarColumn(
+            bar_width=24,
+            complete_style='white',
+            finished_style='dim',
+            pulse_style='dim white',
+        ),
+        TaskProgressColumn(style='dim'),
+        TimeElapsedColumn(),
+        console=_console,
+        transient=False,
+        expand=False,
+    ) as progress:
+        for path in image_files:
+            name = Path(path).stem
+            task_id = progress.add_task(
+                f'[dim]{name}[/dim]  loading',
+                total=n_stages,
             )
+            try:
+                res = analyzer.process_image(
+                    path, args.output,
+                    run_color_detection=not args.skip_color,
+                    progress=progress,
+                    task_id=task_id,
+                )
+                c = res.get('color', {})
+                n_walls = len(c.get('segments', []))
+                n_arcs = len(c.get('door_arcs', []))    # === DOOR ARC INTEGRATION ===
+                suffix = f'{n_walls} walls'
+                if n_arcs > 0:
+                    suffix += f'  {n_arcs} arcs'         # === DOOR ARC INTEGRATION ===
+                if c.get('sh3d_path'):
+                    suffix += '  sh3d ✓'
+                progress.update(
+                    task_id,
+                    description=f'[dim]{name}[/dim]  {suffix}',
+                )
+                ok += 1
+            except Exception as e:
+                progress.update(
+                    task_id,
+                    description=f'[dim]{name}[/dim]  [red]✗ {e}[/red]',
+                )
+                fail += 1
 
-            # Output information about created .sh3d file
-            if result.get('color') and 'sh3d_path' in result['color']:
-                sh3d_path = result['color']['sh3d_path']
-                print(f"  ✓ Sweet Home 3D: {Path(sh3d_path).name}")
-
-            # Output information about created .obj file
-            if result.get('color') and 'obj_path' in result['color']:
-                obj_path = result['color']['obj_path']
-                print(f"  ✓ OBJ Model: {Path(obj_path).name}")
-
-            # Output segment count info
-            if result.get('color') and 'segments' in result['color']:
-                seg_count = len(result['color']['segments'])
-                print(f"  ✓ Wall segments: {seg_count} (merged from rectangles)")
-
-            results.append({
-                'path': img_path,
-                'success': True,
-                'result': result
-            })
-        except Exception as e:
-            print(f"  ✗ Error: {e}")
-            results.append({
-                'path': img_path,
-                'success': False,
-                'error': str(e)
-            })
-
-    # Generate summary
-    successful = sum(1 for r in results if r['success'])
-    failed = len(results) - successful
-
-    print(f"\n{'='*60}")
-    print(f"Processing complete: {successful}/{len(results)} images successful")
-    if failed > 0:
-        print(f"Errors: {failed} images")
-    print(f"Results saved to: {args.output}")
-
-    # Output information about .sh3d files
-    sh3d_files = [r for r in results if r['success'] and
-                  r.get('result', {}).get('color', {}).get('sh3d_path')]
-    if sh3d_files:
-        print(f"\n.sh3d files created: {len(sh3d_files)}")
-        print("Open them in Sweet Home 3D!")
-
-    # Output information about .obj files
-    obj_files = [r for r in results if r['success'] and
-                 r.get('result', {}).get('color', {}).get('obj_path')]
-    if obj_files:
-        print(f"\n.obj files created: {len(obj_files)} (v2.0 - Sweet Home 3D compatible)")
-        print("Features: Y-up coordinates, vertex normals, ground plane")
-        print("Open them in Blender, SketchUp, Sweet Home 3D, or any 3D modeling software!")
+    _console.print()
+    _console.print(
+        f'  [dim]{ok}/{ok + fail} completed  ·  {args.output}/[/dim]'
+    )
+    _console.print()
 
 
-    print(f"\nv4.2 Note: Wall lengths calculated from merged rectangle edges")
-    print(f"OBJ v2.0: Full Sweet Home 3D compatibility with Y-up coordinate system")
-    print(f"{'='*60}\n")
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -80,11 +80,11 @@ class GeometricOpeningDetector:
     """
 
     def __init__(self,
-                 max_extension_length: int = 150,
+                 max_extension_length: int = 300,
                  min_extension_length: int = 10,
                  min_overlap_ratio: float = 0.5,
                  max_occlusion_ratio: float = 0.8,
-                 small_rect_aspect_threshold: float = 2.0,
+                 small_rect_aspect_threshold: float = 3.0,
                  small_rect_min_side: int = 20,
                  merge_distance: int = 0,
                  merge_min_overlap_ratio: float = 0.1,
@@ -96,11 +96,12 @@ class GeometricOpeningDetector:
                  min_opening_length_factor: float = 1.0,
                  max_opening_length_factor: float = 8.0,
                  max_opening_aspect_ratio: float = 8.0,
+                 min_opening_aspect_ratio: float = 5.0,
                  connectivity_tolerance: int = 2,
-                 min_gap_width_m: float = 0.60,
-                 max_gap_width_m: float = 0.90,
-                 max_wall_touch_length_m: float = 0.35,
-                 max_non_white_ratio: float = 0.25,
+                 min_gap_width_m: float = 0.30,
+                 max_gap_width_m: float = 1.4,
+                 max_wall_touch_length_m: float = 0.45,
+                 max_non_white_ratio: float = 0.35,
                  white_threshold: int = 240,
                  third_wall_check_tolerance: int = 3):
         """
@@ -160,6 +161,7 @@ class GeometricOpeningDetector:
         self.min_opening_length_factor = float(min_opening_length_factor)
         self.max_opening_length_factor = float(max_opening_length_factor)
         self.max_opening_aspect_ratio = float(max_opening_aspect_ratio)
+        self.min_opening_aspect_ratio = float(min_opening_aspect_ratio)
 
         # Ограничения реального мира
         self.min_gap_width_m = float(min_gap_width_m)
@@ -523,6 +525,33 @@ class GeometricOpeningDetector:
         # Отклонение только если 3 или более сторон заблокированы
         if sides_blocked_count >= 3:
             return True
+
+        return False
+
+    def _check_min_aspect_ratio(self, opening: Opening) -> bool:
+        """
+        Проверка минимального соотношения сторон проёма (5:1).
+
+        Проёмы в стенах должны быть вытянутыми — одна сторона (длина проёма)
+        значительно больше другой (толщина стены). Слишком «квадратные»
+        детекции обычно являются ложными срабатываниями.
+
+        Параметры:
+            opening: Проверяемый проём
+
+        Возвращает:
+            True если проём слишком квадратный (невалидный), False если OK
+        """
+        w = opening.width
+        h = opening.height
+
+        if w <= 0 or h <= 0:
+            return True  # Невалидный — нулевые размеры
+
+        aspect_ratio = max(w, h) / (min(w, h) + 1e-6)
+
+        if aspect_ratio < self.min_opening_aspect_ratio:
+            return True  # Невалидный — слишком квадратный
 
         return False
 
@@ -1059,6 +1088,13 @@ class GeometricOpeningDetector:
             if self._check_wall_overlap(opening, rectangles, threshold=0.5):
                 opening.is_valid = False
                 opening.status = "wall_overlap"
+                self.last_deleted_openings.append(opening)
+                continue
+
+            # Проверка 6: Минимальное соотношение сторон (5:1)
+            if self._check_min_aspect_ratio(opening):
+                opening.is_valid = False
+                opening.status = "aspect_ratio_too_low"
                 self.last_deleted_openings.append(opening)
                 continue
 

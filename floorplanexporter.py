@@ -1,38 +1,32 @@
 """
-Экспортёр планировок Sweet Home 3D - Полная переработка
-Версия: 6.6
-Автор: Расширение для системы анализа планировок
-Дата: 02.06.2026
-
-Изменения:
-1. Стены с проёмами РЕАЛЬНО ПЕРЕМЕЩАЮТСЯ для выравнивания с соседними структурными стенами
-2. Простой прямой подход: поиск ближайших стен, перемещение к их центральным линиям
-3. Финальный проход расширяет стены для проникновения в ближайшие стеновые блоки
-4. Корректное хранилище .sh3d файлов со встроенными OBJ моделями и иконками
+================================================================================
+СИСТЕМА АВТОМАТИЧЕСКОГО АНАЛИЗА ПЛАНИРОВОК КВАРТИР «БРУСНИКА»
+Модуль: Экспорт в SweetHome3D (floorplanexporter.py)
+Версия: 6.0 — Flood-Fill Room Detection + Correct Opening Sizing
+Автор: Быков Вадим Олегович
+Дата: 2 марта 2026 г.
+================================================================================
 """
-
 import math
 import uuid
 import zipfile
 import base64
-from typing import List, Dict, Tuple, Optional, Set
-from dataclasses import dataclass, field
 from collections import defaultdict
+from dataclasses import dataclass, field
 from enum import Enum
+from typing import Dict, List, Optional, Set, Tuple
 from xml.etree import ElementTree as ET
-from xml.dom import minidom
 
-
-# ============================================================
-# РЕСУРСЫ И КОНСТАНТЫ
-# ============================================================
-
+import cv2
+import numpy as np
 
 # ============================================================
-# ASSETS & CONSTANTS
+# Встроенные 3D-ресурсы (base64 / OBJ)
 # ============================================================
-
-DUMMY_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAABJRU5ErkJggg=="
+DUMMY_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAACklEQVR4nGMAAQAABQABDQottAAAAA"
+    "BJRU5ErkJggg=="
+)
 
 DOOR_OBJ_CONTENT = """# door.obj
 g sweethome3d_hinge_1_3
@@ -285,77 +279,74 @@ f 70 69 68 67
 f 69 70 66 65
 """
 
+# ============================================================
+# Конфигурация — все константы в одном месте
+# ============================================================
+SCALE_FACTOR: float = 2.2
+DEFAULT_WALL_HEIGHT: float = 243.84
+DEFAULT_WALL_THICKNESS: float = 15.0
+DEFAULT_DOOR_HEIGHT: float = 208.5975
+DEFAULT_WINDOW_HEIGHT: float = 173.98999
+DEFAULT_WINDOW_ELEVATION: float = 46.989998
+WALL_EXTENSION_FACTOR: float = 0.05
+WALL_OVERLAP: float = 2.0
+SNAP_TOLERANCE: float = 40.0
+AXIS_SNAP_TOLERANCE: float = 15.0
+T_JUNCTION_SNAP_TOLERANCE: float = 30.0
+PARENT_WALL_SEARCH_TOLERANCE: float = 50.0
+CENTERLINE_SEARCH_RADIUS: float = 150.0
+OPENING_AXIS_SNAP_TOLERANCE: float = 30.0
+OPENING_EXTENSION_TOLERANCE: float = 30.0
+
+# --- REMOVED: these constants are no longer used ---
+# DEFAULT_DOOR_WIDTH / DEFAULT_WINDOW_WIDTH — opening width now comes
+# from the detected rectangle, not a hard-coded default.
+# OPENING_TO_WALL_RATIO — was used to stretch openings to parent wall
+# length; removed entirely.
+
 
 # ============================================================
-# CONFIGURATION
+# Перечисление типов проёмов
 # ============================================================
-
-DEFAULT_WALL_HEIGHT = 243.84
-DEFAULT_WALL_THICKNESS = 15.0
-DEFAULT_DOOR_WIDTH = 91.44
-DEFAULT_DOOR_HEIGHT = 208.5975
-DEFAULT_WINDOW_WIDTH = 91.1225
-DEFAULT_WINDOW_HEIGHT = 173.98999
-DEFAULT_WINDOW_ELEVATION = 46.989998
-
-SNAP_TOLERANCE = 15.0
-PARENT_WALL_SEARCH_TOLERANCE = 50.0
-WALL_EXTENSION_FACTOR = 0.05
-WALL_OVERLAP = 2.0
-BOX_PROXIMITY_TOLERANCE = 20.0
-BOX_EXTENSION_AMOUNT = 5.0
-CENTERLINE_SEARCH_RADIUS = 150.0
-OPENING_TO_WALL_RATIO = 0.85
-
-
 class OpeningType(Enum):
-    DOOR = "door"
-    WINDOW = "window"
-    GAP = "gap"
+    DOOR = 'door'
+    WINDOW = 'window'
+    GAP = 'gap'
 
 
 # ============================================================
-# DATA STRUCTURES
+# Структуры данных
 # ============================================================
-
 @dataclass
 class Point:
-    """2D точка на планировке"""
     x: float
     y: float
 
     def distance_to(self, other: 'Point') -> float:
         return math.hypot(self.x - other.x, self.y - other.y)
 
-    def __hash__(self):
+    def copy(self) -> 'Point':
+        return Point(self.x, self.y)
+
+    def __hash__(self) -> int:
         return hash((round(self.x, 2), round(self.y, 2)))
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         if not isinstance(other, Point):
             return False
         return abs(self.x - other.x) < 0.01 and abs(self.y - other.y) < 0.01
 
-    def copy(self) -> 'Point':
-        return Point(self.x, self.y)
-
-    def __repr__(self):
-        return f"Point({self.x:.2f}, {self.y:.2f})"
-
 
 @dataclass
 class Wall:
-    """
-    Представление стены для экспорта Sweet Home 3D.
-    Содержит геометрические параметры, связи с другими стенами и метаданные.
-    """
     start: Point
     end: Point
     thickness: float
     height: float = DEFAULT_WALL_HEIGHT
-    wall_id: str = field(default_factory=lambda: f"wall-{uuid.uuid4()}")
+    wall_id: str = field(default_factory=lambda: f'wall-{uuid.uuid4()}')
     wall_at_start: Optional[str] = None
     wall_at_end: Optional[str] = None
-    pattern: str = "hatchUp"
+    pattern: str = 'hatchUp'
     is_structural: bool = True
 
     @property
@@ -364,21 +355,21 @@ class Wall:
 
     @property
     def midpoint(self) -> Point:
-        return Point((self.start.x + self.end.x) / 2, (self.start.y + self.end.y) / 2)
+        return Point(
+            (self.start.x + self.end.x) / 2,
+            (self.start.y + self.end.y) / 2,
+        )
 
     @property
     def angle(self) -> float:
-        return math.atan2(self.end.y - self.start.y, self.end.x - self.start.x)
+        return math.atan2(
+            self.end.y - self.start.y,
+            self.end.x - self.start.x,
+        )
 
     @property
     def is_horizontal(self) -> bool:
         return abs(self.end.y - self.start.y) < abs(self.end.x - self.start.x)
-
-    def direction_vector(self) -> Tuple[float, float]:
-        length = self.length
-        if length < 0.001:
-            return (1.0, 0.0)
-        return ((self.end.x - self.start.x) / length, (self.end.y - self.start.y) / length)
 
     def perpendicular_distance(self, point: Point) -> float:
         dx = self.end.x - self.start.x
@@ -386,200 +377,315 @@ class Wall:
         length = self.length
         if length < 0.001:
             return point.distance_to(self.start)
-        return abs(dy * point.x - dx * point.y + self.end.x * self.start.y - self.end.y * self.start.x) / length
+        return abs(
+            dy * point.x - dx * point.y
+            + self.end.x * self.start.y
+            - self.end.y * self.start.x
+        ) / length
 
     def project_point(self, point: Point) -> Tuple[float, Point]:
         length_sq = self.length ** 2
         if length_sq < 0.001:
-            return (0.0, self.start.copy())
-
-        t = ((point.x - self.start.x) * (self.end.x - self.start.x) +
-             (point.y - self.start.y) * (self.end.y - self.start.y)) / length_sq
-
-        proj = Point(
+            return 0.0, self.start.copy()
+        t = (
+            (point.x - self.start.x) * (self.end.x - self.start.x)
+            + (point.y - self.start.y) * (self.end.y - self.start.y)
+        ) / length_sq
+        return t, Point(
             self.start.x + t * (self.end.x - self.start.x),
-            self.start.y + t * (self.end.y - self.start.y)
+            self.start.y + t * (self.end.y - self.start.y),
         )
-        return (t, proj)
 
-    def get_min_x(self) -> float:
-        return min(self.start.x, self.end.x)
-
-    def get_max_x(self) -> float:
-        return max(self.start.x, self.end.x)
-
-    def get_min_y(self) -> float:
-        return min(self.start.y, self.end.y)
-
-    def get_max_y(self) -> float:
-        return max(self.start.y, self.end.y)
-
-    def get_centerline_y(self) -> float:
-        return (self.start.y + self.end.y) / 2.0
-
-    def get_centerline_x(self) -> float:
-        return (self.start.x + self.end.x) / 2.0
+    def get_min_x(self) -> float: return min(self.start.x, self.end.x)
+    def get_max_x(self) -> float: return max(self.start.x, self.end.x)
+    def get_min_y(self) -> float: return min(self.start.y, self.end.y)
+    def get_max_y(self) -> float: return max(self.start.y, self.end.y)
+    def get_centerline_y(self) -> float: return (self.start.y + self.end.y) / 2.0
+    def get_centerline_x(self) -> float: return (self.start.x + self.end.x) / 2.0
 
 
 @dataclass
 class Opening:
-    """
-    Представление проёма (дверь или окно) в Sweet Home 3D.
-    Включает позицию, размеры, тип и связь с родительской стеной.
-    """
     opening_type: OpeningType
     center: Point
-    width: float
+    width: float          # FIX: now set from detected rectangle, not wall length
     height: float
     depth: float
     angle: float
     elevation: float = 0.0
     parent_wall_id: Optional[str] = None
-    opening_id: str = field(default_factory=lambda: f"opening-{uuid.uuid4()}")
+    opening_id: str = field(default_factory=lambda: f'opening-{uuid.uuid4()}')
     wall_thickness: float = 0.5
     wall_distance: float = 0.0
-    model: str = ""
-    icon: str = ""
+    model: str = ''
+    icon: str = ''
+    hinge: Optional[Tuple[int, int]] = None
+    swing_clockwise: bool = True
+    wall_normal_deg: float = 0.0
 
 
 @dataclass
 class Room:
     points: List[Point]
-    room_id: str = field(default_factory=lambda: f"room-{uuid.uuid4()}")
-    name: str = "Room"
+    room_id: str = field(default_factory=lambda: f'room-{uuid.uuid4()}')
+    name: str = 'Room'
+
+
+@dataclass
+class WallSegment:
+    wall_id: str
+    start: Point
+    end: Point
+    original_wall_id: str
 
 
 # ============================================================
-# UTILITIES
+# Утилиты
 # ============================================================
-
 def parse_rectangle(rect: Dict) -> Tuple[float, float, float, float]:
-    if all(k in rect for k in ['x1', 'y1', 'x2', 'y2']):
+    if all(k in rect for k in ('x1', 'y1', 'x2', 'y2')):
         return rect['x1'], rect['y1'], rect['x2'], rect['y2']
-    elif all(k in rect for k in ['x', 'y', 'width', 'height']):
-        return rect['x'], rect['y'], rect['x'] + rect['width'], rect['y'] + rect['height']
-    elif all(k in rect for k in ['x', 'y', 'w', 'h']):
+    if all(k in rect for k in ('x', 'y', 'width', 'height')):
+        return (rect['x'], rect['y'],
+                rect['x'] + rect['width'], rect['y'] + rect['height'])
+    if all(k in rect for k in ('x', 'y', 'w', 'h')):
         return rect['x'], rect['y'], rect['x'] + rect['w'], rect['y'] + rect['h']
-    else:
-        raise ValueError(f"Unknown rectangle format: {rect.keys()}")
+    raise ValueError(f'Unknown rectangle format: {list(rect.keys())}')
 
 
 # ============================================================
-# STRUCTURAL WALL CONVERTER
+# DebugVisualizer — CV2-визуализация для отладки экспорта
 # ============================================================
+class DebugVisualizer:
+    ROOM_COLORS: List[Tuple[int, int, int]] = [
+        (255, 180, 180), (180, 255, 180), (180, 180, 255),
+        (255, 255, 180), (255, 180, 255), (180, 255, 255),
+        (220, 200, 160), (160, 220, 200), (200, 160, 220),
+    ]
 
+    def __init__(self, pixels_to_cm: float) -> None:
+        self.pixels_to_cm = pixels_to_cm
+
+    def _cm_to_px(self, val: float) -> int:
+        return int(val / self.pixels_to_cm)
+
+    def _point_to_px(self, p: Point) -> Tuple[int, int]:
+        return self._cm_to_px(p.x), self._cm_to_px(p.y)
+
+    def create_debug_image(
+        self,
+        original_image: np.ndarray,
+        wall_rectangles: List[Dict],
+        walls: List[Wall],
+        rooms: List[Room],
+        openings: List[Opening],
+        ocr_labels: Optional[List] = None,
+        wall_mask: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        canvas = original_image.copy()
+        if wall_mask is not None:
+            self._draw_wall_mask(canvas, wall_mask)
+        if rooms:
+            room_overlay = canvas.copy()
+            for i, room in enumerate(rooms):
+                color = self.ROOM_COLORS[i % len(self.ROOM_COLORS)]
+                pts = np.array(
+                    [self._point_to_px(p) for p in room.points], dtype=np.int32
+                )
+                cv2.fillPoly(room_overlay, [pts], color)
+            cv2.addWeighted(room_overlay, 0.25, canvas, 0.75, 0, canvas)
+        for rect in wall_rectangles:
+            x1, y1, x2, y2 = parse_rectangle(rect)
+            cv2.rectangle(canvas, (int(x1), int(y1)), (int(x2), int(y2)),
+                          (90, 90, 90), 1)
+        for wall in walls:
+            pt1 = self._point_to_px(wall.start)
+            pt2 = self._point_to_px(wall.end)
+            color = (0, 0, 220) if wall.is_structural else (220, 120, 0)
+            cv2.line(canvas, pt1, pt2, color, 2 if wall.is_structural else 1)
+        for i, room in enumerate(rooms):
+            outline = tuple(max(0, c - 100) for c in self.ROOM_COLORS[i % len(self.ROOM_COLORS)])
+            px_pts = [self._point_to_px(p) for p in room.points]
+            cv2.polylines(canvas, [np.array(px_pts, dtype=np.int32)], True, outline, 2)
+            cx = int(sum(p[0] for p in px_pts) / len(px_pts))
+            cy = int(sum(p[1] for p in px_pts) / len(px_pts))
+            cv2.putText(canvas, room.name, (cx - 20, cy),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, outline, 1, cv2.LINE_AA)
+        for opening in openings:
+            cx, cy = self._point_to_px(opening.center)
+            if opening.opening_type == OpeningType.DOOR:
+                color, label = (255, 80, 0), 'D'
+            elif opening.opening_type == OpeningType.WINDOW:
+                color, label = (0, 200, 255), 'W'
+            else:
+                color, label = (0, 140, 255), 'G'
+            cv2.circle(canvas, (cx, cy), 6, color, -1)
+            cv2.circle(canvas, (cx, cy), 6, (255, 255, 255), 1)
+            cv2.putText(canvas, label, (cx + 9, cy + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+            if opening.hinge is not None:
+                hx, hy = opening.hinge
+                cv2.drawMarker(canvas, (hx, hy), (0, 255, 255),
+                               cv2.MARKER_DIAMOND, 8, 2)
+        if ocr_labels:
+            self._draw_ocr_labels(canvas, ocr_labels)
+        return canvas
+
+    def _draw_wall_mask(
+        self, canvas: np.ndarray, wall_mask: np.ndarray
+    ) -> None:
+        h, w = canvas.shape[:2]
+        mh, mw = wall_mask.shape[:2]
+        mask = (
+            cv2.resize(wall_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+            if (mh != h or mw != w) else wall_mask
+        )
+        mask_bool = mask > 0
+        fill = canvas.copy()
+        fill[mask_bool] = (180, 100, 200)
+        cv2.addWeighted(fill, 0.25, canvas, 0.75, 0, canvas)
+        contours, _ = cv2.findContours(
+            (mask_bool.astype(np.uint8)) * 255,
+            cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+        )
+        cv2.drawContours(canvas, contours, -1, (200, 50, 200), 1)
+
+    def _draw_ocr_labels(
+        self, canvas: np.ndarray, ocr_labels: List
+    ) -> None:
+        for text, x1, y1, x2, y2 in ocr_labels:
+            is_num = self._is_numeric(text)
+            bc = (0, 200, 0) if is_num else (160, 160, 0)
+            tc = (0, 180, 0) if is_num else (140, 140, 0)
+            th = 2 if is_num else 1
+            cv2.rectangle(canvas, (x1, y1), (x2, y2), bc, th)
+            (tw, tth), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
+            ly = max(y1 - 4, tth + 2)
+            cv2.rectangle(canvas, (x1, ly - tth - 2), (x1 + tw + 4, ly + 2),
+                          (255, 255, 255), -1)
+            cv2.putText(canvas, text, (x1 + 2, ly),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, tc, 1, cv2.LINE_AA)
+
+    @staticmethod
+    def _is_numeric(text: str) -> bool:
+        cleaned = text.strip().replace(',', '.').replace(' ', '')
+        if not cleaned:
+            return False
+        try:
+            float(cleaned)
+            return True
+        except ValueError:
+            return False
+
+
+# ============================================================
+# StructuralWallConverter
+# ============================================================
 class StructuralWallConverter:
-    def __init__(self, pixels_to_cm: float = 2.54, min_thickness: float = 5.0):
+    def __init__(
+        self, pixels_to_cm: float = 2.54, min_thickness: float = 2.0
+    ) -> None:
         self.pixels_to_cm = pixels_to_cm
         self.min_thickness = min_thickness
 
     def convert(self, rectangles: List[Dict]) -> List[Wall]:
-        walls = []
-
+        walls: List[Wall] = []
         for rect in rectangles:
             x1, y1, x2, y2 = parse_rectangle(rect)
-            x1 *= self.pixels_to_cm
-            y1 *= self.pixels_to_cm
-            x2 *= self.pixels_to_cm
-            y2 *= self.pixels_to_cm
-
-            width = abs(x2 - x1)
-            height = abs(y2 - y1)
-
+            x1 *= self.pixels_to_cm; y1 *= self.pixels_to_cm
+            x2 *= self.pixels_to_cm; y2 *= self.pixels_to_cm
+            width, height = abs(x2 - x1), abs(y2 - y1)
             if width >= height:
                 thickness = max(height, self.min_thickness)
-                center_y = (y1 + y2) / 2
-                start = Point(min(x1, x2), center_y)
-                end = Point(max(x1, x2), center_y)
+                cy = (y1 + y2) / 2
+                start, end = Point(min(x1, x2), cy), Point(max(x1, x2), cy)
             else:
                 thickness = max(width, self.min_thickness)
-                center_x = (x1 + x2) / 2
-                start = Point(center_x, min(y1, y2))
-                end = Point(center_x, max(y1, y2))
-
-            wall = Wall(
-                start=start,
-                end=end,
-                thickness=thickness,
-                is_structural=True
-            )
-            walls.append(wall)
-
+                cx = (x1 + x2) / 2
+                start, end = Point(cx, min(y1, y2)), Point(cx, max(y1, y2))
+            walls.append(Wall(start=start, end=end, thickness=thickness,
+                              is_structural=True))
         return walls
 
 
 # ============================================================
-# THICKNESS NORMALIZER
+# ThicknessNormalizer
 # ============================================================
-
 class ThicknessNormalizer:
-    def __init__(self, structural_walls: List[Wall], search_radius: float = 100.0):
+    def __init__(
+        self, structural_walls: List[Wall], search_radius: float = 80.0
+    ) -> None:
         self.structural_walls = [w for w in structural_walls if w.is_structural]
         self.search_radius = search_radius
 
-    def get_thickness_for_segment(self, start: Point, end: Point) -> float:
+    def get_thickness_for_segment(
+        self, start: Point, end: Point
+    ) -> float:
         midpoint = Point((start.x + end.x) / 2, (start.y + end.y) / 2)
         is_horizontal = abs(end.x - start.x) > abs(end.y - start.y)
-
-        candidates = []
+        candidates: List[Tuple[int, float, float]] = []
         for wall in self.structural_walls:
-            perp_dist = wall.perpendicular_distance(midpoint)
-            if perp_dist > self.search_radius:
+            if wall.perpendicular_distance(midpoint) > self.search_radius:
                 continue
-
             t, _ = wall.project_point(midpoint)
             if t < -0.5 or t > 1.5:
                 continue
-
-            orientation_match = (wall.is_horizontal == is_horizontal)
-            priority = 0 if orientation_match else 1
-            candidates.append((priority, perp_dist, wall.thickness))
-
+            priority = 0 if (wall.is_horizontal == is_horizontal) else 1
+            candidates.append((
+                priority,
+                wall.perpendicular_distance(midpoint),
+                wall.thickness,
+            ))
         if not candidates:
             return DEFAULT_WALL_THICKNESS
-
         candidates.sort(key=lambda x: (x[0], x[1]))
         return candidates[0][2]
 
 
 # ============================================================
-# PARENT WALL FINDER
+# ParentWallFinder
 # ============================================================
-
 class ParentWallFinder:
-    def __init__(self, walls: List[Wall], tolerance: float = PARENT_WALL_SEARCH_TOLERANCE):
+    def __init__(
+        self,
+        walls: List[Wall],
+        tolerance: float = PARENT_WALL_SEARCH_TOLERANCE,
+    ) -> None:
         self.walls = walls
         self.tolerance = tolerance
 
-    def find_parent(self, center: Point, opening_width: float, is_horizontal: bool) -> Optional[Wall]:
-        best_wall = None
+    def find_parent(
+        self, center: Point, opening_width: float, is_horizontal: bool
+    ) -> Optional[Wall]:
+        best_wall: Optional[Wall] = None
         best_distance = float('inf')
-
         for wall in self.walls:
             if wall.is_horizontal != is_horizontal:
                 continue
-
-            margin = (opening_width / 2) / wall.length if wall.length > 0 else 0.5
-            t, proj = wall.project_point(center)
-
-            if t < -margin or t > 1 + margin:
+            dx = wall.end.x - wall.start.x
+            dy = wall.end.y - wall.start.y
+            length_sq = dx * dx + dy * dy
+            if length_sq < 0.001:
                 continue
-
+            t = (
+                (center.x - wall.start.x) * dx
+                + (center.y - wall.start.y) * dy
+            ) / length_sq
+            if t < 0.0 or t > 1.0:
+                continue
+            proj = Point(wall.start.x + t * dx, wall.start.y + t * dy)
             perp_dist = center.distance_to(proj)
-
             if perp_dist < self.tolerance and perp_dist < best_distance:
                 best_distance = perp_dist
                 best_wall = wall
-
         return best_wall
 
 
 # ============================================================
-# OPENING PROCESSOR
+# OpeningProcessor
 # ============================================================
-
 class OpeningProcessor:
-    def __init__(self, pixels_to_cm: float = 2.54):
+    def __init__(self, pixels_to_cm: float = 2.54) -> None:
         self.pixels_to_cm = pixels_to_cm
 
     def process(
@@ -587,380 +693,517 @@ class OpeningProcessor:
         structural_walls: List[Wall],
         door_rects: Optional[List[Dict]] = None,
         window_rects: Optional[List[Dict]] = None,
-        gap_rects: Optional[List[Dict]] = None
+        gap_rects: Optional[List[Dict]] = None,
+        fused_doors: Optional[List] = None,
     ) -> Tuple[List[Wall], List[Opening]]:
         parent_finder = ParentWallFinder(structural_walls)
         thickness_normalizer = ThicknessNormalizer(structural_walls)
-
-        new_walls = []
-        openings = []
+        new_walls: List[Wall] = []
+        openings: List[Opening] = []
         processed_centers: List[Point] = []
 
-        all_rects = []
+        if fused_doors:
+            for fd in fused_doors:
+                result = self._process_fused_door(
+                    fd, parent_finder, thickness_normalizer
+                )
+                if result is None:
+                    continue
+                opening, wall = result
+                if any(opening.center.distance_to(pc) < 20.0 for pc in processed_centers):
+                    continue
+                processed_centers.append(opening.center)
+                openings.append(opening)
+                if wall:
+                    new_walls.append(wall)
+            door_rects = None
+
+        all_rects: List[Tuple[Dict, OpeningType]] = []
         if window_rects:
-            all_rects.extend([(r, OpeningType.WINDOW) for r in window_rects])
+            all_rects.extend((r, OpeningType.WINDOW) for r in window_rects)
         if gap_rects:
-            all_rects.extend([(r, OpeningType.GAP) for r in gap_rects])
+            all_rects.extend((r, OpeningType.GAP) for r in gap_rects)
         if door_rects:
-            all_rects.extend([(r, OpeningType.DOOR) for r in door_rects])
+            all_rects.extend((r, OpeningType.DOOR) for r in door_rects)
 
         for rect, opening_type in all_rects:
             result = self._process_single(
                 rect, opening_type, parent_finder, thickness_normalizer
             )
-
             if result is None:
                 continue
-
             opening, wall = result
-
-            is_duplicate = False
-            for prev_center in processed_centers:
-                if opening.center.distance_to(prev_center) < 20.0:
-                    is_duplicate = True
-                    break
-
-            if is_duplicate:
+            if any(opening.center.distance_to(pc) < 20.0 for pc in processed_centers):
                 continue
-
             processed_centers.append(opening.center)
             openings.append(opening)
             if wall:
                 new_walls.append(wall)
-
         return new_walls, openings
+
+    def _process_fused_door(
+        self,
+        fused_door,
+        parent_finder: ParentWallFinder,
+        thickness_normalizer: ThicknessNormalizer,
+    ) -> Optional[Tuple[Opening, Optional[Wall]]]:
+        cx, cy = fused_door.center
+        cx_cm = cx * self.pixels_to_cm
+        cy_cm = cy * self.pixels_to_cm
+        center = Point(cx_cm, cy_cm)
+
+        # FIX: derive opening width from the fused door's detected pixel width
+        width_cm = fused_door.width_px * self.pixels_to_cm
+        is_horizontal = abs(math.cos(math.radians(fused_door.wall_normal_deg))) > 0.707
+
+        ow = width_cm                       # ← actual detected gap width
+        oh = DEFAULT_DOOR_HEIGHT
+        elev = 0.0
+        wt, wd = 0.51724136, 0.06896552
+        model, icon = '1/door/door.obj', '0'
+
+        parent = parent_finder.find_parent(center, width_cm, is_horizontal)
+        new_wall: Optional[Wall] = None
+
+        if parent:
+            pid, depth, angle = parent.wall_id, parent.thickness, parent.angle
+        else:
+            thickness = thickness_normalizer.get_thickness_for_segment(
+                Point(cx_cm - width_cm / 2, cy_cm) if is_horizontal else Point(cx_cm, cy_cm - width_cm / 2),
+                Point(cx_cm + width_cm / 2, cy_cm) if is_horizontal else Point(cx_cm, cy_cm + width_cm / 2),
+            )
+            if is_horizontal:
+                half = width_cm * (1 + WALL_EXTENSION_FACTOR * 2) / 2
+                start = Point(center.x - half, center.y)
+                end = Point(center.x + half, center.y)
+                angle = 0.0
+            else:
+                half = width_cm * (1 + WALL_EXTENSION_FACTOR * 2) / 2
+                start = Point(center.x, center.y - half)
+                end = Point(center.x, center.y + half)
+                angle = math.pi / 2
+            new_wall = Wall(start=start, end=end, thickness=thickness, is_structural=False)
+            pid, depth = new_wall.wall_id, thickness
+
+        fused_angle = math.radians(fused_door.wall_normal_deg) if hasattr(fused_door, 'wall_normal_deg') else angle
+        hinge_px = fused_door.hinge if fused_door.hinge else (cx, cy)
+
+        opening = Opening(
+            opening_type=OpeningType.DOOR,
+            center=center,
+            width=ow, height=oh, depth=depth,
+            angle=fused_angle, elevation=elev,
+            parent_wall_id=pid,
+            wall_thickness=wt, wall_distance=wd,
+            model=model, icon=icon,
+            hinge=hinge_px,
+            swing_clockwise=fused_door.swing_clockwise,
+            wall_normal_deg=fused_door.wall_normal_deg,
+        )
+        return opening, new_wall
 
     def _process_single(
         self,
         rect: Dict,
         opening_type: OpeningType,
         parent_finder: ParentWallFinder,
-        thickness_normalizer: ThicknessNormalizer
+        thickness_normalizer: ThicknessNormalizer,
     ) -> Optional[Tuple[Opening, Optional[Wall]]]:
-
         x1, y1, x2, y2 = parse_rectangle(rect)
-        x1 *= self.pixels_to_cm
-        y1 *= self.pixels_to_cm
-        x2 *= self.pixels_to_cm
-        y2 *= self.pixels_to_cm
-
-        bbox_width = abs(x2 - x1)
-        bbox_height = abs(y2 - y1)
+        x1 *= self.pixels_to_cm; y1 *= self.pixels_to_cm
+        x2 *= self.pixels_to_cm; y2 *= self.pixels_to_cm
+        bbox_w, bbox_h = abs(x2 - x1), abs(y2 - y1)
         center = Point((x1 + x2) / 2, (y1 + y2) / 2)
-        is_horizontal = bbox_width >= bbox_height
+        is_horizontal = bbox_w >= bbox_h
+
+        # ──────────────────────────────────────────────────
+        # FIX: opening width = dimension parallel to the wall
+        # (the detected gap size), NOT a hard-coded default.
+        # ──────────────────────────────────────────────────
+        gap_width = bbox_w if is_horizontal else bbox_h
 
         if opening_type == OpeningType.WINDOW:
-            opening_width = DEFAULT_WINDOW_WIDTH
-            opening_height = DEFAULT_WINDOW_HEIGHT
-            elevation = DEFAULT_WINDOW_ELEVATION
-            wall_thickness_param = 0.7352941
-            wall_distance_param = 0.0
-            model = "3/window85x163/window85x163.obj"
-            icon = "2"
+            ow = gap_width
+            oh = DEFAULT_WINDOW_HEIGHT
+            elev = DEFAULT_WINDOW_ELEVATION
+            wt, wd = 0.7352941, 0.0
+            model, icon = '3/window85x163/window85x163.obj', '2'
         elif opening_type == OpeningType.GAP:
-            # GAP (геометрически обнаруженные окна) используют параметры дверей для стен
-            opening_width = DEFAULT_WINDOW_WIDTH
-            opening_height = DEFAULT_WINDOW_HEIGHT
-            elevation = DEFAULT_WINDOW_ELEVATION
-            wall_thickness_param = 0.51724136  # Как у дверей
-            wall_distance_param = 0.06896552   # Как у дверей
-            model = "3/window85x163/window85x163.obj"
-            icon = "2"
-        else:  # DOOR
-            opening_width = DEFAULT_DOOR_WIDTH
-            opening_height = DEFAULT_DOOR_HEIGHT
-            elevation = 0.0
-            wall_thickness_param = 0.51724136
-            wall_distance_param = 0.06896552
-            model = "1/door/door.obj"
-            icon = "0"
+            ow = gap_width
+            oh = DEFAULT_WINDOW_HEIGHT
+            elev = DEFAULT_WINDOW_ELEVATION
+            wt, wd = 0.51724136, 0.06896552
+            model, icon = '3/window85x163/window85x163.obj', '2'
+        else:
+            ow = gap_width
+            oh = DEFAULT_DOOR_HEIGHT
+            elev = 0.0
+            wt, wd = 0.51724136, 0.06896552
+            model, icon = '1/door/door.obj', '0'
 
-        parent_wall = parent_finder.find_parent(center, max(bbox_width, bbox_height), is_horizontal)
+        parent = parent_finder.find_parent(center, max(bbox_w, bbox_h), is_horizontal)
+        new_wall: Optional[Wall] = None
 
-        new_wall = None
-        if parent_wall:
-            parent_wall_id = parent_wall.wall_id
-            depth = parent_wall.thickness
-            angle = parent_wall.angle
+        if parent:
+            pid, depth, angle = parent.wall_id, parent.thickness, parent.angle
         else:
             thickness = thickness_normalizer.get_thickness_for_segment(
                 Point(x1, (y1 + y2) / 2) if is_horizontal else Point((x1 + x2) / 2, y1),
-                Point(x2, (y1 + y2) / 2) if is_horizontal else Point((x1 + x2) / 2, y2)
+                Point(x2, (y1 + y2) / 2) if is_horizontal else Point((x1 + x2) / 2, y2),
             )
-
             if is_horizontal:
-                extent = bbox_width * (1 + WALL_EXTENSION_FACTOR * 2)
-                half_extent = extent / 2
-                start = Point(center.x - half_extent, center.y)
-                end = Point(center.x + half_extent, center.y)
+                half = bbox_w * (1 + WALL_EXTENSION_FACTOR * 2) / 2
+                start = Point(center.x - half, center.y)
+                end = Point(center.x + half, center.y)
                 angle = 0.0
             else:
-                extent = bbox_height * (1 + WALL_EXTENSION_FACTOR * 2)
-                half_extent = extent / 2
-                start = Point(center.x, center.y - half_extent)
-                end = Point(center.x, center.y + half_extent)
+                half = bbox_h * (1 + WALL_EXTENSION_FACTOR * 2) / 2
+                start = Point(center.x, center.y - half)
+                end = Point(center.x, center.y + half)
                 angle = math.pi / 2
-
-            new_wall = Wall(
-                start=start,
-                end=end,
-                thickness=thickness,
-                is_structural=False
-            )
-            parent_wall_id = new_wall.wall_id
-            depth = thickness
+            new_wall = Wall(start=start, end=end, thickness=thickness, is_structural=False)
+            pid, depth = new_wall.wall_id, thickness
 
         opening = Opening(
             opening_type=opening_type,
             center=center,
-            width=opening_width,
-            height=opening_height,
-            depth=depth,
-            angle=angle,
-            elevation=elevation,
-            parent_wall_id=parent_wall_id,
-            wall_thickness=wall_thickness_param,
-            wall_distance=wall_distance_param,
-            model=model,
-            icon=icon
+            width=ow, height=oh, depth=depth,
+            angle=angle, elevation=elev,
+            parent_wall_id=pid,
+            wall_thickness=wt, wall_distance=wd,
+            model=model, icon=icon,
         )
-
-        return (opening, new_wall)
+        return opening, new_wall
 
 
 # ============================================================
-# ROOM DETECTOR
+# RoomDetector  — REWRITTEN: raster flood-fill approach
 # ============================================================
-
 class RoomDetector:
-    def __init__(self, tolerance: float = 1.0):
-        self.tolerance = tolerance
+    """
+    Detect rooms by rasterising all wall geometry onto a binary mask,
+    flood-filling the exterior from the image border, then finding
+    connected components of remaining interior (non-wall, non-exterior)
+    space.  Each connected component = one room polygon.
 
+    This guarantees:
+      • every enclosed space is detected,
+      • no room polygon contains walls inside it,
+      • adjacent rooms connected only by a doorway are kept separate
+        (because opening walls seal the gap in the raster).
+    """
+
+    def __init__(
+        self,
+        resolution: float = 1.0,
+        min_room_area_cm2: float = 2000.0,
+        wall_dilation_px: int = 2,
+        contour_simplify_ratio: float = 0.012,
+    ) -> None:
+        self.resolution = resolution              # cm per raster pixel
+        self.min_room_area_cm2 = min_room_area_cm2
+        self.wall_dilation_px = wall_dilation_px  # close sub-pixel gaps
+        self.contour_simplify_ratio = contour_simplify_ratio
+
+    # ---- public API (same signature the exporter expects) ----
     def detect(self, walls: List[Wall]) -> List[Room]:
         if len(walls) < 3:
             return []
 
-        graph = self._build_graph(walls)
-        if not graph:
-            return []
+        mask, origin = self._rasterize_walls(walls)
+        interior = self._extract_interior(mask)
+        rooms = self._components_to_rooms(interior, origin)
+        return rooms
 
-        cycles = self._find_minimal_cycles(graph)
+    # ---- rasterise walls as filled rectangles ----
+    def _rasterize_walls(
+        self, walls: List[Wall]
+    ) -> Tuple[np.ndarray, Tuple[float, float]]:
+        padding = 60.0  # cm around the bounding box
+        all_x, all_y = [], []
+        for w in walls:
+            half_t = w.thickness / 2.0
+            dx = w.end.x - w.start.x
+            dy = w.end.y - w.start.y
+            length = math.hypot(dx, dy)
+            if length < 0.001:
+                continue
+            nx, ny = -dy / length, dx / length
+            for p in (w.start, w.end):
+                all_x.extend([p.x + nx * half_t, p.x - nx * half_t])
+                all_y.extend([p.y + ny * half_t, p.y - ny * half_t])
 
-        rooms = []
-        for i, cycle in enumerate(cycles):
-            if len(cycle) >= 3:
-                points = [Point(x, y) for x, y in cycle]
-                rooms.append(Room(points=points, name=f"Room {i + 1}"))
+        if not all_x:
+            return np.zeros((10, 10), np.uint8), (0.0, 0.0)
+
+        min_x = min(all_x) - padding
+        min_y = min(all_y) - padding
+        max_x = max(all_x) + padding
+        max_y = max(all_y) + padding
+
+        res = self.resolution
+        w_px = int(math.ceil((max_x - min_x) / res)) + 1
+        h_px = int(math.ceil((max_y - min_y) / res)) + 1
+        mask = np.zeros((h_px, w_px), dtype=np.uint8)
+
+        for wall in walls:
+            half_t = wall.thickness / 2.0
+            dx = wall.end.x - wall.start.x
+            dy = wall.end.y - wall.start.y
+            length = math.hypot(dx, dy)
+            if length < 0.001:
+                continue
+            nx, ny = -dy / length, dx / length
+            corners_cm = [
+                (wall.start.x + nx * half_t, wall.start.y + ny * half_t),
+                (wall.end.x   + nx * half_t, wall.end.y   + ny * half_t),
+                (wall.end.x   - nx * half_t, wall.end.y   - ny * half_t),
+                (wall.start.x - nx * half_t, wall.start.y - ny * half_t),
+            ]
+            pts = np.array(
+                [
+                    [int((x - min_x) / res), int((y - min_y) / res)]
+                    for x, y in corners_cm
+                ],
+                dtype=np.int32,
+            )
+            cv2.fillConvexPoly(mask, pts, 255)
+
+        # Dilate slightly to close sub-pixel gaps between abutting walls
+        if self.wall_dilation_px > 0:
+            kernel = np.ones(
+                (2 * self.wall_dilation_px + 1, 2 * self.wall_dilation_px + 1),
+                dtype=np.uint8,
+            )
+            mask = cv2.dilate(mask, kernel, iterations=1)
+
+        return mask, (min_x, min_y)
+
+    # ---- flood-fill exterior, then interior = rooms ----
+    def _extract_interior(self, mask: np.ndarray) -> np.ndarray:
+        h, w = mask.shape
+        flood = mask.copy()
+        # cv2.floodFill needs a mask that is h+2 × w+2
+        ff_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
+        # Fill from (0, 0) — guaranteed to be exterior because of padding
+        cv2.floodFill(flood, ff_mask, (0, 0), 128)
+        # flood now: 255 = wall, 128 = exterior, 0 = interior
+        interior = (flood == 0).astype(np.uint8) * 255
+        return interior
+
+    # ---- connected components → Room objects ----
+    def _components_to_rooms(
+        self, interior: np.ndarray, origin: Tuple[float, float]
+    ) -> List[Room]:
+        min_x, min_y = origin
+        res = self.resolution
+        num_labels, labels = cv2.connectedComponents(interior)
+
+        rooms: List[Room] = []
+        for label_id in range(1, num_labels):
+            component = (labels == label_id).astype(np.uint8) * 255
+            area_px = int(np.sum(component > 0))
+            area_cm2 = area_px * (res * res)
+            if area_cm2 < self.min_room_area_cm2:
+                continue
+
+            contours, _ = cv2.findContours(
+                component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+            if not contours:
+                continue
+            contour = max(contours, key=cv2.contourArea)
+
+            # Simplify to a reasonable polygon
+            perimeter = cv2.arcLength(contour, True)
+            epsilon = self.contour_simplify_ratio * perimeter
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            if len(approx) < 3:
+                continue
+
+            points: List[Point] = []
+            for pt in approx:
+                x_cm = pt[0][0] * res + min_x
+                y_cm = pt[0][1] * res + min_y
+                points.append(Point(x_cm, y_cm))
+
+            rooms.append(Room(
+                points=points,
+                name=f'Room {len(rooms) + 1}',
+            ))
 
         return rooms
 
-    def _build_graph(self, walls: List[Wall]) -> Dict[Tuple[float, float], Set[Tuple[float, float]]]:
-        graph = defaultdict(set)
-        for wall in walls:
-            start_key = (round(wall.start.x, 1), round(wall.start.y, 1))
-            end_key = (round(wall.end.x, 1), round(wall.end.y, 1))
-            if start_key != end_key:
-                graph[start_key].add(end_key)
-                graph[end_key].add(start_key)
-        return graph
 
-    def _find_minimal_cycles(self, graph: Dict) -> List[List[Tuple[float, float]]]:
-        cycles = []
+# ============================================================
+# RoomOverlapRemover  (kept for compatibility but much simpler
+# now — the flood-fill detector rarely produces overlaps)
+# ============================================================
+class RoomOverlapRemover:
+    def __init__(
+        self,
+        min_area_threshold: float = 50.0,
+        overlap_threshold: float = 0.50,
+        **_kwargs,
+    ) -> None:
+        self.min_area_threshold = min_area_threshold
+        self.overlap_threshold = overlap_threshold
 
-        def dfs(start, current, path, depth):
-            if depth > 12:
-                return
-            for neighbor in graph[current]:
-                edge = tuple(sorted([current, neighbor]))
-                if neighbor == start and len(path) >= 3:
-                    cycles.append(path[:])
-                elif neighbor not in path:
-                    path.append(neighbor)
-                    dfs(start, neighbor, path, depth + 1)
-                    path.pop()
+    @staticmethod
+    def _polygon_area(points: List[Point]) -> float:
+        if len(points) < 3:
+            return 0.0
+        area = 0.0
+        for i in range(len(points)):
+            j = (i + 1) % len(points)
+            area += points[i].x * points[j].y - points[j].x * points[i].y
+        return abs(area) / 2.0
 
-        for start_node in graph:
-            dfs(start_node, start_node, [start_node], 0)
-
-        return self._remove_duplicate_cycles(cycles)
-
-    def _remove_duplicate_cycles(self, cycles: List[List]) -> List[List]:
-        unique = []
-        seen = set()
-        for cycle in cycles:
-            min_idx = cycle.index(min(cycle))
-            normalized = tuple(cycle[min_idx:] + cycle[:min_idx])
-            reversed_cycle = list(reversed(cycle))
-            min_idx_rev = reversed_cycle.index(min(reversed_cycle))
-            normalized_rev = tuple(reversed_cycle[min_idx_rev:] + reversed_cycle[:min_idx_rev])
-            key = min(normalized, normalized_rev)
-            if key not in seen:
-                seen.add(key)
-                unique.append(cycle)
-        return unique
+    def remove_overlaps(self, rooms: List[Room]) -> List[Room]:
+        # With flood-fill rooms overlap should not happen; keep as safety net
+        if not rooms:
+            return []
+        return [
+            r for r in rooms
+            if self._polygon_area(r.points) >= self.min_area_threshold
+        ]
 
 
 # ============================================================
-# XML GENERATOR
+# SH3DXMLGenerator
 # ============================================================
-
 class SH3DXMLGenerator:
-    def __init__(self, wall_height: float = DEFAULT_WALL_HEIGHT):
+    def __init__(
+        self,
+        wall_height: float = DEFAULT_WALL_HEIGHT,
+        scale_factor: float = SCALE_FACTOR,
+    ) -> None:
         self.wall_height = wall_height
+        self.scale_factor = scale_factor
 
     def generate(
         self,
         walls: List[Wall],
         openings: List[Opening],
         rooms: List[Room],
-        name: str = "floor_plan"
+        name: str = 'floor_plan',
     ) -> str:
+        sf = self.scale_factor
         root = ET.Element('home')
         root.set('version', '7400')
         root.set('name', name)
         root.set('camera', 'topCamera')
-        root.set('wallHeight', str(self.wall_height))
-
-        # Properties
+        root.set('wallHeight', f'{self.wall_height / sf:.4f}')
         prop = ET.SubElement(root, 'property')
         prop.set('name', 'com.eteks.sweethome3d.SweetHome3D.PlanScale')
         prop.set('value', '0.02')
-
         env = ET.SubElement(root, 'environment')
         env.set('groundColor', '00A8A8A8')
         env.set('skyColor', '00CCE4FC')
         env.set('lightColor', '00D0D0D0')
-
-        camera = ET.SubElement(root, 'camera')
-        camera.set('attribute', 'topCamera')
-        camera.set('lens', 'PINHOLE')
-        camera.set('x', '500.0')
-        camera.set('y', '500.0')
-        camera.set('z', '1500.0')
-        camera.set('yaw', '0.0')
-        camera.set('pitch', '1.4')
-        camera.set('fieldOfView', '1.0')
-
+        cam = ET.SubElement(root, 'camera')
+        cam.set('attribute', 'topCamera')
+        cam.set('lens', 'PINHOLE')
+        cam.set('x', f'{500 / sf:.4f}')
+        cam.set('y', f'{500 / sf:.4f}')
+        cam.set('z', f'{1500 / sf:.4f}')
+        cam.set('yaw', '0.0')
+        cam.set('pitch', '1.4')
+        cam.set('fieldOfView', '1.0')
         for room in rooms:
             self._add_room(root, room)
-
         for opening in openings:
             self._add_opening(root, opening)
-
         for wall in walls:
             self._add_wall(root, wall)
+        return ET.tostring(root, encoding='unicode')
 
-        xml_str = ET.tostring(root, encoding='unicode')
-        return xml_str
+    def _add_wall(self, root: ET.Element, w: Wall) -> None:
+        sf = self.scale_factor
+        e = ET.SubElement(root, 'wall')
+        e.set('id', w.wall_id)
+        e.set('xStart', f'{w.start.x / sf:.4f}')
+        e.set('yStart', f'{w.start.y / sf:.4f}')
+        e.set('xEnd', f'{w.end.x / sf:.4f}')
+        e.set('yEnd', f'{w.end.y / sf:.4f}')
+        e.set('height', f'{w.height / sf:.4f}')
+        e.set('thickness', f'{w.thickness / sf:.4f}')
+        e.set('pattern', w.pattern)
+        if w.wall_at_start:
+            e.set('wallAtStart', w.wall_at_start)
+        if w.wall_at_end:
+            e.set('wallAtEnd', w.wall_at_end)
 
-    def _add_wall(self, root: ET.Element, wall: Wall):
-        elem = ET.SubElement(root, 'wall')
-        elem.set('id', wall.wall_id)
-        elem.set('xStart', f"{wall.start.x:.4f}")
-        elem.set('yStart', f"{wall.start.y:.4f}")
-        elem.set('xEnd', f"{wall.end.x:.4f}")
-        elem.set('yEnd', f"{wall.end.y:.4f}")
-        elem.set('height', str(wall.height))
-        elem.set('thickness', f"{wall.thickness:.4f}")
-        elem.set('pattern', wall.pattern)
-
-        if wall.wall_at_start:
-            elem.set('wallAtStart', wall.wall_at_start)
-        if wall.wall_at_end:
-            elem.set('wallAtEnd', wall.wall_at_end)
-
-    def _add_opening(self, root: ET.Element, opening: Opening):
-        elem = ET.SubElement(root, 'doorOrWindow')
-        elem.set('id', opening.opening_id)
-
-        if opening.opening_type in (OpeningType.DOOR, OpeningType.GAP):
-            elem.set('catalogId', 'eteks-door')
-            elem.set('name', 'Door')
+    def _add_opening(self, root: ET.Element, o: Opening) -> None:
+        sf = self.scale_factor
+        e = ET.SubElement(root, 'doorOrWindow')
+        e.set('id', o.opening_id)
+        if o.opening_type in (OpeningType.DOOR, OpeningType.GAP):
+            e.set('catalogId', 'eteks-door')
+            e.set('name', 'Door')
         else:
-            elem.set('catalogId', 'eteks-window85x163')
-            elem.set('name', 'Window')
+            e.set('catalogId', 'eteks-window85x163')
+            e.set('name', 'Window')
+        e.set('creator', 'eTeks')
+        e.set('model', o.model)
+        e.set('icon', o.icon)
+        e.set('x', f'{o.center.x / sf:.4f}')
+        e.set('y', f'{o.center.y / sf:.4f}')
+        if o.elevation > 0:
+            e.set('elevation', f'{o.elevation / sf:.4f}')
+        e.set('angle', str(o.angle))
+        e.set('width', f'{o.width / sf:.4f}')
+        e.set('depth', f'{o.depth / sf:.4f}')
+        e.set('height', f'{o.height / sf:.4f}')
+        e.set('movable', 'false')
+        e.set('wallThickness', str(o.wall_thickness))
+        e.set('wallDistance', str(o.wall_distance))
+        e.set('cutOutShape', 'M0,0 v1 h1 v-1 z')
+        e.set('wallCutOutOnBothSides', 'true')
 
-        elem.set('creator', 'eTeks')
-        elem.set('model', opening.model)
-        elem.set('icon', opening.icon)
-        elem.set('x', f"{opening.center.x:.4f}")
-        elem.set('y', f"{opening.center.y:.4f}")
+        # ──────────────────────────────────────────────────────────
+        # FIX: NO <sash> element → SweetHome3D will not draw a
+        # swing arc for doors or windows.
+        # ──────────────────────────────────────────────────────────
 
-        if opening.elevation > 0:
-            elem.set('elevation', str(opening.elevation))
-
-        elem.set('angle', str(opening.angle))
-        elem.set('width', str(opening.width))
-        elem.set('depth', f"{opening.depth:.4f}")
-        elem.set('height', str(opening.height))
-        elem.set('movable', 'false')
-
-        elem.set('wallThickness', str(opening.wall_thickness))
-        elem.set('wallDistance', str(opening.wall_distance))
-        elem.set('cutOutShape', 'M0,0 v1 h1 v-1 z')
-        elem.set('wallCutOutOnBothSides', 'true')
-
-        sash = ET.SubElement(elem, 'sash')
-        if opening.opening_type in (OpeningType.DOOR, OpeningType.GAP):
-            sash.set('xAxis', '0.05464481')
-            sash.set('yAxis', '0.5862069')
-            sash.set('width', '0.89071035')
-        else:
-            sash.set('xAxis', '0.021978023')
-            sash.set('yAxis', '0.7352941')
-            sash.set('width', '0.94505495')
-        sash.set('startAngle', '0.0')
-        sash.set('endAngle', '-1.5707964')
-
-    def _add_room(self, root: ET.Element, room: Room):
-        elem = ET.SubElement(root, 'room')
-        elem.set('id', room.room_id)
-        elem.set('name', room.name)
-        elem.set('areaVisible', 'true')
-        elem.set('floorColor', '-3355444')
-
-        for point in room.points:
-            pt = ET.SubElement(elem, 'point')
-            pt.set('x', f"{point.x:.4f}")
-            pt.set('y', f"{point.y:.4f}")
+    def _add_room(self, root: ET.Element, room: Room) -> None:
+        sf = self.scale_factor
+        e = ET.SubElement(root, 'room')
+        e.set('id', room.room_id)
+        e.set('name', room.name)
+        e.set('areaVisible', 'true')
+        e.set('floorColor', '-3355444')
+        for p in room.points:
+            pt = ET.SubElement(e, 'point')
+            pt.set('x', f'{p.x / sf:.4f}')
+            pt.set('y', f'{p.y / sf:.4f}')
 
 
 # ============================================================
-# MAIN EXPORTER
+# SweetHome3DExporter — фасад всего пайплайна экспорта
 # ============================================================
-
 class SweetHome3DExporter:
-    """
-    Основной класс экспортёра в формат Sweet Home 3D.
-
-    Функциональность:
-    - Преобразование сегментов стен в геометрию Sweet Home 3D
-    - Создание и позиционирование проёмов (дверей/окон)
-    - Выравнивание стен с проёмами относительно структурных стен
-    - Автоматическое соединение стен в углах
-    - Генерация XML для .sh3d файлов
-    - Упаковка всех ресурсов в итоговый .sh3d архив
-    """
-    """
-    Sweet Home 3D Floor Plan Exporter - Version 6.6
-    """
-
     def __init__(
         self,
-        min_wall_thickness: float = 5.0,
+        min_wall_thickness: float = 2.0,
         pixels_to_cm: float = 2.54,
         wall_height_cm: float = DEFAULT_WALL_HEIGHT,
         snap_tolerance: float = SNAP_TOLERANCE,
-        wall_overlap: float = WALL_OVERLAP
-    ):
+        wall_overlap: float = WALL_OVERLAP,
+        scale_factor: float = SCALE_FACTOR,
+    ) -> None:
         self.pixels_to_cm = pixels_to_cm
         self.wall_height = wall_height_cm
         self.snap_tolerance = snap_tolerance
         self.wall_overlap = wall_overlap
-
         self.wall_converter = StructuralWallConverter(pixels_to_cm, min_wall_thickness)
         self.opening_processor = OpeningProcessor(pixels_to_cm)
-        self.xml_generator = SH3DXMLGenerator(wall_height_cm)
+        self.xml_generator = SH3DXMLGenerator(wall_height_cm, scale_factor)
+
+    def update_scale(self, pixels_to_cm: float) -> None:
+        self.pixels_to_cm = pixels_to_cm
+        self.wall_converter.pixels_to_cm = pixels_to_cm
+        self.opening_processor.pixels_to_cm = pixels_to_cm
 
     def export_to_sh3d(
         self,
@@ -969,505 +1212,465 @@ class SweetHome3DExporter:
         door_rectangles: Optional[List[Dict]] = None,
         window_rectangles: Optional[List[Dict]] = None,
         gap_rectangles: Optional[List[Dict]] = None,
-        **kwargs
-    ):
-        # Step 1: Convert structural walls
+        original_image: Optional[np.ndarray] = None,
+        ocr_labels: Optional[List] = None,
+        debug_image_path: Optional[str] = None,
+        wall_mask: Optional[np.ndarray] = None,
+        fused_doors: Optional[List] = None,
+    ) -> List[Room]:
         structural_walls = self.wall_converter.convert(wall_rectangles)
 
-        # Step 2: Process openings - creates opening walls
         opening_walls, openings = self.opening_processor.process(
             structural_walls,
             door_rects=door_rectangles,
             window_rects=window_rectangles,
-            gap_rects=gap_rectangles
+            gap_rects=gap_rectangles,
+            fused_doors=fused_doors,
         )
 
-        # Step 3: Combine all walls
         all_walls = structural_walls + opening_walls
-
-        # Step 4: MOVE opening walls to align with adjacent structural walls
-        self._move_opening_walls_to_structural_centerlines(opening_walls, structural_walls)
-
-        # Step 5: Extend all walls to connect with overlaps
-        self._extend_walls_to_connect(all_walls)
-
-        # Step 6: Final pass - extend walls close to other wall boxes
-        self._extend_walls_into_nearby_boxes(all_walls)
-
-        # Step 7: Connect walls
-        self._connect_walls(all_walls)
-
-        # Step 8: Update openings to match moved walls
+        self._move_opening_walls_to_structural_centerlines(
+            opening_walls, structural_walls
+        )
+        self._process_wall_connections(all_walls, structural_walls, opening_walls)
         self._update_openings_from_walls(openings, all_walls)
 
-        # Step 9: Detect rooms
-        room_detector = RoomDetector()
-        rooms = room_detector.detect(all_walls)
+        # ──────────────────────────────────────────────────────
+        # FIX: use the new flood-fill RoomDetector
+        # ──────────────────────────────────────────────────────
+        rooms = RoomDetector(
+            resolution=1.0,
+            min_room_area_cm2=2000.0,
+            wall_dilation_px=2,
+            contour_simplify_ratio=0.012,
+        ).detect(all_walls)
 
-        # Step 10: Generate XML
-        xml_content = self.xml_generator.generate(
-            walls=all_walls,
-            openings=openings,
-            rooms=rooms,
-            name=output_path
+        rooms = RoomOverlapRemover(
+            min_area_threshold=50.0, overlap_threshold=0.50
+        ).remove_overlaps(rooms)
+
+        xml = self.xml_generator.generate(
+            walls=all_walls, openings=openings, rooms=rooms, name=output_path
         )
+        self._write_sh3d_file(output_path, xml)
 
-        # Step 11: Write file
-        self._write_sh3d_file(output_path, xml_content)
+        if original_image is not None and debug_image_path is not None:
+            viz = DebugVisualizer(self.wall_converter.pixels_to_cm)
+            debug_img = viz.create_debug_image(
+                original_image, wall_rectangles, all_walls,
+                rooms, openings, ocr_labels, wall_mask,
+            )
+            cv2.imwrite(debug_image_path, debug_img)
+        return rooms
 
+    # ----- opening-wall → structural-centerline snapping (unchanged) -----
     def _move_opening_walls_to_structural_centerlines(
-            self,
-            opening_walls: List[Wall],
-            structural_walls: List[Wall]
-    ):
-        """
-        Move each opening wall to snap between two structural walls that form
-        the smallest non-zero gap that isn't already occupied by another wall.
-        """
-        horiz_structural = [w for w in structural_walls if w.is_horizontal]
-        vert_structural = [w for w in structural_walls if not w.is_horizontal]
+        self,
+        opening_walls: List[Wall],
+        structural_walls: List[Wall],
+    ) -> None:
+        horiz_s = [w for w in structural_walls if w.is_horizontal]
+        vert_s = [w for w in structural_walls if not w.is_horizontal]
+        search_r = CENTERLINE_SEARCH_RADIUS
 
         for ow in opening_walls:
             if ow.length < 0.1:
                 continue
-
-            old_start = ow.start.copy()
-            old_end = ow.end.copy()
-
             if ow.is_horizontal:
-                # === HORIZONTAL OPENING WALL ===
-                # Opening runs left-right, need to find two VERTICAL walls to snap between
                 ow_y = ow.get_centerline_y()
-                ow_center_x = (ow.get_min_x() + ow.get_max_x()) / 2
-
-                # Find the best pair of vertical walls (left and right) with smallest gap
-                best_gap = float('inf')
-                best_left_x = None
-                best_right_x = None
-
-                # Get all vertical walls that could be candidates (near our Y level)
-                left_candidates = []  # walls to the left of center
-                right_candidates = []  # walls to the right of center
-
-                for sw in vert_structural:
-                    sw_x = sw.get_centerline_x()
-                    sw_y_min = sw.get_min_y()
-                    sw_y_max = sw.get_max_y()
-
-                    # Check if this wall spans our Y level
-                    if not (sw_y_min - CENTERLINE_SEARCH_RADIUS <= ow_y <= sw_y_max + CENTERLINE_SEARCH_RADIUS):
-                        continue
-
-                    dist_from_center = abs(sw_x - ow_center_x)
-                    if dist_from_center > CENTERLINE_SEARCH_RADIUS:
-                        continue
-
-                    if sw_x < ow_center_x:
-                        left_candidates.append((sw_x, sw))
-                    else:
-                        right_candidates.append((sw_x, sw))
-
-                # Try all pairs of (left_wall, right_wall) to find smallest non-zero gap
-                for left_x, left_wall in left_candidates:
-                    for right_x, right_wall in right_candidates:
-                        gap = right_x - left_x
-
-                        # Must be positive (right is actually to the right of left)
-                        if gap <= 0:
-                            continue
-
-                        # Skip if gap is too small (walls touching)
-                        if gap < 5.0:
-                            continue
-
-                        # Check if this gap is already occupied by another wall
-                        is_occupied = False
-                        for other_ow in opening_walls:
-                            if other_ow.wall_id == ow.wall_id:
-                                continue
-                            if not other_ow.is_horizontal:
-                                continue
-                            # Check if other opening wall is in this gap
-                            other_y = other_ow.get_centerline_y()
-                            if abs(other_y - ow_y) < 20.0:  # Same Y level
-                                other_min_x = other_ow.get_min_x()
-                                other_max_x = other_ow.get_max_x()
-                                # Check overlap with gap
-                                if other_min_x < right_x and other_max_x > left_x:
-                                    is_occupied = True
-                                    break
-
-                        # Also check structural walls in the gap
-                        if not is_occupied:
-                            for sw in horiz_structural:
-                                sw_y = sw.get_centerline_y()
-                                if abs(sw_y - ow_y) < 20.0:
-                                    sw_min_x = sw.get_min_x()
-                                    sw_max_x = sw.get_max_x()
-                                    # Check if structural wall fills this gap
-                                    if sw_min_x <= left_x + 5 and sw_max_x >= right_x - 5:
-                                        is_occupied = True
-                                        break
-
-                        if is_occupied:
-                            continue
-
-                        # This gap is valid - check if it's the smallest
-                        if gap < best_gap:
-                            best_gap = gap
-                            best_left_x = left_x
-                            best_right_x = right_x
-
-                # Apply the best gap found
-                if best_left_x is not None and best_right_x is not None:
-                    ow.start.x = best_left_x
-                    ow.end.x = best_right_x
-
-                # Now find the best Y position (snap to nearest horizontal structural wall)
-                best_y = None
-                best_y_dist = CENTERLINE_SEARCH_RADIUS
-
-                for sw in horiz_structural:
-                    sw_y = sw.get_centerline_y()
-                    dist = abs(sw_y - ow_y)
-
-                    sw_x_min = sw.get_min_x()
-                    sw_x_max = sw.get_max_x()
-
-                    # Check if wall overlaps with our X range
-                    has_overlap = not (ow.get_max_x() < sw_x_min - 20 or ow.get_min_x() > sw_x_max + 20)
-
-                    if has_overlap and dist < best_y_dist:
-                        best_y = sw_y
-                        best_y_dist = dist
-
+                ow_cx = (ow.get_min_x() + ow.get_max_x()) / 2
+                best_y, best_yd = None, search_r
+                for sw in horiz_s:
+                    d = abs(sw.get_centerline_y() - ow_y)
+                    if (
+                        d < best_yd
+                        and not (
+                            ow.get_max_x() < sw.get_min_x() - 20
+                            or ow.get_min_x() > sw.get_max_x() + 20
+                        )
+                    ):
+                        best_y, best_yd = sw.get_centerline_y(), d
                 if best_y is not None:
-                    ow.start.y = best_y
-                    ow.end.y = best_y
-
+                    ow.start.y = ow.end.y = best_y
+                best_gap, best_lx, best_rx = float('inf'), None, None
+                left_c = [
+                    (sw.get_centerline_x(), sw) for sw in vert_s
+                    if (
+                        sw.get_min_y() - search_r <= ow_y <= sw.get_max_y() + search_r
+                        and sw.get_centerline_x() < ow_cx
+                        and abs(sw.get_centerline_x() - ow_cx) <= search_r
+                    )
+                ]
+                right_c = [
+                    (sw.get_centerline_x(), sw) for sw in vert_s
+                    if (
+                        sw.get_min_y() - search_r <= ow_y <= sw.get_max_y() + search_r
+                        and sw.get_centerline_x() >= ow_cx
+                        and abs(sw.get_centerline_x() - ow_cx) <= search_r
+                    )
+                ]
+                for lx, _ in left_c:
+                    for rx, _ in right_c:
+                        gap = rx - lx
+                        if gap <= 5.0 or gap >= best_gap:
+                            continue
+                        occupied = any(
+                            oow.wall_id != ow.wall_id
+                            and oow.is_horizontal
+                            and abs(oow.get_centerline_y() - ow_y) < 20.0
+                            and oow.get_min_x() < rx
+                            and oow.get_max_x() > lx
+                            for oow in opening_walls
+                        ) or any(
+                            abs(sw.get_centerline_y() - ow_y) < 20.0
+                            and sw.get_min_x() <= lx + 5
+                            and sw.get_max_x() >= rx - 5
+                            for sw in horiz_s
+                        )
+                        if not occupied:
+                            best_gap, best_lx, best_rx = gap, lx, rx
+                if best_lx is not None:
+                    ow.start.x, ow.end.x = best_lx, best_rx
             else:
-                # === VERTICAL OPENING WALL ===
-                # Opening runs top-bottom, need to find two HORIZONTAL walls to snap between
                 ow_x = ow.get_centerline_x()
-                ow_center_y = (ow.get_min_y() + ow.get_max_y()) / 2
-
-                # Find the best pair of horizontal walls (top and bottom) with smallest gap
-                best_gap = float('inf')
-                best_top_y = None
-                best_bottom_y = None
-
-                # Get all horizontal walls that could be candidates (near our X level)
-                top_candidates = []  # walls above center (smaller Y)
-                bottom_candidates = []  # walls below center (larger Y)
-
-                for sw in horiz_structural:
-                    sw_y = sw.get_centerline_y()
-                    sw_x_min = sw.get_min_x()
-                    sw_x_max = sw.get_max_x()
-
-                    # Check if this wall spans our X level
-                    if not (sw_x_min - CENTERLINE_SEARCH_RADIUS <= ow_x <= sw_x_max + CENTERLINE_SEARCH_RADIUS):
-                        continue
-
-                    dist_from_center = abs(sw_y - ow_center_y)
-                    if dist_from_center > CENTERLINE_SEARCH_RADIUS:
-                        continue
-
-                    if sw_y < ow_center_y:
-                        top_candidates.append((sw_y, sw))
-                    else:
-                        bottom_candidates.append((sw_y, sw))
-
-                # Try all pairs of (top_wall, bottom_wall) to find smallest non-zero gap
-                for top_y, top_wall in top_candidates:
-                    for bottom_y, bottom_wall in bottom_candidates:
-                        gap = bottom_y - top_y
-
-                        # Must be positive
-                        if gap <= 0:
-                            continue
-
-                        # Skip if gap is too small
-                        if gap < 5.0:
-                            continue
-
-                        # Check if this gap is already occupied
-                        is_occupied = False
-                        for other_ow in opening_walls:
-                            if other_ow.wall_id == ow.wall_id:
-                                continue
-                            if other_ow.is_horizontal:
-                                continue
-                            # Check if other opening wall is in this gap
-                            other_x = other_ow.get_centerline_x()
-                            if abs(other_x - ow_x) < 20.0:  # Same X level
-                                other_min_y = other_ow.get_min_y()
-                                other_max_y = other_ow.get_max_y()
-                                if other_min_y < bottom_y and other_max_y > top_y:
-                                    is_occupied = True
-                                    break
-
-                        # Also check structural walls in the gap
-                        if not is_occupied:
-                            for sw in vert_structural:
-                                sw_x = sw.get_centerline_x()
-                                if abs(sw_x - ow_x) < 20.0:
-                                    sw_min_y = sw.get_min_y()
-                                    sw_max_y = sw.get_max_y()
-                                    if sw_min_y <= top_y + 5 and sw_max_y >= bottom_y - 5:
-                                        is_occupied = True
-                                        break
-
-                        if is_occupied:
-                            continue
-
-                        # This gap is valid - check if it's the smallest
-                        if gap < best_gap:
-                            best_gap = gap
-                            best_top_y = top_y
-                            best_bottom_y = bottom_y
-
-                # Apply the best gap found
-                if best_top_y is not None and best_bottom_y is not None:
-                    # Preserve start/end direction
-                    if ow.start.y < ow.end.y:
-                        ow.start.y = best_top_y
-                        ow.end.y = best_bottom_y
-                    else:
-                        ow.start.y = best_bottom_y
-                        ow.end.y = best_top_y
-
-                # Now find the best X position (snap to nearest vertical structural wall)
-                best_x = None
-                best_x_dist = CENTERLINE_SEARCH_RADIUS
-
-                for sw in vert_structural:
-                    sw_x = sw.get_centerline_x()
-                    dist = abs(sw_x - ow_x)
-
-                    sw_y_min = sw.get_min_y()
-                    sw_y_max = sw.get_max_y()
-
-                    # Check if wall overlaps with our Y range
-                    has_overlap = not (ow.get_max_y() < sw_y_min - 20 or ow.get_min_y() > sw_y_max + 20)
-
-                    if has_overlap and dist < best_x_dist:
-                        best_x = sw_x
-                        best_x_dist = dist
-
+                ow_cy = (ow.get_min_y() + ow.get_max_y()) / 2
+                best_x, best_xd = None, search_r
+                for sw in vert_s:
+                    d = abs(sw.get_centerline_x() - ow_x)
+                    if (
+                        d < best_xd
+                        and not (
+                            ow.get_max_y() < sw.get_min_y() - 20
+                            or ow.get_min_y() > sw.get_max_y() + 20
+                        )
+                    ):
+                        best_x, best_xd = sw.get_centerline_x(), d
                 if best_x is not None:
-                    ow.start.x = best_x
-                    ow.end.x = best_x
+                    ow.start.x = ow.end.x = best_x
+                best_gap, best_ty, best_by = float('inf'), None, None
+                top_c = [
+                    (sw.get_centerline_y(), sw) for sw in horiz_s
+                    if (
+                        sw.get_min_x() - search_r <= ow_x <= sw.get_max_x() + search_r
+                        and sw.get_centerline_y() < ow_cy
+                        and abs(sw.get_centerline_y() - ow_cy) <= search_r
+                    )
+                ]
+                bot_c = [
+                    (sw.get_centerline_y(), sw) for sw in horiz_s
+                    if (
+                        sw.get_min_x() - search_r <= ow_x <= sw.get_max_x() + search_r
+                        and sw.get_centerline_y() >= ow_cy
+                        and abs(sw.get_centerline_y() - ow_cy) <= search_r
+                    )
+                ]
+                for ty, _ in top_c:
+                    for by_, _ in bot_c:
+                        gap = by_ - ty
+                        if gap <= 5.0 or gap >= best_gap:
+                            continue
+                        occupied = any(
+                            oow.wall_id != ow.wall_id
+                            and not oow.is_horizontal
+                            and abs(oow.get_centerline_x() - ow_x) < 20.0
+                            and oow.get_min_y() < by_
+                            and oow.get_max_y() > ty
+                            for oow in opening_walls
+                        ) or any(
+                            abs(sw.get_centerline_x() - ow_x) < 20.0
+                            and sw.get_min_y() <= ty + 5
+                            and sw.get_max_y() >= by_ - 5
+                            for sw in vert_s
+                        )
+                        if not occupied:
+                            best_gap, best_ty, best_by = gap, ty, by_
+                if best_ty is not None:
+                    if ow.start.y < ow.end.y:
+                        ow.start.y, ow.end.y = best_ty, best_by
+                    else:
+                        ow.start.y, ow.end.y = best_by, best_ty
 
-    def _extend_walls_to_connect(
-    self, walls: List[Wall]):
-        """
-        Расширение стен вдоль их направления для соединения с близлежащими стенами.
+    def _process_wall_connections(
+        self,
+        all_walls: List[Wall],
+        structural_walls: List[Wall],
+        opening_walls: List[Wall],
+    ) -> None:
+        self._align_walls_to_shared_axes(structural_walls, AXIS_SNAP_TOLERANCE)
+        self._extend_walls_along_axis(
+            structural_walls, T_JUNCTION_SNAP_TOLERANCE, iterations=2
+        )
+        self._align_opening_walls_to_structural(
+            opening_walls, structural_walls, OPENING_AXIS_SNAP_TOLERANCE
+        )
+        self._extend_walls_along_axis_against(
+            opening_walls, all_walls, OPENING_EXTENSION_TOLERANCE, iterations=2
+        )
+        self._snap_endpoints_to_corners(all_walls, snap_distance=5.0)
+        self._connect_walls(all_walls)
 
-        Выполняется в несколько проходов для постепенного достижения соединений.
-        Проверяет каждый конец стены и расширяет его при обнаружении близкой цели.
+    def _align_walls_to_shared_axes(
+        self, walls: List[Wall], tolerance: float
+    ) -> None:
+        h_walls = [w for w in walls if w.is_horizontal]
+        v_walls = [w for w in walls if not w.is_horizontal]
+        for w in h_walls:
+            avg = (w.start.y + w.end.y) / 2
+            w.start.y = w.end.y = avg
+        for w in v_walls:
+            avg = (w.start.x + w.end.x) / 2
+            w.start.x = w.end.x = avg
+        for wall_list, attr, cfn in (
+            (h_walls, 'y', lambda w: w.get_centerline_y()),
+            (v_walls, 'x', lambda w: w.get_centerline_x()),
+        ):
+            groups: List[Dict] = []
+            for w in wall_list:
+                val = cfn(w)
+                placed = False
+                for g in groups:
+                    if abs(val - g['val']) < tolerance:
+                        g['walls'].append(w)
+                        total = sum(ww.length for ww in g['walls'])
+                        if total > 0:
+                            g['val'] = (
+                                sum(cfn(ww) * ww.length for ww in g['walls'])
+                                / total
+                            )
+                        placed = True
+                        break
+                if not placed:
+                    groups.append({'walls': [w], 'val': val})
+            for g in groups:
+                v = g['val']
+                for w in g['walls']:
+                    if attr == 'y':
+                        w.start.y = w.end.y = v
+                    else:
+                        w.start.x = w.end.x = v
 
-        Параметры:
-            walls: Список стен для обработки
-        """
-        for _ in range(3):
+    def _align_opening_walls_to_structural(
+        self,
+        opening_walls: List[Wall],
+        structural_walls: List[Wall],
+        tolerance: float,
+    ) -> None:
+        h_struct = [
+            (w.get_centerline_y(), w.length)
+            for w in structural_walls if w.is_horizontal
+        ]
+        v_struct = [
+            (w.get_centerline_x(), w.length)
+            for w in structural_walls if not w.is_horizontal
+        ]
+        for ow in opening_walls:
+            if ow.is_horizontal:
+                avg = (ow.start.y + ow.end.y) / 2
+                best_y, best_d = None, tolerance
+                for sy, _ in h_struct:
+                    d = abs(avg - sy)
+                    if d < best_d:
+                        best_d, best_y = d, sy
+                ow.start.y = ow.end.y = best_y if best_y is not None else avg
+            else:
+                avg = (ow.start.x + ow.end.x) / 2
+                best_x, best_d = None, tolerance
+                for sx, _ in v_struct:
+                    d = abs(avg - sx)
+                    if d < best_d:
+                        best_d, best_x = d, sx
+                ow.start.x = ow.end.x = best_x if best_x is not None else avg
+
+    def _extend_walls_along_axis(
+        self, walls: List[Wall], max_gap: float, iterations: int = 2
+    ) -> None:
+        for _ in range(iterations):
             for wall in walls:
                 if wall.length < 0.1:
                     continue
+                self._try_extend_endpoint(wall, 'start', walls, max_gap)
+                self._try_extend_endpoint(wall, 'end', walls, max_gap)
 
-                dx, dy = wall.direction_vector()
-
-                for endpoint_name in ('start', 'end'):
-                    p = getattr(wall, endpoint_name)
-
-                    if endpoint_name == 'start':
-                        ext_dir = (-dx, -dy)
-                    else:
-                        ext_dir = (dx, dy)
-
-                    best_target = None
-                    best_dist = self.snap_tolerance
-
-                    for other in walls:
-                        if other.wall_id == wall.wall_id:
-                            continue
-
-                        result = self._calc_extension_to_wall(p, ext_dir, other)
-                        if result is not None:
-                            dist, target_pt = result
-                            if dist < best_dist:
-                                best_dist = dist
-                                best_target = target_pt
-
-                    if best_target is not None:
-                        new_x = best_target.x + ext_dir[0] * self.wall_overlap
-                        new_y = best_target.y + ext_dir[1] * self.wall_overlap
-
-                        if endpoint_name == 'start':
-                            wall.start = Point(new_x, new_y)
-                        else:
-                            wall.end = Point(new_x, new_y)
-
-    def _calc_extension_to_wall(
+    def _extend_walls_along_axis_against(
         self,
-        p: Point,
-        direction: Tuple[float, float],
-        target: Wall
-    ) -> Optional[Tuple[float, Point]]:
-        """Calculate extension from point p in direction to reach target wall."""
-        dx, dy = direction
+        walls_to_extend: List[Wall],
+        target_walls: List[Wall],
+        max_gap: float,
+        iterations: int = 2,
+    ) -> None:
+        for _ in range(iterations):
+            for wall in walls_to_extend:
+                if wall.length < 0.1:
+                    continue
+                self._try_extend_endpoint(wall, 'start', target_walls, max_gap)
+                self._try_extend_endpoint(wall, 'end', target_walls, max_gap)
 
-        t1x, t1y = target.start.x, target.start.y
-        t2x, t2y = target.end.x, target.end.y
-        tdx, tdy = t2x - t1x, t2y - t1y
+    def _try_extend_endpoint(
+        self,
+        wall: Wall,
+        endpoint: str,
+        all_walls: List[Wall],
+        max_gap: float,
+    ) -> None:
+        point = wall.start if endpoint == 'start' else wall.end
+        best_ext, best_gap = None, max_gap
+        for other in all_walls:
+            if other.wall_id == wall.wall_id:
+                continue
+            info = self._calc_gap(wall, point, other, wall.is_horizontal)
+            if info is None:
+                continue
+            gap, target, _ = info
+            if 0 <= gap < best_gap:
+                best_gap, best_ext = gap, target
+        if best_ext is not None:
+            if wall.is_horizontal:
+                if endpoint == 'start':
+                    wall.start.x = best_ext
+                else:
+                    wall.end.x = best_ext
+            else:
+                if endpoint == 'start':
+                    wall.start.y = best_ext
+                else:
+                    wall.end.y = best_ext
 
-        denom = dx * tdy - dy * tdx
-
-        if abs(denom) < 1e-6:
-            perp = target.perpendicular_distance(p)
-            if perp < 5.0:
-                d1 = (t1x - p.x) * dx + (t1y - p.y) * dy
-                d2 = (t2x - p.x) * dx + (t2y - p.y) * dy
-                candidates = []
-                if d1 > 0.01:
-                    candidates.append((d1, Point(t1x, t1y)))
-                if d2 > 0.01:
-                    candidates.append((d2, Point(t2x, t2y)))
-                if candidates:
-                    return min(candidates, key=lambda x: x[0])
-            return None
-
-        diff_x = t1x - p.x
-        diff_y = t1y - p.y
-
-        t = (diff_x * tdy - diff_y * tdx) / denom
-        s = (diff_x * dy - diff_y * dx) / denom
-
-        if t > 0.01 and -0.2 <= s <= 1.2:
-            ix = p.x + dx * t
-            iy = p.y + dy * t
-            return (t, Point(ix, iy))
-
+    def _calc_gap(
+        self,
+        wall: Wall,
+        point: Point,
+        other: Wall,
+        is_horizontal: bool,
+    ) -> Optional[Tuple[float, float, bool]]:
+        half = (wall.thickness + other.thickness) / 2
+        if is_horizontal:
+            wy = point.y
+            if other.is_horizontal:
+                if abs(wy - other.get_centerline_y()) > half:
+                    return None
+                if point.x < other.get_min_x():
+                    return (
+                        other.get_min_x() - point.x - half,
+                        other.get_min_x() - self.wall_overlap,
+                        False,
+                    )
+                if point.x > other.get_max_x():
+                    return (
+                        point.x - other.get_max_x() - half,
+                        other.get_max_x() + self.wall_overlap,
+                        False,
+                    )
+            else:
+                ox = other.get_centerline_x()
+                if not (other.get_min_y() - half <= wy <= other.get_max_y() + half):
+                    return None
+                return (abs(point.x - ox) - half, ox, True)
+        else:
+            wx = point.x
+            if not other.is_horizontal:
+                if abs(wx - other.get_centerline_x()) > half:
+                    return None
+                if point.y < other.get_min_y():
+                    return (
+                        other.get_min_y() - point.y - half,
+                        other.get_min_y() - self.wall_overlap,
+                        False,
+                    )
+                if point.y > other.get_max_y():
+                    return (
+                        point.y - other.get_max_y() - half,
+                        other.get_max_y() + self.wall_overlap,
+                        False,
+                    )
+            else:
+                oy = other.get_centerline_y()
+                if not (other.get_min_x() - half <= wx <= other.get_max_x() + half):
+                    return None
+                return (abs(point.y - oy) - half, oy, True)
         return None
 
-    def _extend_walls_into_nearby_boxes(self, walls: List[Wall]):
-        """
-        Final pass: if wall endpoint is close to another wall's thickness box,
-        extend the wall to penetrate into that box.
-        """
-        for wall in walls:
-            if wall.length < 0.1:
-                continue
-
-            dx, dy = wall.direction_vector()
-
-            for endpoint_name in ('start', 'end'):
-                p = getattr(wall, endpoint_name)
-
-                if endpoint_name == 'start':
-                    ext_dx, ext_dy = -dx, -dy
-                else:
-                    ext_dx, ext_dy = dx, dy
-
-                for other in walls:
-                    if other.wall_id == wall.wall_id:
-                        continue
-
-                    half_t = other.thickness / 2.0
-
-                    if other.is_horizontal:
-                        box_x_min = other.get_min_x()
-                        box_x_max = other.get_max_x()
-                        box_y_min = other.get_centerline_y() - half_t
-                        box_y_max = other.get_centerline_y() + half_t
-                    else:
-                        box_x_min = other.get_centerline_x() - half_t
-                        box_x_max = other.get_centerline_x() + half_t
-                        box_y_min = other.get_min_y()
-                        box_y_max = other.get_max_y()
-
-                    dist_to_box = self._point_to_box_distance(p, box_x_min, box_y_min, box_x_max, box_y_max)
-
-                    if 0.5 < dist_to_box < BOX_PROXIMITY_TOLERANCE:
-                        extension = dist_to_box + BOX_EXTENSION_AMOUNT
-
-                        new_x = p.x + ext_dx * extension
-                        new_y = p.y + ext_dy * extension
-
-                        if endpoint_name == 'start':
-                            wall.start = Point(new_x, new_y)
-                        else:
-                            wall.end = Point(new_x, new_y)
-                        break
-
-    def _point_to_box_distance(
-        self,
-        p: Point,
-        x_min: float, y_min: float,
-        x_max: float, y_max: float
-    ) -> float:
-        """Calculate distance from point to axis-aligned box."""
-        if x_min <= p.x <= x_max and y_min <= p.y <= y_max:
-            return 0.0
-
-        dx = max(x_min - p.x, 0, p.x - x_max)
-        dy = max(y_min - p.y, 0, p.y - y_max)
-
-        return math.hypot(dx, dy)
-
-    def _connect_walls(
-        self, walls: List[Wall]):
-        """
-        Установка связей между стенами (wall-to-wall connections).
-
-        Определяет какие стены соединены в углах и обновляет атрибуты
-        wall_at_start и wall_at_end для корректного рендеринга соединений.
-
-        Параметры:
-            walls: Список стен
-        """
-        eps = self.wall_overlap + 2.0
-
-        for i, wall1 in enumerate(walls):
-            for j, wall2 in enumerate(walls):
-                if i >= j:
+    def _snap_endpoints_to_corners(
+        self, walls: List[Wall], snap_distance: float = 5.0
+    ) -> None:
+        endpoints = [
+            (w, e, w.start if e == 'start' else w.end)
+            for w in walls for e in ('start', 'end')
+        ]
+        for i, (w1, e1, p1) in enumerate(endpoints):
+            for w2, e2, p2 in endpoints[i + 1:]:
+                if w1.wall_id == w2.wall_id or p1.distance_to(p2) > snap_distance:
                     continue
+                if w1.is_structural and not w2.is_structural:
+                    target = p1
+                elif w2.is_structural and not w1.is_structural:
+                    target = p2
+                elif w1.length > w2.length:
+                    target = p1
+                else:
+                    target = p2
+                for w, e in ((w1, e1), (w2, e2)):
+                    pt = w.start if e == 'start' else w.end
+                    if w.is_horizontal:
+                        pt.x = target.x
+                    else:
+                        pt.y = target.y
 
-                if wall1.end.distance_to(wall2.start) < eps:
-                    wall1.wall_at_end = wall2.wall_id
-                    wall2.wall_at_start = wall1.wall_id
-                elif wall1.start.distance_to(wall2.end) < eps:
-                    wall1.wall_at_start = wall2.wall_id
-                    wall2.wall_at_end = wall1.wall_id
-                elif wall1.end.distance_to(wall2.end) < eps:
-                    wall1.wall_at_end = wall2.wall_id
-                    wall2.wall_at_end = wall1.wall_id
-                elif wall1.start.distance_to(wall2.start) < eps:
-                    wall1.wall_at_start = wall2.wall_id
-                    wall2.wall_at_start = wall1.wall_id
+    def _connect_walls(self, walls: List[Wall]) -> None:
+        eps = self.wall_overlap + 2.0
+        for i, w1 in enumerate(walls):
+            for w2 in walls[i + 1:]:
+                if w1.end.distance_to(w2.start) < eps:
+                    w1.wall_at_end = w2.wall_id
+                    w2.wall_at_start = w1.wall_id
+                elif w1.start.distance_to(w2.end) < eps:
+                    w1.wall_at_start = w2.wall_id
+                    w2.wall_at_end = w1.wall_id
+                elif w1.end.distance_to(w2.end) < eps:
+                    w1.wall_at_end = w2.wall_id
+                    w2.wall_at_end = w1.wall_id
+                elif w1.start.distance_to(w2.start) < eps:
+                    w1.wall_at_start = w2.wall_id
+                    w2.wall_at_start = w1.wall_id
 
-    def _update_openings_from_walls(self, openings: List[Opening], walls: List[Wall]):
-        """Update opening positions based on final wall positions."""
+    # ──────────────────────────────────────────────────────────────
+    # FIX: _update_openings_from_walls
+    #   OLD behaviour:
+    #     o.width = parent.length * OPENING_TO_WALL_RATIO   ← BUG
+    #     o.center = parent.midpoint  (for non-structural)  ← BUG
+    #   NEW behaviour:
+    #     o.width is KEPT as-is (set from detected rectangle
+    #     in OpeningProcessor).
+    #     o.center is PROJECTED onto the parent wall
+    #     centerline — never replaced with the wall midpoint.
+    # ──────────────────────────────────────────────────────────────
+    def _update_openings_from_walls(
+        self, openings: List[Opening], walls: List[Wall]
+    ) -> None:
         wall_by_id = {w.wall_id: w for w in walls}
-
-        for opening in openings:
-            parent = wall_by_id.get(opening.parent_wall_id)
+        for o in openings:
+            parent = wall_by_id.get(o.parent_wall_id)
             if not parent:
                 continue
+            # Align angle to parent wall (unless fused door set a precise angle)
+            if o.hinge is None:
+                o.angle = parent.angle
+            # Project opening centre onto the parent wall centerline
+            # but do NOT replace it with the wall midpoint and do NOT
+            # resize to the wall length.
+            t, projected_pt = parent.project_point(o.center)
+            # Clamp t so the opening sits within the wall bounds
+            t_clamped = max(0.0, min(1.0, t))
+            o.center = Point(
+                parent.start.x + t_clamped * (parent.end.x - parent.start.x),
+                parent.start.y + t_clamped * (parent.end.y - parent.start.y),
+            )
+            # Depth = wall thickness (already set at creation, but refresh
+            # in case the wall was adjusted during connection processing)
+            o.depth = parent.thickness
 
-            # Move opening center to wall midpoint
-            opening.center = parent.midpoint
-            opening.angle = parent.angle
-
-            # For non-structural walls (opening walls), make the opening object
-            # slightly shorter than the wall
-            if not parent.is_structural:
-                opening.width = parent.length * OPENING_TO_WALL_RATIO
-
-    def _write_sh3d_file(self, output_path: str, xml_content: str):
+    def _write_sh3d_file(self, output_path: str, xml_content: str) -> None:
         if not output_path.endswith('.sh3d'):
             output_path += '.sh3d'
-
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             zf.writestr('Home.xml', xml_content)
             zf.writestr('1/door/door.obj', DOOR_OBJ_CONTENT)
@@ -1476,5 +1679,4 @@ class SweetHome3DExporter:
             zf.writestr('2', base64.b64decode(DUMMY_PNG_B64))
 
 
-# Backward compatibility
 FixedSweetHome3DExporter = SweetHome3DExporter

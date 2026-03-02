@@ -9,9 +9,12 @@
 
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
+import logging
 import numpy as np
 import cv2
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,6 +39,22 @@ BLACK = (0, 0, 0)
 WHITE = (255, 255, 255)
 
 
+def _iou_xyxy(
+    a: Tuple[float, float, float, float],
+    b: Tuple[float, float, float, float],
+) -> float:
+    """Intersection-over-Union for two (x1,y1,x2,y2) boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter == 0.0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0.0 else 0.0
+
+
 class AlgorithmicWindowDetector:
     """
     Детектор окон на основе алгоритма параллельных линий.
@@ -49,7 +68,8 @@ class AlgorithmicWindowDetector:
                  ocr_model: Optional[object] = None,
                  wall_overlap_threshold: float = 0.4,
                  wall_connectivity_proximity: int = 5,
-                 min_wall_endpoint_contact: int = 1):
+                 min_wall_endpoint_contact: int = 1,
+                 min_thickness_ratio: float = 0.35):
         """
         Инициализация детектора окон.
 
@@ -59,12 +79,16 @@ class AlgorithmicWindowDetector:
             wall_overlap_threshold: Максимальная доля окна, которая может перекрываться со стеной
             wall_connectivity_proximity: Максимальное расстояние для проверки связности со стеной
             min_wall_endpoint_contact: Минимальное количество концов, касающихся стен
+            min_thickness_ratio: Minimum ratio of window narrow-side to estimated wall
+                thickness.  Windows thinner than ``min_thickness_ratio * wall_thickness``
+                are rejected as spurious thin-line artefacts (default 0.35).
         """
         self.min_window_len = min_window_len
         self.ocr_model = ocr_model
         self.wall_overlap_threshold = wall_overlap_threshold
         self.wall_connectivity_proximity = wall_connectivity_proximity
         self.min_wall_endpoint_contact = min_wall_endpoint_contact
+        self.min_thickness_ratio = min_thickness_ratio
 
     def _threshold_by_rgb_variance(
             self,
@@ -121,6 +145,7 @@ class AlgorithmicWindowDetector:
             self,
             img: Image.Image,
             max_thickness: int = 3,
+            min_thickness: int = 3,
             white_ratio_threshold: float = 0.75,
             side_check_px: int = 2,
     ) -> Tuple[List[dict], List[dict]]:
@@ -130,6 +155,7 @@ class AlgorithmicWindowDetector:
         Параметры:
             img: Бинарное изображение PIL
             max_thickness: Максимальная толщина линии
+            min_thickness: Минимальная толщина линии; сегменты тоньше отбрасываются
             white_ratio_threshold: Минимальная доля белых пикселей по краям
             side_check_px: Расстояние проверки по сторонам линии
 
@@ -181,7 +207,7 @@ class AlgorithmicWindowDetector:
                                 for xx in range(xs, x):
                                     tc += 1
                                     wc += is_white(xx, lower_y)
-                        if tc > 0 and wc / tc >= white_ratio_threshold:
+                        if tc > 0 and wc / tc >= white_ratio_threshold and t >= min_thickness:
                             horiz_segments.append({
                                 "x1": xs,
                                 "x2": x - 1,
@@ -222,7 +248,7 @@ class AlgorithmicWindowDetector:
                                 for yy in range(ys, y):
                                     tc += 1
                                     wc += is_white(right_x, yy)
-                        if tc > 0 and wc / tc >= white_ratio_threshold:
+                        if tc > 0 and wc / tc >= white_ratio_threshold and t >= min_thickness:
                             vert_segments.append({
                                 "x1": x,
                                 "x2": x + t - 1,
@@ -633,11 +659,260 @@ class AlgorithmicWindowDetector:
         contact_ratio = contact_points / total_points if total_points > 0 else 0
         return contact_ratio >= min_contact_ratio
 
+    def _classify_narrow_side_connection(
+        self,
+        win: 'DetectedWindow',
+        side: str,
+        wall_mask: np.ndarray,
+        other_windows: List['DetectedWindow'],
+        proximity_px: int = 8,
+    ) -> str:
+        """
+        For one narrow side of ``win`` return what it is connected to:
+
+          'wall'          – wall pixels present in the outward search zone
+          'window_narrow' – the closest feature of an overlapping window is
+                            that window's own narrow end (end-to-end or
+                            perpendicular T-junction)
+          'window_long'   – the only window contact is the long body of
+                            another window (bad: A hangs off B's side)
+          'none'          – nothing found within proximity_px
+
+        ``side`` is one of 'left'/'right' for horizontal windows or
+        'top'/'bottom' for vertical windows.
+        """
+        mh, mw = wall_mask.shape
+        is_horiz = win.w >= win.h
+
+        # ── 1. Build the outward search rectangle ──────────────────────────
+        if is_horiz:
+            # narrow sides are left/right vertical edges
+            edge_x = win.x if side == 'left' else win.x + win.w
+            sx1 = max(0, edge_x - proximity_px)
+            sx2 = min(mw, edge_x + proximity_px + 1)
+            sy1 = max(0, win.y)
+            sy2 = min(mh, win.y + win.h)
+        else:
+            # narrow sides are top/bottom horizontal edges
+            edge_y = win.y if side == 'top' else win.y + win.h
+            sy1 = max(0, edge_y - proximity_px)
+            sy2 = min(mh, edge_y + proximity_px + 1)
+            sx1 = max(0, win.x)
+            sx2 = min(mw, win.x + win.w)
+
+        if sx2 <= sx1 or sy2 <= sy1:
+            return 'none'
+
+        # ── 2. Wall check ───────────────────────────────────────────────────
+        if wall_mask[sy1:sy2, sx1:sx2].any():
+            return 'wall'
+
+        # ── 3. Window check ─────────────────────────────────────────────────
+        for other in other_windows:
+            ox1 = other.x
+            oy1 = other.y
+            ox2 = other.x + other.w
+            oy2 = other.y + other.h
+
+            # Does the other window bbox intersect the search zone?
+            if ox2 < sx1 or ox1 > sx2 or oy2 < sy1 or oy1 > sy2:
+                continue
+
+            other_horiz = other.w >= other.h
+
+            if is_horiz and other_horiz:
+                # Both horizontal.
+                # Narrow ends of other are at ox1 and ox2.
+                # Valid if our edge_x is close to one of those ends.
+                if abs(edge_x - ox1) <= proximity_px or abs(edge_x - ox2) <= proximity_px:
+                    return 'window_narrow'
+                else:
+                    return 'window_long'   # edge_x is in the middle of other's span
+
+            elif not is_horiz and not other_horiz:
+                # Both vertical.
+                # Narrow ends of other are at oy1 and oy2.
+                if abs(edge_y - oy1) <= proximity_px or abs(edge_y - oy2) <= proximity_px:
+                    return 'window_narrow'
+                else:
+                    return 'window_long'
+
+            elif is_horiz and not other_horiz:
+                # A is horizontal, B is vertical (perpendicular).
+                # A's narrow side is a vertical segment at edge_x.
+                # B's narrow sides are at oy1 and oy2 (horizontal edges).
+                # B's long sides are at ox1 and ox2 (vertical edges).
+                # Valid if A's edge_x is close to B's long side (it sits flush
+                # against B's wall face) AND the y extents overlap —
+                # BUT invalid if A's edge_x is well inside B's horizontal span
+                # without aligning to B's end.
+                on_b_long_side = (
+                    abs(edge_x - ox1) <= proximity_px or
+                    abs(edge_x - ox2) <= proximity_px
+                )
+                # Also valid if A's end aligns with B's narrow end y-position
+                a_y_mid = win.y + win.h / 2
+                on_b_narrow_end = (
+                    abs(a_y_mid - oy1) <= proximity_px * 2 or
+                    abs(a_y_mid - oy2) <= proximity_px * 2
+                )
+                if on_b_long_side or on_b_narrow_end:
+                    return 'window_narrow'
+                return 'window_long'
+
+            else:
+                # A is vertical, B is horizontal (perpendicular).
+                on_b_long_side = (
+                    abs(edge_y - oy1) <= proximity_px or
+                    abs(edge_y - oy2) <= proximity_px
+                )
+                a_x_mid = win.x + win.w / 2
+                on_b_narrow_end = (
+                    abs(a_x_mid - ox1) <= proximity_px * 2 or
+                    abs(a_x_mid - ox2) <= proximity_px * 2
+                )
+                if on_b_long_side or on_b_narrow_end:
+                    return 'window_narrow'
+                return 'window_long'
+
+        return 'none'
+
+    def _validate_narrow_connectivity(
+        self,
+        windows: List['DetectedWindow'],
+        wall_mask: np.ndarray,
+        proximity_px: int = 8,
+    ) -> List['DetectedWindow']:
+        """
+        Keep only windows whose BOTH narrow sides have a valid connection:
+        either a wall pixel or another window's narrow end.
+        A window is dropped if either narrow side is unconnected ('none') or
+        only touches the long body of another window ('window_long').
+        """
+        valid = []
+        for win in windows:
+            others = [w for w in windows if w is not win]
+            is_horiz = win.w >= win.h
+            sides = ('left', 'right') if is_horiz else ('top', 'bottom')
+            ok = True
+            for side in sides:
+                result = self._classify_narrow_side_connection(
+                    win, side, wall_mask, others, proximity_px
+                )
+                if result in ('none', 'window_long'):
+                    ok = False
+                    break
+            if ok:
+                valid.append(win)
+        return valid
+
+    def _estimate_wall_thickness(
+            self,
+            wall_mask: np.ndarray,
+            sample_count: int = 200,
+    ) -> float:
+        """
+        Estimate the typical wall thickness in pixels by sampling the wall mask.
+
+        For each sampled wall pixel, measure how many consecutive wall pixels
+        exist in both the horizontal and vertical directions. The median of
+        these local thickness measurements is returned as the representative
+        wall thickness.
+
+        Parameters:
+            wall_mask: Binary wall outline mask (255 = wall).
+            sample_count: Number of wall pixels to sample.
+
+        Returns:
+            Estimated wall thickness in pixels, or 0.0 if mask is empty.
+        """
+        ys, xs = np.where(wall_mask > 0)
+        if len(ys) == 0:
+            return 0.0
+
+        h, w = wall_mask.shape
+        rng = np.random.default_rng(42)
+        indices = rng.choice(len(ys), size=min(sample_count, len(ys)), replace=False)
+
+        thicknesses = []
+        for idx in indices:
+            cy, cx = int(ys[idx]), int(xs[idx])
+
+            # Measure horizontal run length through this pixel
+            lx = cx
+            while lx > 0 and wall_mask[cy, lx - 1] > 0:
+                lx -= 1
+            rx = cx
+            while rx < w - 1 and wall_mask[cy, rx + 1] > 0:
+                rx += 1
+            horiz = rx - lx + 1
+
+            # Measure vertical run length through this pixel
+            ty = cy
+            while ty > 0 and wall_mask[ty - 1, cx] > 0:
+                ty -= 1
+            by = cy
+            while by < h - 1 and wall_mask[by + 1, cx] > 0:
+                by += 1
+            vert = by - ty + 1
+
+            # The minimum of the two directions is a better proxy for
+            # local thickness (the other direction measures wall length)
+            thicknesses.append(min(horiz, vert))
+
+        return float(np.median(thicknesses)) if thicknesses else 0.0
+
+    def _filter_by_thickness(
+            self,
+            bboxes: List[dict],
+            wall_mask: np.ndarray,
+            min_thickness_ratio: float = 0.35,
+    ) -> List[dict]:
+        """
+        Discard candidate windows whose narrow dimension is significantly
+        thinner than the typical wall thickness.
+
+        A real window occupies the full depth of a wall, so its narrow side
+        should be comparable to wall thickness.  Spurious thin-line artefacts
+        are typically far narrower.
+
+        Parameters:
+            bboxes: List of bbox dicts with x1/y1/x2/y2 keys.
+            wall_mask: Binary wall outline mask used to estimate wall thickness.
+            min_thickness_ratio: A window is rejected if its narrow side is
+                less than ``min_thickness_ratio * wall_thickness``.
+
+        Returns:
+            Filtered list of bboxes.
+        """
+        wall_thickness = self._estimate_wall_thickness(wall_mask)
+        if wall_thickness <= 0:
+            # Cannot estimate — skip filter entirely
+            return bboxes
+
+        min_narrow = wall_thickness * min_thickness_ratio
+        kept = []
+        for bbox in bboxes:
+            win_w = bbox["x2"] - bbox["x1"] + 1
+            win_h = bbox["y2"] - bbox["y1"] + 1
+            narrow = min(win_w, win_h)
+            if narrow >= min_narrow:
+                kept.append(bbox)
+            else:
+                logger.debug(
+                    "Thickness filter: dropped bbox %s "
+                    "(narrow=%d < %.1f = %.2f * wall_thickness=%.1f)",
+                    bbox, narrow, min_narrow, min_thickness_ratio, wall_thickness,
+                )
+        return kept
+
     def detect(self,
                img: np.ndarray,
                wall_outline_mask: np.ndarray,
                exclude_bboxes: Optional[List[Tuple[float, float, float, float]]] = None,
-               ocr_bboxes: Optional[List[Tuple[int, int, int, int]]] = None) -> List[DetectedWindow]:
+               ocr_bboxes: Optional[List[Tuple[int, int, int, int]]] = None,
+               known_windows: Optional[List[Tuple[float, float, float, float]]] = None,
+               ) -> List[DetectedWindow]:
         """
         Детекция окон на изображении.
 
@@ -646,6 +921,9 @@ class AlgorithmicWindowDetector:
             wall_outline_mask: Бинарная маска контуров стен
             exclude_bboxes: Список исключаемых областей (например, двери) как (x1, y1, x2, y2)
             ocr_bboxes: Список областей текста OCR для исключения как (x1, y1, x2, y2)
+            known_windows: Confirmed window boxes from another source (e.g. YOLO) as
+                (x1, y1, x2, y2).  Any algo window whose IoU with one of these
+                exceeds 0.30 is dropped — the caller's detection is authoritative.
 
         Возвращает:
             Список обнаруженных окон
@@ -705,6 +983,7 @@ class AlgorithmicWindowDetector:
         horiz_segments, vert_segments = self._detect_thin_lines(
             bw,
             max_thickness=3,
+            min_thickness=3,
             white_ratio_threshold=0.75,
             side_check_px=2,
         )
@@ -713,6 +992,13 @@ class AlgorithmicWindowDetector:
         horiz_bboxes = self._group_segments(horiz_segments, "h", max_gap_perp=15, max_gap_length=10)
         vert_bboxes = self._group_segments(vert_segments, "v", max_gap_perp=15, max_gap_length=10)
         all_bboxes = horiz_bboxes + vert_bboxes
+
+        # ── Thickness filter ──────────────────────────────────────────────────
+        # Reject windows whose narrow side is significantly thinner than the
+        # walls on this image.  This eliminates thin-line artefacts that pass
+        # the parallel-lines heuristic but are nowhere near wall depth.
+        all_bboxes = self._filter_by_thickness(all_bboxes, wall_outline_mask,
+                                               min_thickness_ratio=self.min_thickness_ratio)
 
         # Фильтрация окон, перекрывающихся с исключёнными областями
         filtered_bboxes = []
@@ -789,6 +1075,28 @@ class AlgorithmicWindowDetector:
                 w=w,
                 h=h
             ))
+
+        # Narrow-side connectivity check: both ends must touch a wall or
+        # another window's narrow end — not just its long body.
+        windows = self._validate_narrow_connectivity(windows, wall_outline_mask)
+
+        # Suppress algo windows that overlap a confirmed external detection
+        if known_windows and windows:
+            iou_thresh = 0.30
+            windows = [
+                w for w in windows
+                if all(
+                    _iou_xyxy(
+                        (float(w.x), float(w.y),
+                         float(w.x + w.w), float(w.y + w.h)),
+                        tuple(float(v) for v in kw),
+                    ) < iou_thresh
+                    for kw in known_windows
+                )
+            ]
+            # Re-assign sequential ids after filtering
+            for i, w in enumerate(windows):
+                w.id = i
 
         return windows
 
