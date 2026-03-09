@@ -1,23 +1,20 @@
 """
 SmartFloorPlanGenerator — Professional-Grade Configurable Procedural Engine
-Version: 5.0
+Version: 6.0
 Author: Bykov Vadim Olegovich
 Date: 2026-01-28
 Architecture: Plugin-based strategy system with Shapely geometry, theme engine,
-              constraint solver, vector export, semantic furniture placement, and multi-format output.
-
-Changes v5.0:
-  - Doors: no swing arcs, smaller opening angles (10-45 deg)
-  - Windows: 5 visual sub-types (single/double/triple/french/slit), wider size range
-  - Per-image color jitter within same style family
-  - Two new layout strategies (asymmetric, courtyard)
-  - More overall variety while keeping YOLO bbox accuracy
-
+ constraint solver, vector export, semantic furniture placement, and multi-format output.
+Changes v6.0:
+ - NEW wall type: "outlined" — dark contour with background fill inside
+ - NEW door type: "cross" — double-stroke wall segment crossed by thin perpendicular line with serifs
+ - U-Net semantic segmentation masks output (multi-class PNG masks compatible with
+   pretrained encoder backbones like ResNet-50 / EfficientNet-b3)
+ - All v5.0 features preserved
 Dependencies:
-    pip install opencv-python numpy shapely networkx pulp svgwrite ezdxf pydantic pyyaml scipy noise kiwisolver
+ pip install opencv-python numpy shapely networkx pulp svgwrite ezdxf pydantic pyyaml scipy noise kiwisolver
 """
 from __future__ import annotations
-
 import os
 import sys
 import math
@@ -122,6 +119,18 @@ class StylePreset(str, Enum):
     CUSTOM = "custom"
 
 
+# ── NEW: Wall drawing style enum ─────────────────────────────────────────────
+class WallDrawStyle(str, Enum):
+    SOLID = "solid"          # Original: single solid-color filled rectangle
+    OUTLINED = "outlined"    # NEW: dark contour lines + background fill inside
+
+
+# ── NEW: Door drawing style enum ─────────────────────────────────────────────
+class DoorDrawStyle(str, Enum):
+    SLAB = "slab"            # Original: rotated rectangle slab with optional arc
+    CROSS = "cross"          # NEW: double-stroke wall + thin perpendicular line with serifs
+
+
 # ── Color helpers ─────────────────────────────────────────────────────────────
 def hsl_to_bgr(h: float, s: float, l: float) -> Tuple[int, int, int]:
     """Convert HSL (h 0-360, s/l 0-1) → BGR tuple for OpenCV."""
@@ -153,7 +162,7 @@ def hex_to_bgr(h: str) -> Tuple[int, int, int]:
 
 
 def _jitter_color(color: Tuple[int, int, int], rng: random.Random,
-                   max_delta: int = 15) -> Tuple[int, int, int]:
+                  max_delta: int = 15) -> Tuple[int, int, int]:
     """Slightly randomize a BGR color within ±max_delta per channel."""
     return tuple(
         max(0, min(255, c + rng.randint(-max_delta, max_delta)))
@@ -167,10 +176,10 @@ class RoomStyle:
     fill: Tuple[int, int, int]
     stroke: Tuple[int, int, int]
     stroke_width: int = 1
-    hatch_pattern: Optional[str] = None   # "diagonal", "cross", "dots", None
+    hatch_pattern: Optional[str] = None  # "diagonal", "cross", "dots", None
     hatch_spacing: int = 12
     hatch_color: Optional[Tuple[int, int, int]] = None
-    texture: Optional[str] = None         # "wood", "tile", "concrete", None
+    texture: Optional[str] = None  # "wood", "tile", "concrete", None
     label_color: Optional[Tuple[int, int, int]] = None
 
 
@@ -210,7 +219,9 @@ class ThemeSpec:
         t = deepcopy(self)
         t.background = _jitter_color(t.background, rng, intensity // 2)
         t.wall_color = _jitter_color(t.wall_color, rng, intensity)
-        t.wall_ext_color = _jitter_color(t.wall_ext_color, rng, intensity)
+        t.wall_ext_color = t.wall_color  # all walls share one color per blueprint
+        t.window_color = t.wall_color    # windows match wall color exactly
+        t.door_color   = t.wall_color    # doors match wall color exactly
         t.furniture_fill = _jitter_color(t.furniture_fill, rng, intensity)
         t.furniture_stroke = _jitter_color(t.furniture_stroke, rng, intensity)
         t.window_color = _jitter_color(t.window_color, rng, intensity)
@@ -433,6 +444,45 @@ def _register_themes():
 _register_themes()
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# U-NET SEMANTIC SEGMENTATION CLASS DEFINITIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class UNetSemanticClasses:
+    """
+    Semantic class IDs for U-Net segmentation masks.
+
+    3-class schema (+ background):
+        0 — background (unlabeled / rooms / furniture)
+        1 — wall
+        2 — window
+        3 — door
+    """
+    BACKGROUND = 0
+    WALL       = 1
+    WINDOW     = 2
+    DOOR       = 3
+
+    NUM_CLASSES = 4
+
+    # Color palette for visualization (BGR)
+    PALETTE = [
+        (0,   0,   0),    # 0: background
+        (0,   0, 200),    # 1: wall   (red)
+        (0, 200,   0),    # 2: window (green)
+        (200, 160,  0),   # 3: door   (blue)
+    ]
+
+    @classmethod
+    def colorize_mask(cls, mask: np.ndarray) -> np.ndarray:
+        """Convert single-channel class mask to BGR color visualization."""
+        h, w = mask.shape[:2]
+        color_img = np.zeros((h, w, 3), dtype=np.uint8)
+        for class_id, color in enumerate(cls.PALETTE):
+            color_img[mask == class_id] = color
+        return color_img
+
+
 # ── Pydantic config model ────────────────────────────────────────────────────
 class FloorPlanConfig(BaseModel):
     """Master configuration — can be loaded from YAML / CLI / dict."""
@@ -466,8 +516,8 @@ class FloorPlanConfig(BaseModel):
     generate_metadata_json: bool = True
     constraint_solver: str = "proportional"
     strategies: List[str] = [
-        "central", "linear", "radial", "bsp", "voronoi",
-        "graph", "open_plan", "asymmetric", "courtyard"
+        "central", "linear", "radial", "bsp",
+        "graph", "open_plan", "asymmetric", "courtyard", "spine"
     ]
     room_types_enabled: List[str] = [
         "living", "kitchen", "bedroom", "bathroom", "corridor",
@@ -477,14 +527,19 @@ class FloorPlanConfig(BaseModel):
     semantic_furniture: bool = True
     enable_augmentations: bool = Field(True, description="Enable visual corruptions/augmentations")
     color_jitter_intensity: int = Field(12, ge=0, le=40,
-                                         description="Per-image color jitter within same style")
-
+                                        description="Per-image color jitter within same style")
     aug_rotation_range: float = 5.0
     aug_scale_range: float = 0.1
     aug_brightness_range: float = 0.15
     aug_blur_prob: float = 0.4
     aug_noise_prob: float = 0.5
     aug_jpeg_prob: float = 0.5
+
+    # ── NEW v6.0 options ──────────────────────────────────────────────────
+    wall_draw_style: str = Field("random", description="Wall drawing style: solid, outlined, or random")
+    door_draw_style: str = Field("random", description="Door drawing style: slab, cross, or random")
+    generate_unet_masks: bool = Field(True, description="Generate U-Net segmentation masks")
+    unet_mask_colorized: bool = Field(False, description="Also save colorized mask visualization")
 
     class Config:
         use_enum_values = True
@@ -907,7 +962,7 @@ class ConstraintSolver:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 5. LAYOUT STRATEGIES
+# 5. LAYOUT STRATEGIES (unchanged from v5.0)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class LayoutStrategy(ABC):
@@ -937,7 +992,6 @@ class CentralCorridorStrategy(LayoutStrategy):
         height = bottom - top
         rng = solver.rng
         walls, rooms = [], []
-
         walls.extend([
             Wall(left, top, right, top, ext_th, True),
             Wall(left, bottom, right, bottom, ext_th, True),
@@ -958,7 +1012,6 @@ class CentralCorridorStrategy(LayoutStrategy):
         if is_horizontal:
             corridor_height = int(height * rng.uniform(0.15, 0.22))
             corridor_y = top + int(height * rng.uniform(0.35, 0.50))
-
             walls.append(Wall(left, corridor_y, right, corridor_y, int_th, False))
             walls.append(Wall(left, corridor_y + corridor_height, right,
                               corridor_y + corridor_height, int_th, False))
@@ -967,10 +1020,8 @@ class CentralCorridorStrategy(LayoutStrategy):
 
             kitchen_width = int(width * rng.uniform(0.35, 0.45))
             walls.append(Wall(left + kitchen_width, top, left + kitchen_width, corridor_y, int_th, False))
-
             top_left_type = rng.choice(service_choices) if service_choices else "kitchen"
             top_right_type = rng.choice(primary_choices) if primary_choices else "living"
-
             rooms.append(Room(left, top, left + kitchen_width, corridor_y,
                               top_left_type,
                               solver.ROOM_CONFIGS.get(top_left_type, {}).get("zone", Zone.SERVICE),
@@ -984,7 +1035,6 @@ class CentralCorridorStrategy(LayoutStrategy):
             bathroom_width = int(width * rng.uniform(0.20, 0.30))
             walls.append(Wall(left + bathroom_width, bottom_start,
                               left + bathroom_width, bottom, int_th, False))
-
             rooms.append(Room(left, bottom_start, left + bathroom_width, bottom,
                               "bathroom", Zone.SERVICE, RoomPriority.TERTIARY, False))
 
@@ -992,10 +1042,8 @@ class CentralCorridorStrategy(LayoutStrategy):
             if brief.num_rooms >= 2 and remaining > width * 0.4:
                 bedroom_split = left + bathroom_width + int(remaining * 0.5)
                 walls.append(Wall(bedroom_split, bottom_start, bedroom_split, bottom, int_th, False))
-
                 bot_left = rng.choice([r for r in primary_choices if r != top_right_type] or ["bedroom"])
                 bot_right = rng.choice(primary_choices or ["living"])
-
                 rooms.append(Room(left + bathroom_width, bottom_start, bedroom_split, bottom,
                                   bot_left,
                                   solver.ROOM_CONFIGS.get(bot_left, {}).get("zone", Zone.PRIVATE),
@@ -1010,7 +1058,6 @@ class CentralCorridorStrategy(LayoutStrategy):
         else:
             corridor_width = int(width * rng.uniform(0.15, 0.22))
             corridor_x = left + int(width * rng.uniform(0.35, 0.50))
-
             walls.append(Wall(corridor_x, top, corridor_x, bottom, int_th, False))
             walls.append(Wall(corridor_x + corridor_width, top,
                               corridor_x + corridor_width, bottom, int_th, False))
@@ -1027,7 +1074,8 @@ class CentralCorridorStrategy(LayoutStrategy):
             rooms.append(Room(left, top + bathroom_height, corridor_x, bottom,
                               left_bottom_type,
                               solver.ROOM_CONFIGS.get(left_bottom_type, {}).get("zone", Zone.SERVICE),
-                              solver.ROOM_CONFIGS.get(left_bottom_type, {}).get("priority", RoomPriority.SECONDARY)))
+                              solver.ROOM_CONFIGS.get(left_bottom_type, {}).get("priority",
+                                                                                RoomPriority.SECONDARY)))
 
             right_start = corridor_x + corridor_width
             living_height = int(height * rng.uniform(0.45, 0.60))
@@ -1036,7 +1084,6 @@ class CentralCorridorStrategy(LayoutStrategy):
 
             rt_top = rng.choice(primary_choices or ["living"])
             rt_bot = rng.choice([r for r in primary_choices if r != rt_top] or ["bedroom"])
-
             rooms.append(Room(right_start, top, right, top + living_height,
                               rt_top,
                               solver.ROOM_CONFIGS.get(rt_top, {}).get("zone", Zone.PUBLIC),
@@ -1060,7 +1107,6 @@ class LinearFlowStrategy(LayoutStrategy):
         height = bottom - top
         rng = solver.rng
         walls, rooms = [], []
-
         walls.extend([
             Wall(left, top, right, top, ext_th, True),
             Wall(left, bottom, right, bottom, ext_th, True),
@@ -1085,12 +1131,15 @@ class LinearFlowStrategy(LayoutStrategy):
                     rooms.append(Room(current_x, top, next_x, split_y,
                                       zone_info[0],
                                       solver.ROOM_CONFIGS.get(zone_info[0], {}).get("zone", Zone.SERVICE),
-                                      solver.ROOM_CONFIGS.get(zone_info[0], {}).get("priority", RoomPriority.TERTIARY),
+                                      solver.ROOM_CONFIGS.get(zone_info[0], {}).get("priority",
+                                                                                     RoomPriority.TERTIARY),
                                       solver.ROOM_CONFIGS.get(zone_info[0], {}).get("needs_window", False)))
                     rooms.append(Room(current_x, split_y, next_x, bottom,
                                       zone_info[1],
-                                      solver.ROOM_CONFIGS.get(zone_info[1], {}).get("zone", Zone.CIRCULATION),
-                                      solver.ROOM_CONFIGS.get(zone_info[1], {}).get("priority", RoomPriority.TERTIARY),
+                                      solver.ROOM_CONFIGS.get(zone_info[1], {}).get("zone",
+                                                                                     Zone.CIRCULATION),
+                                      solver.ROOM_CONFIGS.get(zone_info[1], {}).get("priority",
+                                                                                     RoomPriority.TERTIARY),
                                       solver.ROOM_CONFIGS.get(zone_info[1], {}).get("needs_window", False)))
                 else:
                     cfg = solver.ROOM_CONFIGS.get(zone_info, {})
@@ -1174,7 +1223,6 @@ class RadialHubStrategy(LayoutStrategy):
         height = bottom - top
         rng = solver.rng
         walls, rooms = [], []
-
         walls.extend([
             Wall(left, top, right, top, ext_th, True),
             Wall(left, bottom, right, bottom, ext_th, True),
@@ -1186,7 +1234,6 @@ class RadialHubStrategy(LayoutStrategy):
         margin_y = int(height * rng.uniform(0.25, 0.35))
         living_left = left + margin_x
         living_top = top + margin_y
-
         walls.append(Wall(left, living_top, right, living_top, int_th, False))
 
         available = list(config.room_types_enabled)
@@ -1197,10 +1244,8 @@ class RadialHubStrategy(LayoutStrategy):
 
         top_split = left + int(width * rng.uniform(0.35, 0.50))
         walls.append(Wall(top_split, top, top_split, living_top, int_th, False))
-
         r1 = rng.choice(service_types) if service_types else "bathroom"
         r2 = rng.choice(circ_types) if circ_types else "corridor"
-
         rooms.append(Room(left, top, top_split, living_top, r1,
                           solver.ROOM_CONFIGS.get(r1, {}).get("zone", Zone.SERVICE),
                           solver.ROOM_CONFIGS.get(r1, {}).get("priority", RoomPriority.TERTIARY),
@@ -1217,7 +1262,6 @@ class RadialHubStrategy(LayoutStrategy):
         r3 = rng.choice([r for r in service_types if r != r1] or ["kitchen"])
         r4 = rng.choice([r for r in available if
                          ConstraintSolver.ROOM_CONFIGS.get(r, {}).get("zone") == Zone.PRIVATE] or ["bedroom"])
-
         rooms.append(Room(left, living_top, living_left, left_split, r3,
                           solver.ROOM_CONFIGS.get(r3, {}).get("zone", Zone.SERVICE),
                           solver.ROOM_CONFIGS.get(r3, {}).get("priority", RoomPriority.SECONDARY)))
@@ -1241,7 +1285,6 @@ class BSPRecursiveStrategy(LayoutStrategy):
         left, top, right, bottom = bounds
         rng = solver.rng
         walls, rooms = [], []
-
         walls.extend([
             Wall(left, top, right, top, ext_th, True),
             Wall(left, bottom, right, bottom, ext_th, True),
@@ -1256,7 +1299,6 @@ class BSPRecursiveStrategy(LayoutStrategy):
         available = list(config.room_types_enabled)
         needed = min(len(cells), brief.num_rooms + 2)
         cells.sort(key=lambda c: (c[2] - c[0]) * (c[3] - c[1]), reverse=True)
-
         room_assignments = self._assign_rooms(cells[:needed], available, solver, rng)
 
         for (cx1, cy1, cx2, cy2), rt in room_assignments:
@@ -1325,7 +1367,6 @@ class VoronoiZoneStrategy(LayoutStrategy):
         height = bottom - top
         rng = solver.rng
         walls, rooms = [], []
-
         walls.extend([
             Wall(left, top, right, top, ext_th, True),
             Wall(left, bottom, right, bottom, ext_th, True),
@@ -1378,6 +1419,7 @@ class VoronoiZoneStrategy(LayoutStrategy):
                     continue
             except Exception:
                 continue
+
             bx1, by1, bx2, by2 = [int(v) for v in clipped.bounds]
             bx1, by1 = max(bx1, left), max(by1, top)
             bx2, by2 = min(bx2, right), min(by2, bottom)
@@ -1406,7 +1448,6 @@ class VoronoiZoneStrategy(LayoutStrategy):
 
         if not rooms:
             return BSPRecursiveStrategy().generate(bounds, ext_th, int_th, solver, brief, config)
-
         return walls, rooms
 
 
@@ -1421,7 +1462,6 @@ class GraphBasedStrategy(LayoutStrategy):
         height = bottom - top
         rng = solver.rng
         walls, rooms = [], []
-
         walls.extend([
             Wall(left, top, right, top, ext_th, True),
             Wall(left, bottom, right, bottom, ext_th, True),
@@ -1432,7 +1472,6 @@ class GraphBasedStrategy(LayoutStrategy):
         G = nx.Graph()
         available = list(config.room_types_enabled)
         n_rooms = min(brief.num_rooms + 2, len(available), 8)
-
         selected = []
         for rt in ["living", "corridor", "bathroom"]:
             if rt in available:
@@ -1444,7 +1483,6 @@ class GraphBasedStrategy(LayoutStrategy):
 
         for rt in selected:
             G.add_node(rt)
-
         for i, r1 in enumerate(selected):
             for j, r2 in enumerate(selected):
                 if i >= j:
@@ -1505,7 +1543,6 @@ class OpenPlanStrategy(LayoutStrategy):
         height = bottom - top
         rng = solver.rng
         walls, rooms = [], []
-
         walls.extend([
             Wall(left, top, right, top, ext_th, True),
             Wall(left, bottom, right, bottom, ext_th, True),
@@ -1515,7 +1552,6 @@ class OpenPlanStrategy(LayoutStrategy):
 
         open_ratio = rng.uniform(0.60, 0.70)
         corner = rng.choice(["top-left", "top-right", "bottom-left", "bottom-right"])
-
         priv_w = int(width * (1 - open_ratio))
         priv_h = int(height * rng.uniform(0.45, 0.65))
 
@@ -1537,7 +1573,6 @@ class OpenPlanStrategy(LayoutStrategy):
 
         mid_y = priv_y1 + int((priv_y2 - priv_y1) * rng.uniform(0.45, 0.55))
         walls.append(Wall(priv_x1, mid_y, priv_x2, mid_y, int_th, False))
-
         rooms.append(Room(priv_x1, priv_y1, priv_x2, mid_y,
                           "bedroom", Zone.PRIVATE, RoomPriority.PRIMARY))
         rooms.append(Room(priv_x1, mid_y, priv_x2, priv_y2,
@@ -1573,13 +1608,9 @@ class OpenPlanStrategy(LayoutStrategy):
         return walls, rooms
 
 
-# ── 5h. Asymmetric strategy (NEW) ────────────────────────────────────────────
+# ── 5h. Asymmetric strategy ──────────────────────────────────────────────────
 @register_strategy
 class AsymmetricStrategy(LayoutStrategy):
-    """
-    Irregular room sizes — one dominant room + several smaller ones
-    arranged along two sides. Creates more organic, less grid-like layouts.
-    """
     name = "asymmetric"
 
     def generate(self, bounds, ext_th, int_th, solver, brief, config):
@@ -1588,7 +1619,6 @@ class AsymmetricStrategy(LayoutStrategy):
         height = bottom - top
         rng = solver.rng
         walls, rooms = [], []
-
         walls.extend([
             Wall(left, top, right, top, ext_th, True),
             Wall(left, bottom, right, bottom, ext_th, True),
@@ -1597,11 +1627,9 @@ class AsymmetricStrategy(LayoutStrategy):
         ])
 
         available = list(config.room_types_enabled)
-
-        # Dominant room takes 35-55% of one axis
         dominant_ratio = rng.uniform(0.35, 0.55)
         orientation = rng.choice(["left-dominant", "right-dominant",
-                                   "top-dominant", "bottom-dominant"])
+                                  "top-dominant", "bottom-dominant"])
 
         if "left" in orientation or "right" in orientation:
             dom_w = int(width * dominant_ratio)
@@ -1616,11 +1644,9 @@ class AsymmetricStrategy(LayoutStrategy):
                               top,
                               dom_x2 if "left" in orientation else dom_x1,
                               bottom, int_th, False))
-
             rooms.append(Room(dom_x1, top, dom_x2, bottom,
                               "living", Zone.PUBLIC, RoomPriority.PRIMARY))
 
-            # Split remainder into 2-4 rooms vertically
             n_sub = rng.randint(2, max(2, min(4, brief.num_rooms)))
             sub_types = []
             for rt in ["kitchen", "bedroom", "bathroom", "corridor", "home_office"]:
@@ -1659,7 +1685,6 @@ class AsymmetricStrategy(LayoutStrategy):
                               right,
                               dom_y2 if "top" in orientation else dom_y1,
                               int_th, False))
-
             rooms.append(Room(left, dom_y1, right, dom_y2,
                               "living", Zone.PUBLIC, RoomPriority.PRIMARY))
 
@@ -1691,13 +1716,9 @@ class AsymmetricStrategy(LayoutStrategy):
         return walls, rooms
 
 
-# ── 5i. Courtyard strategy (NEW) ─────────────────────────────────────────────
+# ── 5i. Courtyard strategy ───────────────────────────────────────────────────
 @register_strategy
 class CourtyardStrategy(LayoutStrategy):
-    """
-    Rooms arranged around a central courtyard/atrium void.
-    The void is drawn as a special room with hatching.
-    """
     name = "courtyard"
 
     def generate(self, bounds, ext_th, int_th, solver, brief, config):
@@ -1706,7 +1727,6 @@ class CourtyardStrategy(LayoutStrategy):
         height = bottom - top
         rng = solver.rng
         walls, rooms = [], []
-
         walls.extend([
             Wall(left, top, right, top, ext_th, True),
             Wall(left, bottom, right, bottom, ext_th, True),
@@ -1714,7 +1734,6 @@ class CourtyardStrategy(LayoutStrategy):
             Wall(right, top, right, bottom, ext_th, True),
         ])
 
-        # Courtyard in center
         cx_margin = rng.uniform(0.25, 0.35)
         cy_margin = rng.uniform(0.25, 0.35)
         court_x1 = left + int(width * cx_margin)
@@ -1722,7 +1741,6 @@ class CourtyardStrategy(LayoutStrategy):
         court_y1 = top + int(height * cy_margin)
         court_y2 = bottom - int(height * cy_margin)
 
-        # Courtyard walls
         walls.append(Wall(court_x1, court_y1, court_x2, court_y1, int_th, False))
         walls.append(Wall(court_x1, court_y2, court_x2, court_y2, int_th, False))
         walls.append(Wall(court_x1, court_y1, court_x1, court_y2, int_th, False))
@@ -1733,14 +1751,11 @@ class CourtyardStrategy(LayoutStrategy):
                           Zone.PUBLIC, RoomPriority.PRIMARY))
 
         available = [r for r in config.room_types_enabled if r != "atrium"]
-
-        # Top strip
         rt_top = rng.choice(["living", "dining"] if "living" in available else available)
         rooms.append(Room(left, top, right, court_y1, rt_top,
                           solver.ROOM_CONFIGS.get(rt_top, {}).get("zone", Zone.PUBLIC),
                           solver.ROOM_CONFIGS.get(rt_top, {}).get("priority", RoomPriority.PRIMARY)))
 
-        # Bottom strip — split into 2
         bot_split = left + int(width * rng.uniform(0.40, 0.60))
         walls.append(Wall(bot_split, court_y2, bot_split, bottom, int_th, False))
         rt_bl = rng.choice(["kitchen", "laundry"] if "kitchen" in available else available)
@@ -1752,13 +1767,11 @@ class CourtyardStrategy(LayoutStrategy):
                           solver.ROOM_CONFIGS.get(rt_br, {}).get("zone", Zone.SERVICE),
                           RoomPriority.TERTIARY, False))
 
-        # Left strip
         rt_left = rng.choice(["bedroom", "home_office"] if "bedroom" in available else available)
         rooms.append(Room(left, court_y1, court_x1, court_y2, rt_left,
                           solver.ROOM_CONFIGS.get(rt_left, {}).get("zone", Zone.PRIVATE),
                           RoomPriority.PRIMARY))
 
-        # Right strip
         rt_right = rng.choice(["bedroom", "corridor"] if "bedroom" in available else available)
         rooms.append(Room(court_x2, court_y1, right, court_y2, rt_right,
                           solver.ROOM_CONFIGS.get(rt_right, {}).get("zone", Zone.PRIVATE),
@@ -1767,8 +1780,130 @@ class CourtyardStrategy(LayoutStrategy):
         return walls, rooms
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 6. TEXTURE & HATCH ENGINE
+# ── 5j. Spine (corridor-tree) strategy ───────────────────────────────────────
+@register_strategy
+class SpineStrategy(LayoutStrategy):
+    """
+    Rooms arranged as leaves along a central corridor spine.
+    The spine runs along the longer axis; rooms hang off both sides.
+    This produces an even, non-clustered wall distribution that looks
+    like a real floor plan tree rather than stacked boxes.
+    """
+    name = "spine"
+
+    def generate(self, bounds, ext_th, int_th, solver, brief, config):
+        left, top, right, bottom = bounds
+        width  = right - left
+        height = bottom - top
+        rng    = solver.rng
+        walls, rooms = [], []
+
+        # Outer walls
+        walls.extend([
+            Wall(left,  top,    right, top,    ext_th, True),
+            Wall(left,  bottom, right, bottom, ext_th, True),
+            Wall(left,  top,    left,  bottom, ext_th, True),
+            Wall(right, top,    right, bottom, ext_th, True),
+        ])
+
+        horizontal_spine = width >= height
+        available = list(config.room_types_enabled)
+        n_rooms = min(brief.num_rooms + 2, 8, len(available))
+
+        # Room types: corridor is the spine, rest are leaves
+        leaf_types = [r for r in available if r != "corridor"]
+        rng.shuffle(leaf_types)
+        # Always include bathroom and a primary room if possible
+        priority = [r for r in ["living", "bedroom", "kitchen", "bathroom"] if r in leaf_types]
+        others   = [r for r in leaf_types if r not in priority]
+        leaf_types = priority + others
+
+        n_leaves = max(2, n_rooms - 1)
+        leaf_types = leaf_types[:n_leaves]
+
+        if horizontal_spine:
+            # Spine corridor runs left-right through the vertical centre
+            spine_h   = int(height * rng.uniform(0.14, 0.20))
+            spine_cy  = top + int(height * rng.uniform(0.38, 0.55))
+            spine_y1  = spine_cy - spine_h // 2
+            spine_y2  = spine_y1 + spine_h
+
+            walls.append(Wall(left, spine_y1, right, spine_y1, int_th, False))
+            walls.append(Wall(left, spine_y2, right, spine_y2, int_th, False))
+            rooms.append(Room(left, spine_y1, right, spine_y2,
+                              "corridor", Zone.CIRCULATION, RoomPriority.TERTIARY, False))
+
+            # Split leaves: roughly half above, half below spine
+            above = leaf_types[:len(leaf_types)//2 + len(leaf_types)%2]
+            below = leaf_types[len(leaf_types)//2 + len(leaf_types)%2:]
+            if not above: above = leaf_types[:1]
+            if not below: below = leaf_types[-1:]
+
+            def place_leaves(room_list, y_top, y_bot):
+                n = len(room_list)
+                if n == 0:
+                    return
+                # Jittered column widths
+                raw = [rng.uniform(0.7, 1.3) for _ in range(n)]
+                total = sum(raw)
+                widths = [int((r / total) * width) for r in raw]
+                widths[-1] = width - sum(widths[:-1])  # absorb rounding
+                cx = left
+                for i, (rt, w_) in enumerate(zip(room_list, widths)):
+                    nx = min(cx + w_, right)
+                    if i < n - 1:
+                        walls.append(Wall(nx, y_top, nx, y_bot, int_th, False))
+                    cfg = solver.ROOM_CONFIGS.get(rt, {})
+                    rooms.append(Room(cx, y_top, nx, y_bot, rt,
+                                      cfg.get("zone", Zone.PUBLIC),
+                                      cfg.get("priority", RoomPriority.SECONDARY),
+                                      cfg.get("needs_window", True)))
+                    cx = nx
+
+            place_leaves(above, top,      spine_y1)
+            place_leaves(below, spine_y2, bottom)
+
+        else:
+            # Spine corridor runs top-bottom through the horizontal centre
+            spine_w   = int(width * rng.uniform(0.14, 0.20))
+            spine_cx  = left + int(width * rng.uniform(0.38, 0.55))
+            spine_x1  = spine_cx - spine_w // 2
+            spine_x2  = spine_x1 + spine_w
+
+            walls.append(Wall(spine_x1, top, spine_x1, bottom, int_th, False))
+            walls.append(Wall(spine_x2, top, spine_x2, bottom, int_th, False))
+            rooms.append(Room(spine_x1, top, spine_x2, bottom,
+                              "corridor", Zone.CIRCULATION, RoomPriority.TERTIARY, False))
+
+            left_leaves  = leaf_types[:len(leaf_types)//2 + len(leaf_types)%2]
+            right_leaves = leaf_types[len(leaf_types)//2 + len(leaf_types)%2:]
+            if not left_leaves:  left_leaves  = leaf_types[:1]
+            if not right_leaves: right_leaves = leaf_types[-1:]
+
+            def place_leaves_vert(room_list, x_left, x_right):
+                n = len(room_list)
+                if n == 0:
+                    return
+                raw = [rng.uniform(0.7, 1.3) for _ in range(n)]
+                total = sum(raw)
+                heights = [int((r / total) * height) for r in raw]
+                heights[-1] = height - sum(heights[:-1])
+                cy = top
+                for i, (rt, h_) in enumerate(zip(room_list, heights)):
+                    ny = min(cy + h_, bottom)
+                    if i < n - 1:
+                        walls.append(Wall(x_left, ny, x_right, ny, int_th, False))
+                    cfg = solver.ROOM_CONFIGS.get(rt, {})
+                    rooms.append(Room(x_left, cy, x_right, ny, rt,
+                                      cfg.get("zone", Zone.PUBLIC),
+                                      cfg.get("priority", RoomPriority.SECONDARY),
+                                      cfg.get("needs_window", True)))
+                    cy = ny
+
+            place_leaves_vert(left_leaves,  left,     spine_x1)
+            place_leaves_vert(right_leaves, spine_x2, right)
+
+        return walls, rooms
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TextureEngine:
@@ -1782,12 +1917,9 @@ class TextureEngine:
         x2, y2 = min(img.shape[1], x2), min(img.shape[0], y2)
         if x2 <= x1 or y2 <= y1:
             return
-
         cv2.rectangle(img, (x1, y1), (x2, y2), style.fill, -1, cv2.LINE_AA)
-
         if style.texture and HAS_NOISE:
             self._apply_perlin_texture(img, x1, y1, x2, y2, style.texture, style.fill)
-
         if style.hatch_pattern:
             hatch_col = style.hatch_color or style.stroke
             if style.hatch_pattern == "diagonal":
@@ -1839,7 +1971,7 @@ class TextureEngine:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 7. SEMANTIC FURNITURE PLACER
+# 7. SEMANTIC FURNITURE PLACER (unchanged from v5.0)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SemanticFurniturePlacer:
@@ -1889,15 +2021,12 @@ class SemanticFurniturePlacer:
                 self._place_kitchen_suite(img, room)
             elif room.room_type == "bathroom":
                 self._place_bathroom_suite(img, room)
-
             density = self.DENSITY.get(room.room_type, (1, 3))
             n_items = self.rng.randint(*density)
             clearance = self.CLEARANCE_RATIOS.get(room.room_type, 0.1)
             margin = int(min(room.width, room.height) * clearance)
-
             for _ in range(n_items):
                 self._place_single_furniture(img, room, margin)
-
             if room.room_type in ("living", "kitchen", "corridor", "dining", "home_office"):
                 if self.rng.random() < 0.7:
                     for _ in range(self.rng.randint(1, 3)):
@@ -2003,7 +2132,6 @@ class SemanticFurniturePlacer:
         fill = self.theme.furniture_fill
         stroke = self.theme.furniture_stroke
         bg = self.theme.background
-
         if rw >= rh:
             tub_len = int(rw * self.rng.uniform(0.45, 0.75))
             tub_depth = int(rh * self.rng.uniform(0.35, 0.5))
@@ -2016,16 +2144,12 @@ class SemanticFurniturePlacer:
             x1 = room.x1 + 5
             y1 = self.rng.randint(room.y1 + 8, room.y2 - 8 - tub_len)
             x2, y2 = x1 + tub_depth, y1 + tub_len
-
         cv2.rectangle(img, (x1, y1), (x2, y2), fill, -1, cv2.LINE_AA)
         cv2.rectangle(img, (x1, y1), (x2, y2), stroke, 1, cv2.LINE_AA)
         self.add_occupied(x1, y1, x2, y2, "furniture")
-
         pad = max(3, int(min(x2 - x1, y2 - y1) * 0.08))
         cv2.rectangle(img, (x1 + pad, y1 + pad), (x2 - pad, y2 - pad), bg, -1, cv2.LINE_AA)
         cv2.rectangle(img, (x1 + pad, y1 + pad), (x2 - pad, y2 - pad), stroke, 1, cv2.LINE_AA)
-
-        # Sink
         base = min(rw, rh)
         sw, sh = int(base * 0.18), int(base * 0.14)
         sx1 = room.x2 - sw - 8
@@ -2033,8 +2157,6 @@ class SemanticFurniturePlacer:
         cv2.rectangle(img, (sx1, sy1), (sx1 + sw, sy1 + sh), fill, -1, cv2.LINE_AA)
         cv2.rectangle(img, (sx1, sy1), (sx1 + sw, sy1 + sh), stroke, 1, cv2.LINE_AA)
         self.add_occupied(sx1, sy1, sx1 + sw, sy1 + sh, "furniture")
-
-        # Toilet
         wc_r = int(base * 0.06)
         wc_cx, wc_cy = room.x1 + 12 + wc_r, room.y2 - 12 - wc_r
         cv2.circle(img, (wc_cx, wc_cy), wc_r, fill, -1, cv2.LINE_AA)
@@ -2056,12 +2178,10 @@ class SemanticFurniturePlacer:
             rect_h, rect_w = elem_len, elem_thick
         else:
             rect_w, rect_h = elem_len, elem_thick
-
         rw, rh = room.width, room.height
         s = min((rw - 2 * margin) / max(1, rect_w),
                 (rh - 2 * margin) / max(1, rect_h), 1.0)
         rect_w, rect_h = max(3, int(rect_w * s)), max(3, int(rect_h * s))
-
         for _ in range(10):
             x_max = room.x2 - margin - rect_w
             x_min = room.x1 + margin
@@ -2080,7 +2200,7 @@ class SemanticFurniturePlacer:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 8. VECTOR & CAD EXPORTERS
+# 8. VECTOR & CAD EXPORTERS (unchanged from v5.0)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SVGExporter:
@@ -2137,7 +2257,8 @@ class DXFExporter:
                       (room.x2, room.y2), (room.x1, room.y2), (room.x1, room.y1)]
             msp.add_lwpolyline(points, dxfattribs={"layer": "ROOMS"})
             cx, cy = room.center
-            msp.add_text(room.room_type, dxfattribs={"layer": "LABELS", "height": 8}).set_placement((cx, cy))
+            msp.add_text(room.room_type,
+                         dxfattribs={"layer": "LABELS", "height": 8}).set_placement((cx, cy))
         for w in walls:
             layer = "WALLS_EXT" if w.is_external else "WALLS_INT"
             msp.add_line((w.x1, w.y1), (w.x2, w.y2), dxfattribs={"layer": layer})
@@ -2148,7 +2269,7 @@ class DXFExporter:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 9. METADATA / JSON EXPORTER
+# 9. METADATA / JSON EXPORTER (unchanged from v5.0)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class MetadataExporter:
@@ -2158,7 +2279,7 @@ class MetadataExporter:
 
     def export(self, path, rooms, walls, balconies, brief, config):
         data = {
-            "generator_version": "5.0",
+            "generator_version": "6.0",
             "config": {
                 "style": config.style,
                 "building_type": config.building_type,
@@ -2207,16 +2328,18 @@ class MetadataExporter:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 10. RENDERER
+# 10. RENDERER (UPDATED with outlined wall support)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class ThemeRenderer:
-    def __init__(self, theme, size, rng, stroke_scale=1.0):
+    def __init__(self, theme, size, rng, stroke_scale=1.0,
+                 wall_draw_style: str = "solid"):
         self.theme = theme
         self.size = size
         self.rng = rng
         self.stroke_scale = stroke_scale
         self.texture_engine = TextureEngine(rng, size)
+        self.wall_draw_style = wall_draw_style
 
     def _th(self, thickness):
         return max(1, int(thickness * self.stroke_scale))
@@ -2237,30 +2360,129 @@ class ThemeRenderer:
                               fill, -1, cv2.LINE_AA)
 
     def draw_walls(self, img, walls):
+        """Draw walls with either SOLID or OUTLINED style.
+        For OUTLINED style, wall contour edges are clipped so they don't
+        draw over intersecting wall rectangles — eliminating overlap artefacts.
+        """
+        # Pre-compute axis-aligned bounding rects for all non-guardrail walls
+        def wall_rect(w):
+            half = w.thickness // 2
+            x1, x2 = min(w.x1, w.x2), max(w.x1, w.x2)
+            y1, y2 = min(w.y1, w.y2), max(w.y1, w.y2)
+            if w.x1 == w.x2:
+                return (x1 - half, y1, x1 + half, y2)
+            else:
+                return (x1, y1 - half, x2, y1 + half)
+
+        non_gr = [w for w in walls if not w.is_guardrail]
+        rects = [wall_rect(w) for w in non_gr]
+
         for w in walls:
             if w.is_guardrail:
                 cv2.line(img, (w.x1, w.y1), (w.x2, w.y2),
                          self.theme.wall_color, self._th(2), cv2.LINE_AA)
+                continue
+
+            half = w.thickness // 2
+            x1, x2 = min(w.x1, w.x2), max(w.x1, w.x2)
+            y1, y2 = min(w.y1, w.y2), max(w.y1, w.y2)
+            color = self.theme.wall_color
+
+            if w.x1 == w.x2:
+                pt1, pt2 = (x1 - half, y1), (x1 + half, y2)
+            else:
+                pt1, pt2 = (x1, y1 - half), (x2, y1 + half)
+
+            wx1, wy1, wx2, wy2 = pt1[0], pt1[1], pt2[0], pt2[1]
+
+            if self.theme.shadow_offset > 0:
+                so = self.theme.shadow_offset
+                cv2.rectangle(img, (wx1 + so, wy1 + so), (wx2 + so, wy2 + so),
+                              self.theme.shadow_color, -1, cv2.LINE_AA)
+
+            if self.wall_draw_style == "outlined":
+                # Fill interior with background first
+                bg = self.theme.background
+                cv2.rectangle(img, (wx1, wy1), (wx2, wy2), bg, -1, cv2.LINE_AA)
+                contour_th = min(3, max(1, self._th(max(2, w.thickness // 5))))
+
+                # Build set of other wall rects that overlap this wall's rect
+                other_rects = [r for (ww, r) in zip(non_gr, rects) if ww is not w]
+
+                def seg_minus_rects(ax, ay, bx, by, obs):
+                    """Return sub-segments of line a→b not covered by any obs rect."""
+                    segs = [(0.0, 1.0)]
+                    dx, dy = bx - ax, by - ay
+                    for (rx1, ry1, rx2, ry2) in obs:
+                        # does the segment pass through this rect?
+                        # parameterise: point = a + t*(b-a)
+                        # find t-range where point is inside rect
+                        if dx == 0 and dy == 0:
+                            break
+                        if dx != 0:
+                            # horizontal segment: check y overlap
+                            if ay < ry1 or ay > ry2:
+                                continue
+                            t1 = (rx1 - ax) / dx
+                            t2 = (rx2 - ax) / dx
+                        else:
+                            # vertical segment: check x overlap
+                            if ax < rx1 or ax > rx2:
+                                continue
+                            t1 = (ry1 - ay) / dy
+                            t2 = (ry2 - ay) / dy
+                        lo, hi = min(t1, t2), max(t1, t2)
+                        lo, hi = max(lo, 0.0), min(hi, 1.0)
+                        if lo >= hi:
+                            continue
+                        # subtract [lo, hi] from all existing segs
+                        new_segs = []
+                        for (s, e) in segs:
+                            if e <= lo or s >= hi:
+                                new_segs.append((s, e))
+                            else:
+                                if s < lo:
+                                    new_segs.append((s, lo))
+                                if e > hi:
+                                    new_segs.append((hi, e))
+                        segs = new_segs
+                    return segs
+
+                def draw_seg(ax, ay, bx, by):
+                    segs = seg_minus_rects(ax, ay, bx, by, other_rects)
+                    for (t0, t1) in segs:
+                        if t1 - t0 < 1e-6:
+                            continue
+                        px0 = int(ax + t0 * (bx - ax))
+                        py0 = int(ay + t0 * (by - ay))
+                        px1 = int(ax + t1 * (bx - ax))
+                        py1 = int(ay + t1 * (by - ay))
+                        cv2.line(img, (px0, py0), (px1, py1), color, contour_th, cv2.LINE_AA)
+
+                # Draw 4 edges of this wall rect, clipped
+                draw_seg(wx1, wy1, wx2, wy1)  # top
+                draw_seg(wx2, wy1, wx2, wy2)  # right
+                draw_seg(wx2, wy2, wx1, wy2)  # bottom
+                draw_seg(wx1, wy2, wx1, wy1)  # left
+
+            else:
+                # SOLID: filled rectangle
+                cv2.rectangle(img, (wx1, wy1), (wx2, wy2), color, -1, cv2.LINE_AA)
+
+    def draw_walls_on_mask(self, mask, walls, class_id):
+        """Draw walls onto segmentation mask."""
+        for w in walls:
+            if w.is_guardrail:
+                cv2.line(mask, (w.x1, w.y1), (w.x2, w.y2), class_id, max(2, w.thickness // 2))
             else:
                 half = w.thickness // 2
                 x1, x2 = min(w.x1, w.x2), max(w.x1, w.x2)
                 y1, y2 = min(w.y1, w.y2), max(w.y1, w.y2)
-                color = self.theme.wall_ext_color if w.is_external else self.theme.wall_color
-                if self.theme.shadow_offset > 0:
-                    so = self.theme.shadow_offset
-                    shadow_col = self.theme.shadow_color
-                    if w.x1 == w.x2:
-                        pt1 = (x1 - half + so, y1 + so)
-                        pt2 = (x1 + half + so, y2 + so)
-                    else:
-                        pt1 = (x1 + so, y1 - half + so)
-                        pt2 = (x2 + so, y1 + half + so)
-                    cv2.rectangle(img, pt1, pt2, shadow_col, -1, cv2.LINE_AA)
                 if w.x1 == w.x2:
                     pt1, pt2 = (x1 - half, y1), (x1 + half, y2)
                 else:
                     pt1, pt2 = (x1, y1 - half), (x2, y1 + half)
-                cv2.rectangle(img, pt1, pt2, color, -1, cv2.LINE_AA)
+                cv2.rectangle(mask, pt1, pt2, class_id, -1)
 
     def draw_balcony_floor(self, img, balconies):
         for b in balconies:
@@ -2294,7 +2516,7 @@ class ThemeRenderer:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STYLE ROTATOR
+# STYLE ROTATOR (unchanged from v5.0)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class StyleRotator:
@@ -2339,7 +2561,7 @@ class StyleRotator:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 11. MAIN GENERATOR CLASS
+# 11. MAIN GENERATOR CLASS (UPDATED)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class SmartFloorPlanGenerator:
@@ -2352,13 +2574,20 @@ class SmartFloorPlanGenerator:
         self.size = config.img_size * config.super_sampling
         self.rng = random.Random(config.seed)
         self.nprng = np.random.default_rng(config.seed)
+
         self.door_swing_arc_probability = 0.5
 
         self.theme = config.get_theme()
         self.solver = ConstraintSolver(self.rng, config.constraint_solver)
+
+        # Determine wall/door draw style for this generator
+        self._resolve_wall_draw_style()
+        self._resolve_door_draw_style()
+
         self.furniture_placer = SemanticFurniturePlacer(
             self.rng, self.size, self.theme, config.semantic_furniture)
-        self.renderer = ThemeRenderer(self.theme, self.size, self.rng)
+        self.renderer = ThemeRenderer(self.theme, self.size, self.rng,
+                                       wall_draw_style=self.current_wall_style)
         self.texture_engine = TextureEngine(self.rng, self.size)
 
         self.strategies: Dict[str, LayoutStrategy] = {}
@@ -2383,13 +2612,46 @@ class SmartFloorPlanGenerator:
                 rng=self.rng,
             )
 
-        # ── Window sub-types for variety ─────────────────────────────
-        # Expanded length ratios for wider range
+        # Window sub-types
         self.window_length_ratios = (
             0.005, 0.008, 0.010, 0.015, 0.020, 0.025, 0.030, 0.035,
             0.040, 0.045, 0.050, 0.060, 0.070, 0.080, 0.090, 0.100, 0.120
         )
         self.door_length_ratios = (0.04, 0.05, 0.06)
+
+    def _blueprint_line_th(self, base_min: float = 1.0, base_max: float = 3.0) -> int:
+        """
+        Return a stroke thickness for blueprint lines in the range [base_min, base_max].
+        Values are integer pixel widths 1-3; using cv2.LINE_AA on every draw call
+        provides sub-pixel anti-aliasing that mimics non-integer stroke weights.
+        Scaled by super_sampling so lines stay proportionally thin on hi-res canvas.
+        """
+        raw = self.rng.uniform(base_min, base_max)
+        scaled = raw * max(1, self.super_sampling * 0.5)
+        return max(1, min(3, round(scaled)))
+
+    def _resolve_wall_draw_style(self):
+        """Determine wall draw style for the current image."""
+        style_cfg = self.config.wall_draw_style.lower()
+        if style_cfg == "random":
+            self.current_wall_style = self.rng.choice(["solid", "outlined"])
+        elif style_cfg in ("solid", "outlined"):
+            self.current_wall_style = style_cfg
+        else:
+            self.current_wall_style = "solid"
+
+    def _resolve_door_draw_style(self):
+        """Determine door draw style for the current image.
+
+        Door style is always coupled to wall style:
+          outlined walls -> cross (ridge) doors
+          solid walls    -> slab (swing-arc) doors
+        The door_draw_style config is ignored in favour of this coupling.
+        """
+        if self.current_wall_style == "outlined":
+            self.current_door_style = "cross"
+        else:
+            self.current_door_style = "slab"
 
     def generate_brief(self):
         styles = ["compact", "spacious", "linear", "square"]
@@ -2418,8 +2680,12 @@ class SmartFloorPlanGenerator:
 
     def _apply_style_for_image(self):
         overrides = {}
+
+        # Randomize wall/door styles per image
+        self._resolve_wall_draw_style()
+        self._resolve_door_draw_style()
+
         if not self.style_rotator:
-            # Still apply color jitter even without style rotation
             if self.config.color_jitter_intensity > 0:
                 self.theme = self.config.get_theme().jittered_copy(
                     self.rng, self.config.color_jitter_intensity)
@@ -2427,12 +2693,10 @@ class SmartFloorPlanGenerator:
             return overrides
 
         self.theme = self.style_rotator.next_theme()
-        # Apply per-image color jitter within the chosen style
         if self.config.color_jitter_intensity > 0:
             self.theme = self.theme.jittered_copy(
                 self.rng, self.config.color_jitter_intensity)
         overrides["theme"] = self.theme.name
-
         self._rebuild_with_theme()
 
         if self.config.vary_strategies:
@@ -2455,7 +2719,8 @@ class SmartFloorPlanGenerator:
 
     def _rebuild_with_theme(self):
         """Rebuild renderer, furniture placer, exporters with current theme."""
-        self.renderer = ThemeRenderer(self.theme, self.size, self.rng)
+        self.renderer = ThemeRenderer(self.theme, self.size, self.rng,
+                                       wall_draw_style=self.current_wall_style)
         self.furniture_placer = SemanticFurniturePlacer(
             self.rng, self.size, self.theme, self.config.semantic_furniture)
         self.svg_exporter = SVGExporter(self.theme, self.size)
@@ -2473,19 +2738,27 @@ class SmartFloorPlanGenerator:
         svg_dir = os.path.join(out_dir, "svg")
         dxf_dir = os.path.join(out_dir, "dxf")
         meta_dir = os.path.join(out_dir, "metadata")
+        # NEW: U-Net mask directories
+        mask_dir = os.path.join(out_dir, "masks")
+        mask_vis_dir = os.path.join(out_dir, "masks_colorized")
 
         os.makedirs(img_dir, exist_ok=True)
         os.makedirs(lbl_dir, exist_ok=True)
 
         export_formats = [ExportFormat(f) if isinstance(f, str) else f
                           for f in self.config.export_formats]
-
         if ExportFormat.SVG in export_formats:
             os.makedirs(svg_dir, exist_ok=True)
         if ExportFormat.DXF in export_formats:
             os.makedirs(dxf_dir, exist_ok=True)
         if ExportFormat.JSON in export_formats or self.config.generate_metadata_json:
             os.makedirs(meta_dir, exist_ok=True)
+
+        # NEW: Create mask directories
+        if self.config.generate_unet_masks:
+            os.makedirs(mask_dir, exist_ok=True)
+            if self.config.unet_mask_colorized:
+                os.makedirs(mask_vis_dir, exist_ok=True)
 
         style_counts: Dict[str, int] = defaultdict(int)
         strategy_counts: Dict[str, int] = defaultdict(int)
@@ -2501,7 +2774,6 @@ class SmartFloorPlanGenerator:
             int_th = int(ext_th * self.rng.uniform(0.5, 0.7))
 
             result = self.generate_single_plan(ext_th, int_th)
-
             hi_res_img = result["image"]
             labels = result["labels"]
             walls = result["walls"]
@@ -2515,8 +2787,16 @@ class SmartFloorPlanGenerator:
             img = cv2.resize(hi_res_img, (self.out_size, self.out_size),
                              interpolation=cv2.INTER_AREA)
 
+            # Resize mask in sync with the image (NEAREST preserves class IDs)
+            hi_res_mask = result.get("semantic_mask")
+            mask = None
+            if self.config.generate_unet_masks and hi_res_mask is not None:
+                mask = cv2.resize(hi_res_mask, (self.out_size, self.out_size),
+                                  interpolation=cv2.INTER_NEAREST)
+
+            # Apply rotation to both img and mask together so they stay aligned
             if self.rng.random() < self.config.rotation_probability:
-                img, labels = self._apply_rotation(img, labels)
+                img, labels, mask = self._apply_rotation(img, labels, mask)
 
             if self.rng.random() < self.config.augmentation_probability:
                 img = self._apply_augmentations(img)
@@ -2527,6 +2807,14 @@ class SmartFloorPlanGenerator:
             with open(os.path.join(lbl_dir, fname + ".txt"), "w", encoding="utf-8") as f:
                 for cls_id, cx, cy, w, h in labels:
                     f.write(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
+
+            # ── U-Net segmentation mask ────────────────────────────────────
+            if self.config.generate_unet_masks and mask is not None:
+                cv2.imwrite(os.path.join(mask_dir, fname + ".png"), mask)
+
+                if self.config.unet_mask_colorized:
+                    vis = UNetSemanticClasses.colorize_mask(mask)
+                    cv2.imwrite(os.path.join(mask_vis_dir, fname + ".png"), vis)
 
             if ExportFormat.SVG in export_formats:
                 scale_f = self.out_size / self.size
@@ -2584,11 +2872,14 @@ class SmartFloorPlanGenerator:
                         meta = json.load(f)
                     meta["style_overrides"] = overrides
                     meta["actual_theme"] = self.theme.name
+                    meta["wall_draw_style"] = self.current_wall_style
+                    meta["door_draw_style"] = self.current_door_style
                     with open(meta_path, "w") as f:
                         json.dump(meta, f, indent=2, ensure_ascii=False)
 
             if (i + 1) % 100 == 0 or i == n_images - 1:
-                print(f"  [{i + 1}/{n_images}] theme={self.theme.name}")
+                print(f"  [{i + 1}/{n_images}] theme={self.theme.name} "
+                      f"wall={self.current_wall_style} door={self.current_door_style}")
 
         if self.style_rotator:
             print(f"\n── Style distribution across {n_images} images ──")
@@ -2608,8 +2899,13 @@ class SmartFloorPlanGenerator:
         bg = self.theme.background
         img = np.full((self.size, self.size, 3), bg, dtype=np.uint8)
 
+        # NEW: Create semantic segmentation mask (single-channel uint8)
+        semantic_mask = np.zeros((self.size, self.size), dtype=np.uint8)
+
         stroke_scale = self.rng.uniform(0.5, 2.5) if self.config.enable_augmentations else 1.0
-        self.renderer = ThemeRenderer(self.theme, self.size, self.rng, stroke_scale=stroke_scale)
+        self.renderer = ThemeRenderer(self.theme, self.size, self.rng,
+                                       stroke_scale=stroke_scale,
+                                       wall_draw_style=self.current_wall_style)
 
         margin = int(self.size * self.rng.uniform(0.12, 0.28))
         bounds = (margin, margin, self.size - margin, self.size - margin)
@@ -2617,7 +2913,6 @@ class SmartFloorPlanGenerator:
         brief = self.generate_brief()
         strategy_name = brief.circulation_type
         strategy = self.strategies.get(strategy_name, list(self.strategies.values())[0])
-
         walls, rooms = strategy.generate(
             bounds, ext_wall_thickness, int_wall_thickness,
             self.solver, brief, self.config,
@@ -2629,35 +2924,46 @@ class SmartFloorPlanGenerator:
                 walls, rooms, ext_wall_thickness
             )
 
-        # Render
+        # Render rooms
         self.renderer.fill_rooms(img, rooms)
+
+        # Rooms, balconies, furniture are all background in the 3-class schema.
+
+        # Balconies
         self.renderer.draw_balcony_floor(img, balconies)
         for b in balconies:
             x1, x2 = min(b.x1, b.x2), max(b.x1, b.x2)
             y1, y2 = min(b.y1, b.y2), max(b.y1, b.y2)
             self.furniture_placer.add_occupied(x1, y1, x2, y2, "balcony")
 
+        # Draw walls
         self.renderer.draw_walls(img, walls)
+        # Draw walls on mask
+        self.renderer.draw_walls_on_mask(semantic_mask, walls,
+                                          UNetSemanticClasses.WALL)
+
+        # Furniture (visual only — not written to mask)
         self.furniture_placer.place_furniture(img, rooms, walls)
 
         labels: List[Tuple[int, float, float, float, float]] = []
 
         # Balcony features
-        balcony_labels = self._draw_balcony_features(img, balconies, int_wall_thickness)
+        balcony_labels = self._draw_balcony_features(img, balconies, int_wall_thickness,
+                                                      semantic_mask)
         labels.extend(balcony_labels)
 
-        # Windows
+        # Windows — at most 2 per wall segment, biased toward edges
         external_walls = [w for w in walls if w.is_external and not w.is_guardrail]
         for w in external_walls:
             length = max(abs(w.x2 - w.x1), abs(w.y2 - w.y1))
-            n_windows = self.rng.randint(1, max(2, int(length / 200)))
+            n_windows = self.rng.randint(1, max(1, min(2, int(length / 350))))
             for _ in range(n_windows):
-                if self.rng.random() < 0.7:
-                    box = self._place_window(img, w)
+                if self.rng.random() < 0.65:
+                    box = self._place_window(img, w, semantic_mask)
                     if box:
                         labels.append((1, *box))
 
-        # Doors — NO SWING ARC, smaller angle
+        # Doors
         internal_walls = [w for w in walls
                           if not w.is_external and not w.is_balcony_interface]
         door_spans: Dict[int, List[Tuple[int, int]]] = {}
@@ -2665,52 +2971,46 @@ class SmartFloorPlanGenerator:
             length = max(abs(w.x2 - w.x1), abs(w.y2 - w.y1))
             if length < int_wall_thickness * 3:
                 continue
-            n_doors = 1 if length < 250 * self.super_sampling else self.rng.randint(1, 2)
+            # Always at most 1 door per wall segment for cleaner plans
             spans = door_spans.setdefault(id(w), [])
-            for _ in range(n_doors):
-                if self.rng.random() < 0.8:
-                    box = self._place_door(img, w, spans)
-                    if box:
-                        labels.append((0, *box))
+            if self.rng.random() < 0.75:
+                box = self._place_door(img, w, spans, semantic_mask)
+                if box:
+                    labels.append((0, *box))
 
         self.renderer.add_annotations(img, rooms)
 
         if self.config.multi_story and self.config.num_floors > 1:
-            self._draw_staircase_symbol(img, rooms)
+            self._draw_staircase_symbol(img, rooms, semantic_mask)
 
         return {
             "image": img, "labels": labels, "walls": walls,
             "rooms": rooms, "balconies": balconies, "brief": brief,
+            "semantic_mask": semantic_mask,
         }
 
     def _apply_augmentations(self, img, labels=None):
         if not self.config.enable_augmentations:
             return img
-
         h, w = img.shape[:2]
-
         if self.rng.random() < 0.8:
             brightness_factor = 1.0 + self.rng.uniform(
                 -self.config.aug_brightness_range, self.config.aug_brightness_range)
             img = cv2.convertScaleAbs(img, alpha=brightness_factor, beta=0)
-
         if self.rng.random() < self.config.aug_blur_prob:
             k = self.rng.choice([3, 5, 7])
             sigma = self.rng.uniform(0.5, 2.0)
             img = cv2.GaussianBlur(img, (k, k), sigma)
-
         if self.rng.random() < self.config.aug_noise_prob:
             sigma = self.rng.uniform(5, 25)
             gauss = np.random.normal(0, sigma, img.shape).astype(np.int16)
             img = np.clip(img.astype(np.int16) + gauss, 0, 255).astype(np.uint8)
-
         if self.rng.random() < self.config.aug_jpeg_prob:
             quality = self.rng.randint(10, 80)
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
             result, encimg = cv2.imencode('.jpg', img, encode_param)
             if result:
                 img = cv2.imdecode(encimg, 1)
-
         return img
 
     # ── Multi-story ───────────────────────────────────────────────────────────
@@ -2724,7 +3024,7 @@ class SmartFloorPlanGenerator:
             floors.append(result)
         return floors
 
-    def _draw_staircase_symbol(self, img, rooms):
+    def _draw_staircase_symbol(self, img, rooms, semantic_mask=None):
         corridors = [r for r in rooms if r.zone == Zone.CIRCULATION]
         if not corridors:
             return
@@ -2745,6 +3045,7 @@ class SmartFloorPlanGenerator:
         cv2.arrowedLine(img, (arrow_x, y1 + stair_h),
                         (arrow_x, y1), self.theme.wall_color, 2,
                         cv2.LINE_AA, tipLength=0.3)
+        # Staircase is background in the 3-class schema — not written to mask.
 
     # ── Balcony integration ───────────────────────────────────────────────────
     def _integrate_balconies(self, walls, rooms, ext_th):
@@ -2794,22 +3095,26 @@ class SmartFloorPlanGenerator:
             old = room.x1
             room.x1 += depth
             bx1, by1, bx2, by2 = old, room.y1, room.x1, room.y2
-            iface = Wall(room.x1, room.y1, room.x1, room.y2, ext_th, False, is_balcony_interface=True)
+            iface = Wall(room.x1, room.y1, room.x1, room.y2, ext_th, False,
+                         is_balcony_interface=True)
         elif side == "right":
             old = room.x2
             room.x2 -= depth
             bx1, by1, bx2, by2 = room.x2, room.y1, old, room.y2
-            iface = Wall(room.x2, room.y1, room.x2, room.y2, ext_th, False, is_balcony_interface=True)
+            iface = Wall(room.x2, room.y1, room.x2, room.y2, ext_th, False,
+                         is_balcony_interface=True)
         elif side == "top":
             old = room.y1
             room.y1 += depth
             bx1, by1, bx2, by2 = room.x1, old, room.x2, room.y1
-            iface = Wall(room.x1, room.y1, room.x2, room.y1, ext_th, False, is_balcony_interface=True)
+            iface = Wall(room.x1, room.y1, room.x2, room.y1, ext_th, False,
+                         is_balcony_interface=True)
         elif side == "bottom":
             old = room.y2
             room.y2 -= depth
             bx1, by1, bx2, by2 = room.x1, room.y2, room.x2, old
-            iface = Wall(room.x1, room.y2, room.x2, room.y2, ext_th, False, is_balcony_interface=True)
+            iface = Wall(room.x1, room.y2, room.x2, room.y2, ext_th, False,
+                         is_balcony_interface=True)
         else:
             return None, None
         arch = "large_linear" if max(bx2 - bx1, by2 - by1) > self.size * 0.3 else "compact_box"
@@ -2836,7 +3141,7 @@ class SmartFloorPlanGenerator:
                 walls.append(Wall(b_e, target.y1, w_e, target.y2, target.thickness, True))
         return walls
 
-    def _draw_balcony_features(self, img, balconies, int_th):
+    def _draw_balcony_features(self, img, balconies, int_th, semantic_mask=None):
         labels = []
         for b in balconies:
             w = b.interface_wall
@@ -2872,15 +3177,15 @@ class SmartFloorPlanGenerator:
                                      start + d_len + int(length * 0.05) + w_len))
 
             for el_type, s, e in elements:
-                box = self._draw_interface_element(img, w, s, e, el_type, b.side)
+                box = self._draw_interface_element(img, w, s, e, el_type, b.side,
+                                                    semantic_mask)
                 if box:
                     labels.append((0 if el_type == "door" else 1, *box))
-
         return labels
 
-    def _draw_interface_element(self, img, wall, start, end, el_type, side):
-        """Draw door/window on balcony interface wall.
-        Doors have small opening angle; swing arc drawn probabilistically."""
+    def _draw_interface_element(self, img, wall, start, end, el_type, side,
+                                 semantic_mask=None):
+        """Draw door/window on balcony interface wall."""
         th = wall.thickness
         half_th = th // 2
         is_vert = abs(wall.x1 - wall.x2) < abs(wall.y1 - wall.y2)
@@ -2895,7 +3200,6 @@ class SmartFloorPlanGenerator:
             p1, p2 = (start, cy - half_th), (end, cy + half_th)
 
         cv2.rectangle(img, p1, p2, bg, -1)
-
         line_th = self.rng.randint(1, 2)
         off = max(1, half_th // 8)
 
@@ -2906,59 +3210,148 @@ class SmartFloorPlanGenerator:
             else:
                 cv2.line(img, (start, cy - off), (end, cy - off), wc, line_th, cv2.LINE_AA)
                 cv2.line(img, (start, cy + off), (end, cy + off), wc, line_th, cv2.LINE_AA)
+            if semantic_mask is not None:
+                cv2.rectangle(semantic_mask, p1, p2, UNetSemanticClasses.WINDOW, -1)
         else:
-            # Door: draw slab at small angle
-            door_len = end - start
-            swing_angle = self.rng.uniform(10, 45)
-            if is_vert:
-                swing_dir = 1 if side == "left" else -1
-                orad = np.deg2rad(swing_angle * swing_dir)
-                hp = (cx, start)
-                op = (cx + int(door_len * 0.7 * np.sin(orad)),
-                      start + int(door_len * 0.7 * np.cos(0)))
-                cv2.line(img, hp, op, wc, line_th + 1, cv2.LINE_AA)
-
-                # Probabilistic swing arc
-                if self.rng.random() < self.door_swing_arc_probability:
-                    arc_radius = int(door_len * 0.6)
-                    if swing_dir == 1:
-                        sa, ea = -int(swing_angle), 0
-                    else:
-                        sa, ea = 180, 180 + int(swing_angle)
-                    cv2.ellipse(img, hp, (arc_radius, arc_radius),
-                                0, sa, ea, wc, 1, cv2.LINE_AA)
+            # Door on interface
+            if self.current_door_style == "cross":
+                self._draw_cross_door_at(img, p1, p2, is_vert, wc, bg, line_th,
+                                          semantic_mask, wall_th=th)
             else:
-                swing_dir = 1 if side == "top" else -1
-                orad = np.deg2rad(swing_angle * swing_dir)
-                hp = (start, cy)
-                op = (start + int(door_len * 0.7),
-                      cy + int(door_len * 0.7 * np.sin(orad)))
-                cv2.line(img, hp, op, wc, line_th + 1, cv2.LINE_AA)
-
-                # Probabilistic swing arc
-                if self.rng.random() < self.door_swing_arc_probability:
-                    arc_radius = int(door_len * 0.6)
-                    if swing_dir == 1:
-                        sa, ea = 90 - int(swing_angle), 90
-                    else:
-                        sa, ea = 270, 270 + int(swing_angle)
-                    cv2.ellipse(img, hp, (arc_radius, arc_radius),
-                                0, sa, ea, wc, 1, cv2.LINE_AA)
+                door_len = end - start
+                swing_angle = self.rng.uniform(10, 45)
+                if is_vert:
+                    swing_dir = 1 if side == "left" else -1
+                    orad = np.deg2rad(swing_angle * swing_dir)
+                    hp = (cx, start)
+                    op = (cx + int(door_len * 0.7 * np.sin(orad)),
+                          start + int(door_len * 0.7 * np.cos(0)))
+                    cv2.line(img, hp, op, wc, line_th + 1, cv2.LINE_AA)
+                    if self.rng.random() < self.door_swing_arc_probability:
+                        arc_radius = int(door_len * 0.6)
+                        if swing_dir == 1:
+                            sa, ea = -int(swing_angle), 0
+                        else:
+                            sa, ea = 180, 180 + int(swing_angle)
+                        cv2.ellipse(img, hp, (arc_radius, arc_radius),
+                                    0, sa, ea, wc, 1, cv2.LINE_AA)
+                else:
+                    swing_dir = 1 if side == "top" else -1
+                    orad = np.deg2rad(swing_angle * swing_dir)
+                    hp = (start, cy)
+                    op = (start + int(door_len * 0.7),
+                          cy + int(door_len * 0.7 * np.sin(orad)))
+                    cv2.line(img, hp, op, wc, line_th + 1, cv2.LINE_AA)
+                    if self.rng.random() < self.door_swing_arc_probability:
+                        arc_radius = int(door_len * 0.6)
+                        if swing_dir == 1:
+                            sa, ea = 90 - int(swing_angle), 90
+                        else:
+                            sa, ea = 270, 270 + int(swing_angle)
+                        cv2.ellipse(img, hp, (arc_radius, arc_radius),
+                                    0, sa, ea, wc, 1, cv2.LINE_AA)
+            if semantic_mask is not None:
+                cv2.rectangle(semantic_mask, p1, p2, UNetSemanticClasses.DOOR, -1)
 
         return self._points_to_yolo([p1, p2])
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # NEW: Cross-type door drawing
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _draw_cross_door_at(self, img, p1, p2, is_vert, wc, bg, line_th,
+                             semantic_mask=None, wall_th=None):
+        """
+        Draw a ridge-type door symbol:
+        - Two parallel lines at the outer edges of the door opening,
+          matching the wall thickness (i.e. the full width/height of p1→p2).
+        - A thin perpendicular line through the lengthwise midpoint of the
+          opening that crosses both parallel lines and extends beyond them.
+
+        If is_vert=True  (wall runs vertically):
+            Parallel lines are vertical (left/right edges), ridge is horizontal.
+        If is_vert=False (wall runs horizontally):
+            Parallel lines are horizontal (top/bottom edges), ridge is vertical.
+        """
+        x1, y1 = p1
+        x2, y2 = p2
+        w = x2 - x1   # width  of the bounding box
+        h = y2 - y1   # height of the bounding box
+
+        # Clear the area with background
+        cv2.rectangle(img, p1, p2, bg, -1)
+
+        # All lines share the same stroke weight (parallel_th = line_th + 1).
+        # wall_th is used only to compute the ridge overshoot distance.
+        parallel_th = max(1, line_th + 1)
+        # Ridge extends at least wall_th beyond each parallel line on both sides
+        overshoot = max(4, wall_th if wall_th is not None else 8)
+
+        if is_vert:
+            # Two vertical parallel lines at the LEFT and RIGHT edges of the box
+            cv2.line(img, (x1, y1), (x1, y2), wc, parallel_th, cv2.LINE_AA)
+            cv2.line(img, (x2, y1), (x2, y2), wc, parallel_th, cv2.LINE_AA)
+
+            # Horizontal ridge at vertical midpoint — same stroke weight, extends beyond
+            cy = (y1 + y2) // 2
+            cv2.line(img, (x1 - overshoot, cy), (x2 + overshoot, cy),
+                     wc, parallel_th, cv2.LINE_AA)
+
+            # Separation caps: short horizontal lines at the top and bottom
+            # of the door opening, contained within the wall outline (x1..x2)
+            cv2.line(img, (x1, y1), (x2, y1), wc, parallel_th, cv2.LINE_AA)
+            cv2.line(img, (x1, y2), (x2, y2), wc, parallel_th, cv2.LINE_AA)
+        else:
+            # Two horizontal parallel lines at the TOP and BOTTOM edges of the box
+            cv2.line(img, (x1, y1), (x2, y1), wc, parallel_th, cv2.LINE_AA)
+            cv2.line(img, (x1, y2), (x2, y2), wc, parallel_th, cv2.LINE_AA)
+
+            # Vertical ridge at horizontal midpoint — same stroke weight, extends beyond
+            cx = (x1 + x2) // 2
+            cv2.line(img, (cx, y1 - overshoot), (cx, y2 + overshoot),
+                     wc, parallel_th, cv2.LINE_AA)
+
+            # Separation caps: short vertical lines at the left and right
+            # edges of the door opening, contained within the wall outline (y1..y2)
+            cv2.line(img, (x1, y1), (x1, y2), wc, parallel_th, cv2.LINE_AA)
+            cv2.line(img, (x2, y1), (x2, y2), wc, parallel_th, cv2.LINE_AA)
+
+        # Mark on semantic mask: gap rectangle + ridge overshoot line
+        if semantic_mask is not None:
+            cv2.rectangle(semantic_mask, p1, p2, UNetSemanticClasses.DOOR, -1)
+            if is_vert:
+                cy = (y1 + y2) // 2
+                cv2.line(semantic_mask,
+                         (x1 - overshoot, cy), (x2 + overshoot, cy),
+                         UNetSemanticClasses.DOOR, max(1, parallel_th))
+            else:
+                cx = (x1 + x2) // 2
+                cv2.line(semantic_mask,
+                         (cx, y1 - overshoot), (cx, y2 + overshoot),
+                         UNetSemanticClasses.DOOR, max(1, parallel_th))
+
     # ── Windows — VARIED VISUAL TYPES ─────────────────────────────────────────
-    def _place_window(self, img, w):
+    def _place_window(self, img, w: Wall, semantic_mask=None):
+        """Place a window on an external wall.
+        Border/cap lines match the wall contour thickness.
+        Interior pane lines use a lighter blueprint weight.
+        Gap between parallel lines scales with wall thickness.
+        """
         pad = max(20, int(self.size * 0.01))
         is_horiz = abs(w.x2 - w.x1) > abs(w.y2 - w.y1)
         bg = self.theme.background
-        wc = self.theme.window_color
+        wc = self.theme.wall_color
+
+        # 10 % chance: collapse to a single centre line regardless of sub-type
+        single_line_mode = self.rng.random() < 0.10
 
         # Pick window visual sub-type
         window_subtype = self.rng.choices(
             ["single", "double", "triple", "french", "slit"],
             weights=[0.30, 0.25, 0.15, 0.15, 0.15]
         )[0]
+        if single_line_mode:
+            window_subtype = "slit"
 
         # Size selection based on sub-type
         if window_subtype == "slit":
@@ -2967,12 +3360,26 @@ class SmartFloorPlanGenerator:
             length_ratios = (0.04, 0.05, 0.06, 0.07, 0.08, 0.09, 0.10)
         elif window_subtype == "french":
             length_ratios = (0.05, 0.06, 0.07, 0.08)
-        else:  # single
+        else:
             length_ratios = self.window_length_ratios
 
         typical_lengths = [int(self.size * r) for r in length_ratios]
-        line_th = self.rng.randint(1, 2)
-        gap_w = self.rng.randint(1, 8)
+
+        # Border / separation-cap thickness — matches outlined wall contour weight
+        # (same formula as contour_th in draw_walls: thickness//5, clamped 1..3)
+        border_th = min(3, max(1, max(2, w.thickness // 5)))
+
+        # Interior pane line thickness — one step lighter than the border
+        line_th = max(1, border_th - 1) if border_th > 1 else 1
+
+        # Gap between the two parallel window lines scales with wall thickness
+        # so thicker walls get a visually proportional gap.
+        if single_line_mode:
+            gap_w = 0
+        else:
+            gap_min = max(border_th * 2, int(w.thickness * 0.20))
+            gap_max = max(gap_min + 1, int(w.thickness * 0.45))
+            gap_w = self.rng.randint(gap_min, gap_max)
 
         if is_horiz:
             axis_s, axis_e = min(w.x1, w.x2), max(w.x1, w.x2)
@@ -2981,40 +3388,43 @@ class SmartFloorPlanGenerator:
             avail = axis_e - axis_s - 2 * pad
             if avail <= w.thickness * 2:
                 return None
-
             min_win = max(int(w.thickness * 3), int(avail * 0.15))
             max_win = int(avail * 0.9)
             if min_win > max_win:
                 min_win = max(10, max_win - 10)
             if min_win > max_win or max_win <= 0:
                 return None
-
             cands = [L for L in typical_lengths if min_win <= L <= max_win]
             win_len = self.rng.choice(cands) if cands else self.rng.randint(min_win, max_win)
-
             off_range = avail - win_len
             if off_range < 0:
                 return None
-
             for _ in range(10):
-                start = axis_s + pad + self.rng.randint(0, max(0, off_range))
+                # Bias toward wall edges 70% of the time
+                if off_range > 0 and self.rng.random() < 0.70:
+                    edge_zone = max(1, int(off_range * 0.35))
+                    off = self.rng.randint(0, edge_zone) if self.rng.random() < 0.5 \
+                          else self.rng.randint(max(0, off_range - edge_zone), off_range)
+                else:
+                    off = self.rng.randint(0, max(0, off_range))
+                start = axis_s + pad + off
                 end = start + win_len
-                offset = (gap_w + line_th) // 2
+                offset = gap_w // 2
                 l1y, l2y = center_y - offset, center_y + offset
                 y1, y2 = center_y - half, center_y + half
-
                 if self.furniture_placer.check_collision(start, y1, end, y2, 15):
                     continue
-
-                # Clear the wall area
                 cv2.rectangle(img, (start, y1), (end, y2), bg, -1, cv2.LINE_AA)
-
-                # Draw based on sub-type
                 self._draw_window_subtype(img, window_subtype, True,
                                            start, end, l1y, l2y, y1, y2,
                                            center_y, wc, line_th)
-
+                # Separation caps — same weight as wall border
+                cv2.line(img, (start, y1), (start, y2), wc, border_th, cv2.LINE_AA)
+                cv2.line(img, (end,   y1), (end,   y2), wc, border_th, cv2.LINE_AA)
                 self.furniture_placer.add_occupied(start, y1, end, y2, "window")
+                if semantic_mask is not None:
+                    cv2.rectangle(semantic_mask, (start, y1), (end, y2),
+                                  UNetSemanticClasses.WINDOW, -1)
                 self._add_radiator(img, True, start, end, center_y, w.thickness)
                 return self._points_to_yolo([(start, y1), (end, y2)])
         else:
@@ -3024,77 +3434,71 @@ class SmartFloorPlanGenerator:
             avail = axis_e - axis_s - 2 * pad
             if avail <= w.thickness * 2:
                 return None
-
             min_win = max(int(w.thickness * 3), int(avail * 0.15))
             max_win = int(avail * 0.9)
             if min_win > max_win:
                 min_win = max(10, max_win - 10)
             if min_win > max_win or max_win <= 0:
                 return None
-
             cands = [L for L in typical_lengths if min_win <= L <= max_win]
             win_len = self.rng.choice(cands) if cands else self.rng.randint(min_win, max_win)
-
             off_range = avail - win_len
             if off_range < 0:
                 return None
-
             for _ in range(10):
-                start = axis_s + pad + self.rng.randint(0, max(0, off_range))
+                # Bias toward wall edges 70% of the time
+                if off_range > 0 and self.rng.random() < 0.70:
+                    edge_zone = max(1, int(off_range * 0.35))
+                    off = self.rng.randint(0, edge_zone) if self.rng.random() < 0.5 \
+                          else self.rng.randint(max(0, off_range - edge_zone), off_range)
+                else:
+                    off = self.rng.randint(0, max(0, off_range))
+                start = axis_s + pad + off
                 end = start + win_len
-                offset = (gap_w + line_th) // 2
+                offset = gap_w // 2
                 l1x, l2x = center_x - offset, center_x + offset
                 x1, x2 = center_x - half, center_x + half
-
                 if self.furniture_placer.check_collision(x1, start, x2, end, 15):
                     continue
-
                 cv2.rectangle(img, (x1, start), (x2, end), bg, -1, cv2.LINE_AA)
-
                 self._draw_window_subtype(img, window_subtype, False,
                                            start, end, l1x, l2x, x1, x2,
                                            center_x, wc, line_th)
-
+                # Separation caps — same weight as wall border
+                cv2.line(img, (x1, start), (x2, start), wc, border_th, cv2.LINE_AA)
+                cv2.line(img, (x1, end),   (x2, end),   wc, border_th, cv2.LINE_AA)
                 self.furniture_placer.add_occupied(x1, start, x2, end, "window")
+                if semantic_mask is not None:
+                    cv2.rectangle(semantic_mask, (x1, start), (x2, end),
+                                  UNetSemanticClasses.WINDOW, -1)
                 self._add_radiator(img, False, start, end, center_x, w.thickness)
                 return self._points_to_yolo([(x1, start), (x2, end)])
-
         return None
 
     def _draw_window_subtype(self, img, subtype, is_horiz,
                               start, end, l1, l2, bound1, bound2,
                               center, wc, line_th):
-        """
-        Draw window visual based on sub-type.
-        For horiz windows: l1/l2 are y-coords of the two lines, start/end are x range.
-        For vert windows: l1/l2 are x-coords, start/end are y range.
-        """
         win_len = end - start
-
         if is_horiz:
             if subtype == "slit":
-                # Single thin line in the middle
                 mid_y = (l1 + l2) // 2
                 cv2.line(img, (start, mid_y), (end, mid_y), wc, line_th, cv2.LINE_AA)
             elif subtype == "single":
-                # Two parallel lines
                 cv2.line(img, (start, l1), (end, l1), wc, line_th, cv2.LINE_AA)
                 cv2.line(img, (start, l2), (end, l2), wc, line_th, cv2.LINE_AA)
             elif subtype == "double":
-                # Two parallel lines + vertical mullion in center
                 cv2.line(img, (start, l1), (end, l1), wc, line_th, cv2.LINE_AA)
                 cv2.line(img, (start, l2), (end, l2), wc, line_th, cv2.LINE_AA)
                 mid_x = (start + end) // 2
                 cv2.line(img, (mid_x, l1), (mid_x, l2), wc, line_th, cv2.LINE_AA)
             elif subtype == "triple":
-                # Two parallel lines + 2 vertical mullions (3 panes)
                 cv2.line(img, (start, l1), (end, l1), wc, line_th, cv2.LINE_AA)
                 cv2.line(img, (start, l2), (end, l2), wc, line_th, cv2.LINE_AA)
                 third = win_len // 3
                 cv2.line(img, (start + third, l1), (start + third, l2), wc, line_th, cv2.LINE_AA)
-                cv2.line(img, (start + 2 * third, l1), (start + 2 * third, l2), wc, line_th, cv2.LINE_AA)
+                cv2.line(img, (start + 2 * third, l1), (start + 2 * third, l2), wc, line_th,
+                         cv2.LINE_AA)
             elif subtype == "french":
-                # Cross pattern: 2 horizontal + 1 vertical + 1 horizontal mid
                 cv2.line(img, (start, l1), (end, l1), wc, line_th, cv2.LINE_AA)
                 cv2.line(img, (start, l2), (end, l2), wc, line_th, cv2.LINE_AA)
                 mid_x = (start + end) // 2
@@ -3102,7 +3506,6 @@ class SmartFloorPlanGenerator:
                 mid_y = (l1 + l2) // 2
                 cv2.line(img, (start, mid_y), (end, mid_y), wc, max(1, line_th - 1), cv2.LINE_AA)
         else:
-            # Vertical window — l1/l2 are x-coords, start/end are y range
             if subtype == "slit":
                 mid_x = (l1 + l2) // 2
                 cv2.line(img, (mid_x, start), (mid_x, end), wc, line_th, cv2.LINE_AA)
@@ -3119,7 +3522,8 @@ class SmartFloorPlanGenerator:
                 cv2.line(img, (l2, start), (l2, end), wc, line_th, cv2.LINE_AA)
                 third = win_len // 3
                 cv2.line(img, (l1, start + third), (l2, start + third), wc, line_th, cv2.LINE_AA)
-                cv2.line(img, (l1, start + 2 * third), (l2, start + 2 * third), wc, line_th, cv2.LINE_AA)
+                cv2.line(img, (l1, start + 2 * third), (l2, start + 2 * third), wc, line_th,
+                         cv2.LINE_AA)
             elif subtype == "french":
                 cv2.line(img, (l1, start), (l1, end), wc, line_th, cv2.LINE_AA)
                 cv2.line(img, (l2, start), (l2, end), wc, line_th, cv2.LINE_AA)
@@ -3128,14 +3532,24 @@ class SmartFloorPlanGenerator:
                 mid_x = (l1 + l2) // 2
                 cv2.line(img, (mid_x, start), (mid_x, end), wc, max(1, line_th - 1), cv2.LINE_AA)
 
-    # ── Doors — NO SWING ARC, SMALLER ANGLE ──────────────────────────────────
-    def _place_door(self, img, w, occupied_spans):
-        """Place a door as a rotated rectangle slab. Swing arc drawn probabilistically."""
-        door_th = self.rng.randint(2, 7)
+    # ── Doors — SLAB + NEW CROSS STYLE ────────────────────────────────────────
+    def _place_door(self, img, w, occupied_spans, semantic_mask=None):
+        """Place a door. Style depends on self.current_door_style."""
+        if self.current_door_style == "cross":
+            return self._place_cross_door(img, w, occupied_spans, semantic_mask)
+        else:
+            return self._place_slab_door(img, w, occupied_spans, semantic_mask)
+
+    def _place_cross_door(self, img, w, occupied_spans, semantic_mask=None):
+        """
+        Place a cross-type door:
+        Double-stroke wall segment crossed by a thin perpendicular line with serifs.
+        """
         pad = max(40, int(w.thickness * 2.5))
         is_horiz = abs(w.x2 - w.x1) > abs(w.y2 - w.y1)
         bg = self.theme.background
-        wc = self.theme.door_color
+        wc = self.theme.wall_color
+        line_th = self._blueprint_line_th(1.0, 2.0)
 
         if is_horiz:
             axis_s, axis_e = min(w.x1, w.x2), max(w.x1, w.x2)
@@ -3146,86 +3560,137 @@ class SmartFloorPlanGenerator:
             door_len = int(self.size * self.rng.choice(self.door_length_ratios))
             if door_len > avail * 0.9:
                 return None
-
             for _ in range(10):
                 usable = avail - door_len
                 if usable <= 0:
                     return None
                 gap_s = axis_s + pad + self.rng.randint(0, usable)
                 gap_e = gap_s + door_len
-
                 if any(not (gap_e <= s or gap_s >= e) for s, e in occupied_spans):
                     continue
-
                 half = w.thickness // 2
                 y1, y2 = center_y - half, center_y + half
+                bbox = (gap_s, y1, gap_e, y2)
+                if self.furniture_placer.check_collision(*bbox, 20):
+                    continue
+                occupied_spans.append((gap_s, gap_e))
 
-                # Door opening angle: small (10-45 degrees)
-                swing = self.rng.uniform(10, 90)
+                p1 = (gap_s, y1)
+                p2 = (gap_e, y2)
+                self._draw_cross_door_at(img, p1, p2, False, wc, bg, line_th,
+                                          semantic_mask, wall_th=w.thickness)
+                self.furniture_placer.add_occupied(*bbox, "door")
+                return self._points_to_yolo([p1, p2])
+        else:
+            axis_s, axis_e = min(w.y1, w.y2), max(w.y1, w.y2)
+            center_x = (w.x1 + w.x2) // 2
+            avail = axis_e - axis_s - 2 * pad
+            if avail <= w.thickness * 2:
+                return None
+            door_len = int(self.size * self.rng.choice(self.door_length_ratios))
+            if door_len > avail * 0.9:
+                return None
+            for _ in range(10):
+                usable = avail - door_len
+                if usable <= 0:
+                    return None
+                gap_s = axis_s + pad + self.rng.randint(0, usable)
+                gap_e = gap_s + door_len
+                if any(not (gap_e <= s or gap_s >= e) for s, e in occupied_spans):
+                    continue
+                half = w.thickness // 2
+                x1, x2 = center_x - half, center_x + half
+                bbox = (x1, gap_s, x2, gap_e)
+                if self.furniture_placer.check_collision(*bbox, 20):
+                    continue
+                occupied_spans.append((gap_s, gap_e))
+
+                p1 = (x1, gap_s)
+                p2 = (x2, gap_e)
+                self._draw_cross_door_at(img, p1, p2, True, wc, bg, line_th,
+                                          semantic_mask, wall_th=w.thickness)
+                self.furniture_placer.add_occupied(*bbox, "door")
+                return self._points_to_yolo([p1, p2])
+        return None
+
+    def _place_slab_door(self, img, w, occupied_spans, semantic_mask=None):
+        """Slab-style door: gap cleared to background, body + swing arc drawn
+        outside the gap on the room side, both written to the segmentation mask."""
+        door_th = self._blueprint_line_th(1.0, 3.0)
+        pad = max(40, int(w.thickness * 2.5))
+        is_horiz = abs(w.x2 - w.x1) > abs(w.y2 - w.y1)
+        bg = self.theme.background
+        wc = self.theme.wall_color
+
+        if is_horiz:
+            axis_s, axis_e = min(w.x1, w.x2), max(w.x1, w.x2)
+            center_y = (w.y1 + w.y2) // 2
+            avail = axis_e - axis_s - 2 * pad
+            if avail <= w.thickness * 2:
+                return None
+            door_len = int(self.size * self.rng.choice(self.door_length_ratios))
+            if door_len > avail * 0.9:
+                return None
+            for _ in range(10):
+                usable = avail - door_len
+                if usable <= 0:
+                    return None
+                gap_s = axis_s + pad + self.rng.randint(0, usable)
+                gap_e = gap_s + door_len
+                if any(not (gap_e <= s or gap_s >= e) for s, e in occupied_spans):
+                    continue
+                half = w.thickness // 2
+                y1, y2 = center_y - half, center_y + half
+                # Hinge at one longitudinal end; door opens to the room side
                 hinge_left = self.rng.choice([True, False])
-                open_up = self.rng.choice([True, False])
-
-                if hinge_left:
-                    hp = (gap_s, center_y)
-                    angle_deg = -swing if open_up else swing
-                else:
-                    hp = (gap_e, center_y)
-                    angle_deg = 180 + swing if open_up else 180 - swing
-
+                open_up    = self.rng.choice([True, False])   # which room side
+                hinge_x    = gap_s if hinge_left else gap_e
+                hinge_y    = y1    if open_up    else y2
+                hp         = (hinge_x, hinge_y)
+                # Angle: door slab lies along wall (0° or 180°) and swings outward
+                base_angle = 0.0 if hinge_left else 180.0
+                swing      = self.rng.uniform(10, 90)
+                angle_deg  = base_angle + swing * (-1 if open_up else 1)
                 orad = np.deg2rad(angle_deg)
                 op = (hp[0] + int(door_len * np.cos(orad)),
                       hp[1] + int(door_len * np.sin(orad)))
-
                 perp = orad + np.pi / 2
-                dx, dy = int(door_th / 2 * np.cos(perp)), int(door_th / 2 * np.sin(perp))
+                dx = int(door_th / 2 * np.cos(perp))
+                dy = int(door_th / 2 * np.sin(perp))
                 corners = np.array([
                     [hp[0] - dx, hp[1] - dy], [hp[0] + dx, hp[1] + dy],
                     [op[0] + dx, op[1] + dy], [op[0] - dx, op[1] - dy],
                 ], dtype=np.int32)
-
                 all_x = [p[0] for p in corners] + [gap_s, gap_e]
                 all_y = [p[1] for p in corners] + [y1, y2]
                 bbox = (min(all_x), min(all_y), max(all_x), max(all_y))
-
                 if self.furniture_placer.check_collision(*bbox, 20):
                     continue
-
                 occupied_spans.append((gap_s, gap_e))
-
-                # Clear the wall gap
+                # Clear gap to background
                 cv2.rectangle(img, (gap_s, y1), (gap_e, y2), bg, -1, cv2.LINE_AA)
-
-                # Draw door slab (filled polygon)
+                # Draw door body (outside the gap)
                 cv2.fillPoly(img, [corners], bg, cv2.LINE_AA)
-                cv2.polylines(img, [corners], True, wc, 1, cv2.LINE_AA)
-
-                # Probabilistically draw swing arc
-                if self.rng.random() < self.door_swing_arc_probability:
-                    arc_radius = int(door_len * 0.7)
-                    if open_up:
-                        start_angle = 0 if hinge_left else 180 - swing
-                        end_angle = swing if hinge_left else 180
-                        if not hinge_left:
-                            start_angle, end_angle = 180, 180 + swing
-                    else:
-                        if hinge_left:
-                            start_angle, end_angle = 360 - swing, 360
-                        else:
-                            start_angle, end_angle = 180 - swing, 180
-
-                    # Simplified: compute arc from 0 to swing degrees
-                    if hinge_left and open_up:
-                        sa, ea = -int(swing), 0
-                    elif hinge_left and not open_up:
-                        sa, ea = 0, int(swing)
-                    elif not hinge_left and open_up:
-                        sa, ea = 180, 180 + int(swing)
-                    else:
-                        sa, ea = 180 - int(swing), 180
-
+                cv2.polylines(img, [corners], True, wc, door_th, cv2.LINE_AA)
+                # Swing arc — spans from closed position (along wall) to open (angle_deg)
+                draw_arc = self.rng.random() < self.door_swing_arc_probability
+                if draw_arc:
+                    arc_radius = int(door_len * 0.85)
+                    closed_angle = 0.0 if hinge_left else 180.0
+                    arc_sa = min(closed_angle, angle_deg)
+                    arc_ea = max(closed_angle, angle_deg)
                     cv2.ellipse(img, hp, (arc_radius, arc_radius),
-                                0, sa, ea, wc, 1, cv2.LINE_AA)
-
+                                0, arc_sa, arc_ea, wc, door_th, cv2.LINE_AA)
+                # Segmentation mask: gap + body polygon + arc
+                if semantic_mask is not None:
+                    cv2.rectangle(semantic_mask, (gap_s, y1), (gap_e, y2),
+                                  UNetSemanticClasses.DOOR, -1)
+                    cv2.fillPoly(semantic_mask, [corners], UNetSemanticClasses.DOOR)
+                    if draw_arc:
+                        mask_arc_th = max(door_th, 3)
+                        cv2.ellipse(semantic_mask, hp, (arc_radius, arc_radius),
+                                    0, arc_sa, arc_ea,
+                                    UNetSemanticClasses.DOOR, mask_arc_th)
                 self.furniture_placer.add_occupied(*bbox, "door")
                 return self._points_to_yolo([(gap_s, y1), (gap_e, y2), op])
         else:
@@ -3237,73 +3702,68 @@ class SmartFloorPlanGenerator:
             door_len = int(self.size * self.rng.choice(self.door_length_ratios))
             if door_len > avail * 0.9:
                 return None
-
             for _ in range(10):
                 usable = avail - door_len
                 if usable <= 0:
                     return None
                 gap_s = axis_s + pad + self.rng.randint(0, usable)
                 gap_e = gap_s + door_len
-
                 if any(not (gap_e <= s or gap_s >= e) for s, e in occupied_spans):
                     continue
-
                 half = w.thickness // 2
                 x1, x2 = center_x - half, center_x + half
-
-                swing = self.rng.uniform(10, 45)
-                hinge_top = self.rng.choice([True, False])
-                open_right = self.rng.choice([True, False])
-
-                if hinge_top:
-                    hp = (center_x, gap_s)
-                    angle_deg = 90 - swing if open_right else 90 + swing
-                else:
-                    hp = (center_x, gap_e)
-                    angle_deg = 270 + swing if open_right else 270 - swing
-
+                hinge_top   = self.rng.choice([True, False])
+                open_right  = self.rng.choice([True, False])
+                hinge_y     = gap_s if hinge_top  else gap_e
+                hinge_x     = x2   if open_right  else x1
+                hp          = (hinge_x, hinge_y)
+                base_angle  = 90.0 if hinge_top else 270.0
+                swing       = self.rng.uniform(10, 90)
+                # open_right → cos(orad) must be >0 → subtract swing from base
+                # open_left  → cos(orad) must be <0 → add swing to base
+                angle_deg   = base_angle - swing if open_right else base_angle + swing
                 orad = np.deg2rad(angle_deg)
                 op = (hp[0] + int(door_len * np.cos(orad)),
                       hp[1] + int(door_len * np.sin(orad)))
-
                 perp = orad + np.pi / 2
-                dx, dy = int(door_th / 2 * np.cos(perp)), int(door_th / 2 * np.sin(perp))
+                dx = int(door_th / 2 * np.cos(perp))
+                dy = int(door_th / 2 * np.sin(perp))
                 corners = np.array([
                     [hp[0] - dx, hp[1] - dy], [hp[0] + dx, hp[1] + dy],
                     [op[0] + dx, op[1] + dy], [op[0] - dx, op[1] - dy],
                 ], dtype=np.int32)
-
                 all_x = [p[0] for p in corners] + [x1, x2]
                 all_y = [p[1] for p in corners] + [gap_s, gap_e]
                 bbox = (min(all_x), min(all_y), max(all_x), max(all_y))
-
                 if self.furniture_placer.check_collision(*bbox, 20):
                     continue
-
                 occupied_spans.append((gap_s, gap_e))
-
+                # Clear gap to background
                 cv2.rectangle(img, (x1, gap_s), (x2, gap_e), bg, -1, cv2.LINE_AA)
+                # Draw door body (outside the gap)
                 cv2.fillPoly(img, [corners], bg, cv2.LINE_AA)
-                cv2.polylines(img, [corners], True, wc, 1, cv2.LINE_AA)
-
-                # Probabilistically draw swing arc
-                if self.rng.random() < self.door_swing_arc_probability:
-                    arc_radius = int(door_len * 0.7)
-                    if hinge_top and open_right:
-                        sa, ea = 90 - int(swing), 90
-                    elif hinge_top and not open_right:
-                        sa, ea = 90, 90 + int(swing)
-                    elif not hinge_top and open_right:
-                        sa, ea = 270, 270 + int(swing)
-                    else:
-                        sa, ea = 270 - int(swing), 270
-
+                cv2.polylines(img, [corners], True, wc, door_th, cv2.LINE_AA)
+                # Swing arc — spans from closed position (along wall) to open (angle_deg)
+                draw_arc = self.rng.random() < self.door_swing_arc_probability
+                if draw_arc:
+                    arc_radius = int(door_len * 0.85)
+                    closed_angle = 90.0 if hinge_top else 270.0
+                    arc_sa = min(closed_angle, angle_deg)
+                    arc_ea = max(closed_angle, angle_deg)
                     cv2.ellipse(img, hp, (arc_radius, arc_radius),
-                                0, sa, ea, wc, 1, cv2.LINE_AA)
-
+                                0, arc_sa, arc_ea, wc, door_th, cv2.LINE_AA)
+                # Segmentation mask: gap + body polygon + arc
+                if semantic_mask is not None:
+                    cv2.rectangle(semantic_mask, (x1, gap_s), (x2, gap_e),
+                                  UNetSemanticClasses.DOOR, -1)
+                    cv2.fillPoly(semantic_mask, [corners], UNetSemanticClasses.DOOR)
+                    if draw_arc:
+                        mask_arc_th = max(door_th, 3)
+                        cv2.ellipse(semantic_mask, hp, (arc_radius, arc_radius),
+                                    0, arc_sa, arc_ea,
+                                    UNetSemanticClasses.DOOR, mask_arc_th)
                 self.furniture_placer.add_occupied(*bbox, "door")
                 return self._points_to_yolo([(x1, gap_s), (x2, gap_e), op])
-
         return None
 
     def _add_radiator(self, img, horizontal, axis_start, axis_end,
@@ -3316,7 +3776,6 @@ class SmartFloorPlanGenerator:
         rad_len = int(length * self.rng.uniform(0.7, 0.9))
         rad_h = max(3, int(wall_th * self.rng.uniform(0.6, 0.9)))
         gap = max(3, int(wall_th * self.rng.uniform(0.2, 0.6)))
-
         if horizontal:
             idir = 1 if center_coord < self.size // 2 else -1
             cx = (axis_start + axis_end) // 2
@@ -3387,13 +3846,22 @@ class SmartFloorPlanGenerator:
             min(max(h, 0.0), 1.0),
         )
 
-    def _apply_rotation(self, img, labels):
+    def _apply_rotation(self, img, labels, mask=None):
         size = img.shape[0]
         angle = self.rng.uniform(-15, 15)
         center = (size // 2, size // 2)
         M = cv2.getRotationMatrix2D(center, angle, 1.0)
         bg = self.theme.background
         rotated = cv2.warpAffine(img, M, (size, size), borderValue=bg)
+
+        # Rotate mask with NEAREST interpolation to preserve class IDs
+        rotated_mask = None
+        if mask is not None:
+            rotated_mask = cv2.warpAffine(mask, M, (size, size),
+                                          flags=cv2.INTER_NEAREST,
+                                          borderMode=cv2.BORDER_CONSTANT,
+                                          borderValue=0)
+
         a_rad = np.deg2rad(angle)
         cos_a, sin_a = np.cos(a_rad), np.sin(a_rad)
         new_labels = []
@@ -3403,16 +3871,20 @@ class SmartFloorPlanGenerator:
             x_rot = xr * cos_a - yr * sin_a + center[0]
             y_rot = xr * sin_a + yr * cos_a + center[1]
             new_labels.append((cls_id, x_rot / size, y_rot / size, w, h))
-        return rotated, new_labels
+        return rotated, new_labels, rotated_mask
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 12. CLI ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# Alias so that main() can refer to DatasetGenerator interchangeably
+DatasetGenerator = SmartFloorPlanGenerator
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="SmartFloorPlanGenerator v5.0 — Professional Procedural Engine"
+        description="SmartFloorPlanGenerator v6.0 — Professional Procedural Engine"
     )
     parser.add_argument("--output", type=str, default="smart_dataset")
     parser.add_argument("--count", type=int, default=10)
@@ -3433,61 +3905,106 @@ def main():
                         choices=["png", "svg", "dxf", "json"])
     parser.add_argument("--strategies", nargs="+",
                         default=["central", "linear", "radial", "bsp",
-                                 "voronoi", "graph", "open_plan",
-                                 "asymmetric", "courtyard"])
+                                 "graph", "open_plan",
+                                 "asymmetric", "courtyard", "spine"])
     parser.add_argument("--min-rooms", type=int, default=3)
     parser.add_argument("--max-rooms", type=int, default=6)
     parser.add_argument("--multi-story", action="store_true")
     parser.add_argument("--floors", type=int, default=1)
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--solver", type=str, default="proportional",
-                        choices=["proportional", "pulp"])
-    parser.add_argument("--no-metadata", action="store_true")
+                        choices=["proportional",
+                                 "ilp", "kiwi"])
+    parser.add_argument("--wall-draw-style", type=str, default="random",
+                        choices=["solid", "outlined", "random"])
+    parser.add_argument("--door-draw-style", type=str, default="random",
+                        choices=["slab", "cross", "random"])
+    parser.add_argument("--no-unet-masks", action="store_true",
+                        help="Disable U-Net segmentation mask generation")
+    parser.add_argument("--unet-colorized", action="store_true",
+                        help="Also save colorized U-Net mask visualization")
+    parser.add_argument("--no-aug", action="store_true",
+                        help="Disable visual augmentations")
     parser.add_argument("--color-jitter", type=int, default=12,
-                        help="Per-image color jitter intensity (0-40)")
+                        help="Per-image color jitter intensity (0=disabled)")
+    parser.add_argument("--no-metadata", action="store_true",
+                        help="Disable metadata JSON generation")
+    parser.add_argument("--aug-blur-prob", type=float, default=0.4)
+    parser.add_argument("--aug-noise-prob", type=float, default=0.5)
+    parser.add_argument("--aug-jpeg-prob", type=float, default=0.5)
+    parser.add_argument("--aug-brightness", type=float, default=0.15)
+    parser.add_argument("--aug-rotation", type=float, default=5.0)
 
     args = parser.parse_args()
 
+    # ── Load or build config ──────────────────────────────────────────────────
     if args.config:
-        config = FloorPlanConfig.from_yaml(args.config)
+        cfg = FloorPlanConfig.from_yaml(args.config)
     else:
-        config = FloorPlanConfig(
-            style=args.style,
-            building_type=args.building_type,
-            max_rooms=args.max_rooms,
+        cfg = FloorPlanConfig(
+            style=StylePreset(args.style),
+            building_type=BuildingType(args.building_type),
             min_rooms=args.min_rooms,
-            palette_name=args.style,
-            export_formats=args.export,
+            max_rooms=args.max_rooms,
             img_size=args.size,
             super_sampling=args.super_sampling,
             seed=args.seed,
             count=args.count,
             output_dir=args.output,
+            export_formats=[ExportFormat(f) for f in args.export],
             strategies=args.strategies,
-            multi_story=args.multi_story,
-            num_floors=args.floors,
-            constraint_solver=args.solver,
-            generate_metadata_json=not args.no_metadata,
             multi_style=args.multi_style,
             style_rotation_mode=args.style_mode,
             style_themes=args.style_themes,
             style_weights=args.style_weights,
-            vary_strategies=args.vary_all or args.multi_style,
+            vary_strategies=args.vary_all,
             vary_wall_thickness=args.vary_all,
             vary_room_counts=args.vary_all,
             vary_balcony=args.vary_all,
+            multi_story=args.multi_story,
+            num_floors=args.floors,
+            constraint_solver=args.solver,
+            wall_draw_style=args.wall_draw_style,
+            door_draw_style=args.door_draw_style,
+            generate_unet_masks=not args.no_unet_masks,
+            unet_mask_colorized=args.unet_colorized,
+            enable_augmentations=not args.no_aug,
             color_jitter_intensity=args.color_jitter,
+            generate_metadata_json=not args.no_metadata,
+            aug_blur_prob=args.aug_blur_prob,
+            aug_noise_prob=args.aug_noise_prob,
+            aug_jpeg_prob=args.aug_jpeg_prob,
+            aug_brightness_range=args.aug_brightness,
+            aug_rotation_range=args.aug_rotation,
         )
+        # Set palette from style
+        cfg.palette_name = args.style
 
-    gen = SmartFloorPlanGenerator(config=config)
-    gen.generate_dataset()
+    # ── Print config summary ──────────────────────────────────────────────────
+    print("=" * 60)
+    print(f"  SmartFloorPlanGenerator v6.0")
+    print("=" * 60)
+    print(f"  Output dir   : {cfg.output_dir}")
+    print(f"  Count        : {cfg.count}")
+    print(f"  Image size   : {cfg.img_size}px  (super-sampling ×{cfg.super_sampling})")
+    print(f"  Style        : {cfg.palette_name}")
+    print(f"  Building type: {cfg.building_type}")
+    print(f"  Rooms        : {cfg.min_rooms}–{cfg.max_rooms}")
+    print(f"  Strategies   : {', '.join(cfg.strategies)}")
+    print(f"  Solver       : {cfg.constraint_solver}")
+    print(f"  Wall style   : {cfg.wall_draw_style}")
+    print(f"  Door style   : {cfg.door_draw_style}")
+    print(f"  U-Net masks  : {'yes' + (' + colorized' if cfg.unet_mask_colorized else '') if cfg.generate_unet_masks else 'no'}")
+    print(f"  Augmentations: {'yes' if cfg.enable_augmentations else 'no'}")
+    print(f"  Exports      : {', '.join(str(f) for f in cfg.export_formats)}")
+    print("=" * 60)
 
-    print(f"✓ Generated {config.count} floor plans → {config.output_dir}/")
-    print(f"  Theme: {config.palette_name}")
-    print(f"  Strategies: {', '.join(config.strategies)}")
-    print(f"  Formats: {', '.join(str(f) for f in config.export_formats)}")
-    if config.multi_story:
-        print(f"  Floors: {config.num_floors}")
+    # ── Run generation ────────────────────────────────────────────────────────
+    generator = DatasetGenerator(cfg)
+    generator.generate_dataset()
+
+    print("\n✓ Dataset generation complete.")
+    print(f"  → {os.path.abspath(cfg.output_dir)}")
 
 
 if __name__ == "__main__":

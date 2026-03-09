@@ -1,10 +1,10 @@
 """
 ================================================================================
 СИСТЕМА АВТОМАТИЧЕСКОГО АНАЛИЗА ПЛАНИРОВОК КВАРТИР «БРУСНИКА»
-Модуль: Детекция стен — цветовая + структурная фильтрация (walldetector.py)
-Версия: 4.1 — Furniture Filtering Edition
-Автор: Быков Вадим Олегович (оригинал), расширение — Grok
-Дата:  23 февраля 2026 г.
+Модуль: Детекция стен — цветовая + структурная + контурная фильтрация
+Версия: 5.0 — Outline / БТИ Wall Detection Edition
+Автор: Быков Вадим Олегович (оригинал), расширение — Grok, Claude
+Дата:  4 марта 2026 г.
 
 Описание модуля:
   Универсальная детекция стен на планировках квартир.
@@ -12,38 +12,27 @@
     • Залитые цветом стены (оригинальное поведение)
     • Контурные / линейные стены (CAD, сканы, PDF-экспорт)
     • Штрихованные / толстые / двойные линии
+    • Стены-контуры в стиле БТИ (НОВОЕ в v5.0):
+        — Стены изображены как чёрные контуры прямоугольников
+        — Несколько прямоугольников «слиты» в единый контур
+        — Фильтрация цифр, размерных линий, выносок
     • Смешанные обозначения на одном изображении
     • Автоматический выбор стратегии детекции
-    • Фильтрация мебели и внутренних объектов (НОВОЕ в v4.1)
+    • Фильтрация мебели и внутренних объектов
 
-Архитектура:
-  Theme                      — единая дизайн-система: цвета, пороги, константы
-  WallRectangle              — структура данных прямоугольника стены
-  morphological_cleanup      — морфологическая очистка маски
-  ColorBasedWallDetector     — базовый детектор (цветовая фильтрация)
-  VersatileWallDetector      — расширенный детектор (цвет + структура + гибрид)
-                               + фильтрация мебели (v4.1)
+Архитектура (ПОРЯДОК ОПРЕДЕЛЕНИЯ = ПОРЯДОК ЗАВИСИМОСТЕЙ):
+  1. Theme                      — единая дизайн-система: цвета, пороги, константы
+  2. WallRectangle              — структура данных прямоугольника стены
+  3. morphological_cleanup      — морфологическая очистка маски
+  4. ColorBasedWallDetector     — базовый детектор (цветовая фильтрация)
+  5. WallStyleClassifier        — классификатор типа изображения стен (v5.0)
+  6. OutlineWallDetector        — детектор контурных стен БТИ (v5.0)
+     └── наследует ColorBasedWallDetector
+  7. VersatileWallDetector      — расширенный детектор
+     └── наследует ColorBasedWallDetector, использует OutlineWallDetector
 
-Изменения v4.1 vs v4.0:
-  - Theme: добавлены STRUCT_MIN_LINE_RATIO, FURNITURE_MIN_ASPECT_RATIO,
-    MAX_FURNITURE_AREA_RATIO, ANGLE_TOLERANCE_DEG, PARALLEL_* параметры,
-    ROOM_FLOOD_*, STRUCT_MAX_COMPONENTS_BEFORE_FALLBACK
-  - VersatileWallDetector: добавлены методы фильтрации мебели:
-    * _filter_lines_by_geometry — длина + угловая фильтрация линий
-    * _filter_components_by_shape — aspect ratio + fill ratio компонент
-    * _remove_internal_objects — flood-fill удаление внутренней мебели
-    * _filter_furniture_rects — фильтрация прямоугольников по форме/связности
-    * _detect_parallel_wall_pairs — детекция параллельных пар (стены)
-    * _should_fallback_to_color — эвристика фоллбэка при избытке компонент
-  - process() дополнен шагами фильтрации между маской и декомпозицией.
-
-Принципы:
-  - Single Responsibility: каждый класс/функция решает одну задачу
-  - Open/Closed: расширение через наследование, без изменения базового класса
-  - Сбой одного этапа не прерывает обработку
-  - «Магических» чисел нет — все константы вынесены в Theme
-  - Полная обратная совместимость: выходной формат НЕИЗМЕНЕН:
-      (wall_mask: np.ndarray, rectangles: List[WallRectangle], outline_mask: np.ndarray)
+Выходной формат НЕИЗМЕНЕН:
+    (wall_mask: np.ndarray, rectangles: List[WallRectangle], outline_mask: np.ndarray)
 ================================================================================
 """
 
@@ -54,21 +43,17 @@ from dataclasses import dataclass
 
 
 # ============================================================
-# Theme — единая дизайн-система детектора
+# 1. Theme — единая дизайн-система детектора
 # ============================================================
 
 class Theme:
-    """Централизованное хранилище всех констант, порогов и параметров детектора.
-
-    Следует принципу единственной ответственности: изменение любого
-    числового или цветового параметра требует правки только этого класса.
-    """
+    """Централизованное хранилище всех констант, порогов и параметров детектора."""
 
     # --- Морфологические операции ---
     MORPH_KERNEL_SIZE: int = 3
     MORPH_CLOSE_ITERATIONS: int = 2
     MORPH_OPEN_ITERATIONS: int = 1
-    MORPH_COMPONENT_MIN_AREA: int = 5  # ↓ LOWERED from 20: Keep very small components (pillars/short stubs)
+    MORPH_COMPONENT_MIN_AREA: int = 5
 
     # --- Цветовые допуски (HSV) ---
     HSV_H_TOLERANCE: int = 4
@@ -107,16 +92,16 @@ class Theme:
     RECT_STACK_SENTINEL: int = 0
 
     # --- Структурная детекция (v4.0) ---
-    STRUCT_MIN_LINE_LENGTH: int = 5  # ↓ LOWERED from 30/10: Detect very short lines (narrow turns/stubs)
-    STRUCT_HOUGH_THRESHOLD: int = 30  # ↓ LOWERED from 50: Detect more/fainter lines (small features)
-    STRUCT_HOUGH_MAX_GAP: int = 20  # ↑ INCREASED from 10/15: Connect broken small lines (turns/pillars)
-    STRUCT_CANNY_LOW: int = 20  # ↓ LOWERED from 50/30: More sensitive to faint/short edges
-    STRUCT_CANNY_HIGH: int = 100  # ↓ LOWERED from 150/120: Avoid missing weak/small edges
-    STRUCT_CANNY_EDGES_LOW: int = 10  # ↓ LOWERED from 30/20: Even more edge sensitivity
-    STRUCT_CANNY_EDGES_HIGH: int = 60  # ↓ LOWERED from 100/80
-    STRUCT_DILATE_KERNEL: int = 3  # Keep small: Less aggressive for narrow details
-    STRUCT_DILATE_ITERATIONS: int = 1  # ↓ LOWERED from 2: Preserve narrow/short features
-    STRUCT_MIN_WALL_AREA_RATIO: float = 0.0001  # ↓ LOWERED from 0.001/0.0003: Keep tiny wall areas (pillars)
+    STRUCT_MIN_LINE_LENGTH: int = 5
+    STRUCT_HOUGH_THRESHOLD: int = 30
+    STRUCT_HOUGH_MAX_GAP: int = 20
+    STRUCT_CANNY_LOW: int = 20
+    STRUCT_CANNY_HIGH: int = 100
+    STRUCT_CANNY_EDGES_LOW: int = 10
+    STRUCT_CANNY_EDGES_HIGH: int = 60
+    STRUCT_DILATE_KERNEL: int = 3
+    STRUCT_DILATE_ITERATIONS: int = 1
+    STRUCT_MIN_WALL_AREA_RATIO: float = 0.0001
     ADAPTIVE_BLOCK_SIZE: int = 11
     ADAPTIVE_C: int = 2
 
@@ -125,73 +110,83 @@ class Theme:
     AUTO_COLOR_COVERAGE_THRESHOLD: float = 0.015
     AUTO_FUSION_CLOSE_KERNEL: int = 3
 
-    # --- Фильтрация мебели (НОВОЕ в v4.1) ---
-    STRUCT_MIN_LINE_RATIO: float = 0.005  # ↓ LOWERED from 0.015/0.008: Keep shorter lines as % of image diagonal (turns)
-    FURNITURE_MIN_ASPECT_RATIO: float = 1.2  # ↓ LOWERED from 2.5/1.5: Keep squarer shapes
-
-    # Максимальная площадь компоненты как доля от изображения,
-    # ниже которой компактные (низкий aspect) объекты удаляются.
-    # Крупные компоненты сохраняются даже при низком aspect ratio.
+    # --- Фильтрация мебели (v4.1) ---
+    STRUCT_MIN_LINE_RATIO: float = 0.005
+    FURNITURE_MIN_ASPECT_RATIO: float = 1.2
     MAX_FURNITURE_AREA_RATIO: float = 0.005
-
-    # Допуск угла (градусы) для классификации линии как
-    # горизонтальной (0°/180°) или вертикальной (90°).
-    # Линии за пределами этого допуска — диагональные, отбрасываются.
     ANGLE_TOLERANCE_DEG: float = 5.0
-
-    # Максимальная доля заполнения bounding box контуром.
-    # Стены: заполняют bbox на < 70% (вытянутые). Мебель: > 70% (компактные).
     FURNITURE_MAX_FILL_RATIO: float = 0.70
-
-    # Минимальный aspect ratio для прямоугольника декомпозиции.
-    # Квадратные прямоугольники (aspect < 1.5) — вероятная мебель.
     RECT_MIN_ASPECT_RATIO: float = 1.5
-
-    # Минимальная площадь прямоугольника как доля изображения.
-    # Мелкие rect'ы ниже этого порога удаляются.
     RECT_MIN_AREA_RATIO: float = 0.0003
-
-    # Максимальное расстояние (px) для проверки связности прямоугольника
-    # с другими прямоугольниками или краем изображения.
     RECT_CONNECTIVITY_MARGIN_PX: int = 15
 
     # --- Параллельные стены (v4.1) ---
-    # Допуск расстояния между параллельными линиями для
-    # идентификации пары как «двойная стена».
     PARALLEL_DISTANCE_MIN_PX: int = 4
     PARALLEL_DISTANCE_MAX_PX: int = 30
     PARALLEL_ANGLE_TOLERANCE_DEG: float = 3.0
 
-    # --- Удаление внутренних объектов через flood-fill (v4.1) ---
-    # Минимальная площадь замкнутого контура (доля изображения),
-    # чтобы считаться «комнатой» для flood-fill.
+    # --- Удаление внутренних объектов (v4.1) ---
     ROOM_FLOOD_MIN_AREA_RATIO: float = 0.005
-
-    # Размер эрозии при удалении внутренних объектов (px).
     ROOM_FLOOD_ERODE_SIZE: int = 3
 
     # --- Гибридный фоллбэк (v4.1) ---
-    # Если структурная детекция порождает слишком много мелких компонент,
-    # переключаемся на цветовой режим + морфологию.
     STRUCT_MAX_COMPONENTS_BEFORE_FALLBACK: int = 200
+
+    # ==========================================================
+    # КОНТУРНЫЕ / БТИ СТЕНЫ (НОВОЕ v5.0)
+    # ==========================================================
+
+    # --- Классификатор стиля стен ---
+    CLASSIFIER_BLACK_GRAY_THRESH: int = 80
+    CLASSIFIER_OUTLINE_BLACK_RATIO_MIN: float = 0.005
+    CLASSIFIER_OUTLINE_BLACK_RATIO_MAX: float = 0.18
+    CLASSIFIER_FILLED_COVERAGE_MIN: float = 0.015
+    CLASSIFIER_THIN_COMPONENT_RATIO_MIN: float = 0.25
+
+    # --- Извлечение чёрных пикселей ---
+    OUTLINE_BLACK_THRESH: int = 90
+    OUTLINE_ADAPTIVE_BLOCK: int = 25
+    OUTLINE_ADAPTIVE_C: int = 10
+    OUTLINE_USE_ADAPTIVE: bool = True
+
+    # --- Фильтрация текста / цифр ---
+    TEXT_FILTER_MAX_AREA_RATIO: float = 0.0015
+    TEXT_FILTER_MIN_HEIGHT_RATIO: float = 0.005
+    TEXT_FILTER_MAX_HEIGHT_RATIO: float = 0.04
+    TEXT_FILTER_MAX_ASPECT: float = 4.0
+    TEXT_FILTER_MIN_FILL: float = 0.15
+    TEXT_FILTER_MAX_FILL: float = 0.85
+    TEXT_FILTER_CLUSTER_GAP_PX: int = 15
+    TEXT_FILTER_MIN_CLUSTER_SIZE: int = 2
+
+    # --- Фильтрация размерных линий ---
+    DIMLINE_MAX_THIN_DIM_PX: int = 3
+    DIMLINE_MIN_ASPECT: float = 8.0
+    DIMLINE_MAX_AREA_RATIO: float = 0.002
+    DIMLINE_CONNECTIVITY_RADIUS_PX: int = 5
+
+    # --- Заполнение контурных стен ---
+    OUTLINE_FILL_CLOSE_KERNEL: int = 9
+    OUTLINE_FILL_DIRECTIONAL_KERNEL_LENGTH: int = 11
+    OUTLINE_FILL_DIRECTIONAL_KERNEL_WIDTH: int = 3
+    OUTLINE_FILL_CLOSE_ITERATIONS: int = 2
+    OUTLINE_MIN_WALL_AREA_RATIO: float = 0.0003
+
+    # --- Финальная очистка контурного детектора ---
+    OUTLINE_FINAL_OPEN_KERNEL: int = 3
+    OUTLINE_FINAL_OPEN_ITERATIONS: int = 1
+    OUTLINE_MIN_FILLED_COMPONENT_RATIO: float = 0.0005
+    OUTLINE_MIN_RECTANGULARITY: float = 0.3
+    OUTLINE_ROOM_HOLE_MIN_RATIO: float = 0.003
 
 
 # ============================================================
-# СТРУКТУРЫ ДАННЫХ
+# 2. СТРУКТУРЫ ДАННЫХ
 # ============================================================
 
 @dataclass
 class WallRectangle:
-    """Осе-ориентированный прямоугольник, аппроксимирующий часть маски стен.
-
-    Атрибуты:
-        id:             уникальный идентификатор прямоугольника.
-        x1, y1:         левый верхний угол (включительно).
-        x2, y2:         правый нижний угол (включительно).
-        width, height:  размеры прямоугольника.
-        area:           площадь прямоугольника.
-        outline:        4 точки контура прямоугольника.
-    """
+    """Осе-ориентированный прямоугольник, аппроксимирующий часть маски стен."""
 
     id: int
     x1: int
@@ -205,37 +200,22 @@ class WallRectangle:
 
 
 # ============================================================
-# МОРФОЛОГИЧЕСКИЕ ОПЕРАЦИИ
+# 3. МОРФОЛОГИЧЕСКИЕ ОПЕРАЦИИ
 # ============================================================
 
 def morphological_cleanup(mask: np.ndarray) -> np.ndarray:
-    """Морфологическая очистка маски стен.
-
-    Выполняет закрытие дыр, удаление мелких шумов и фильтрацию
-    по минимальной площади связных компонент.
-
-    Параметры:
-        mask: входная бинарная маска.
-
-    Возвращает:
-        Очищенную бинарную маску.
-    """
+    """Морфологическая очистка маски стен."""
     kernel_small = np.ones(
         (Theme.MORPH_KERNEL_SIZE, Theme.MORPH_KERNEL_SIZE), np.uint8
     )
-
-    # Закрытие дыр внутри стен
     mask = cv2.morphologyEx(
         mask, cv2.MORPH_CLOSE, kernel_small,
         iterations=Theme.MORPH_CLOSE_ITERATIONS,
     )
-    # Удаление мелкого шума
     mask = cv2.morphologyEx(
         mask, cv2.MORPH_OPEN, kernel_small,
         iterations=Theme.MORPH_OPEN_ITERATIONS,
     )
-
-    # Анализ связных компонент и фильтрация слишком маленьких
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
         mask, connectivity=8
     )
@@ -244,23 +224,16 @@ def morphological_cleanup(mask: np.ndarray) -> np.ndarray:
         area = stats[i, cv2.CC_STAT_AREA]
         if area > Theme.MORPH_COMPONENT_MIN_AREA:
             cleaned[labels == i] = 255
-
     return cleaned
 
 
 # ============================================================
-# БАЗОВЫЙ ДЕТЕКТОР СТЕН (ЦВЕТОВАЯ ФИЛЬТРАЦИЯ)
+# 4. БАЗОВЫЙ ДЕТЕКТОР СТЕН (ЦВЕТОВАЯ ФИЛЬТРАЦИЯ)
+#    ← Определяется ПЕРВЫМ, т.к. от него наследуют остальные
 # ============================================================
 
 class ColorBasedWallDetector:
-    """Детектор стен на основе цветовой фильтрации и прямоугольной декомпозиции.
-
-    Особенности:
-      - Прямоугольники — внутреннее представление формы стен.
-      - При визуализации строится общий контур формы без внутренних разделов.
-      - Поддержка автоматического определения цвета стен через K-means.
-      - Интеграция с внешней OCR-моделью для удаления текстовых меток.
-    """
+    """Детектор стен на основе цветовой фильтрации и прямоугольной декомпозиции."""
 
     def __init__(
         self,
@@ -290,12 +263,9 @@ class ColorBasedWallDetector:
         if self.ocr_model is None:
             self._init_ocr()
 
-    # ============================================================
-    # OCR-ФУНКЦИОНАЛ
-    # ============================================================
+    # ---- OCR ----
 
     def _init_ocr(self) -> None:
-        """Инициализация модели OCR (docTR) для удаления текстовых меток."""
         try:
             from doctr.models import ocr_predictor
             self.ocr_model = ocr_predictor(pretrained=True)
@@ -307,7 +277,6 @@ class ColorBasedWallDetector:
         img: np.ndarray,
         bbox_expansion_px: int = Theme.OCR_BBOX_EXPANSION_DEFAULT,
     ) -> List[Tuple[int, int, int, int]]:
-        """Возвращает ограничивающие рамки текста, найденного OCR."""
         if self.ocr_model is None:
             return []
 
@@ -357,7 +326,6 @@ class ColorBasedWallDetector:
         self,
         img: np.ndarray,
     ) -> List[Tuple[str, int, int, int, int]]:
-        """Возвращает распознанный текст вместе с пиксельными координатами."""
         if self.ocr_model is None:
             return []
 
@@ -385,18 +353,10 @@ class ColorBasedWallDetector:
 
                             x_min_rel, y_min_rel, x_max_rel, y_max_rel = coords
 
-                            x_min = max(
-                                0, int(np.floor(float(x_min_rel) * w))
-                            )
-                            y_min = max(
-                                0, int(np.floor(float(y_min_rel) * h))
-                            )
-                            x_max = min(
-                                w - 1, int(np.ceil(float(x_max_rel) * w))
-                            )
-                            y_max = min(
-                                h - 1, int(np.ceil(float(y_max_rel) * h))
-                            )
+                            x_min = max(0, int(np.floor(float(x_min_rel) * w)))
+                            y_min = max(0, int(np.floor(float(y_min_rel) * h)))
+                            x_max = min(w - 1, int(np.ceil(float(x_max_rel) * w)))
+                            y_max = min(h - 1, int(np.ceil(float(y_max_rel) * h)))
 
                             if x_max <= x_min or y_max <= y_min:
                                 continue
@@ -415,7 +375,6 @@ class ColorBasedWallDetector:
         inpaint_radius: int = Theme.OCR_INPAINT_RADIUS_DEFAULT,
         bbox_expansion_px: int = Theme.OCR_BBOX_EXPANSION_DEFAULT,
     ) -> np.ndarray:
-        """Удаляет текстовые метки с изображения через OCR и инпэйнтинг."""
         if self.ocr_model is None:
             return img
 
@@ -445,13 +404,10 @@ class ColorBasedWallDetector:
 
         return cleaned
 
-    # ============================================================
-    # ЦВЕТОВАЯ ДЕТЕКЦИЯ
-    # ============================================================
+    # ---- ЦВЕТОВАЯ ДЕТЕКЦИЯ ----
 
     @staticmethod
     def _hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
-        """Конвертирует цвет из формата HEX в кортеж (R, G, B)."""
         hex_color = hex_color.lstrip('#')
         return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
 
@@ -459,7 +415,6 @@ class ColorBasedWallDetector:
     def _parse_ocr_geometry(
         geom: object,
     ) -> Optional[Tuple[float, float, float, float]]:
-        """Разбирает геометрию слова OCR в нормализованные координаты."""
         try:
             (x_min, y_min), (x_max, y_max) = geom
             return float(x_min), float(y_min), float(x_max), float(y_max)
@@ -490,7 +445,6 @@ class ColorBasedWallDetector:
         k: int = Theme.KMEANS_K,
         max_samples: int = Theme.KMEANS_MAX_SAMPLES,
     ) -> Tuple[int, int, int]:
-        """Автоматически определяет цвет стен через K-means кластеризацию."""
         pixels = img.reshape(-1, 3).astype(np.float32)
 
         if pixels.shape[0] > max_samples:
@@ -540,7 +494,6 @@ class ColorBasedWallDetector:
         return int(chosen_bgr[2]), int(chosen_bgr[1]), int(chosen_bgr[0])
 
     def filter_walls_by_color(self, img: np.ndarray) -> np.ndarray:
-        """Создаёт бинарную маску стен комбинированным RGB + HSV методом."""
         if self.auto_wall_color:
             wall_rgb = self._detect_wall_color_auto(img)
             self.wall_rgb = wall_rgb
@@ -550,14 +503,12 @@ class ColorBasedWallDetector:
         target_r, target_g, target_b = wall_rgb
         tol = self.color_tolerance
 
-        # --- RGB-фильтрация ---
         img_16 = img.astype(np.int16)
         r_match = np.abs(img_16[:, :, 2] - target_r) <= tol
         g_match = np.abs(img_16[:, :, 1] - target_g) <= tol
         b_match = np.abs(img_16[:, :, 0] - target_b) <= tol
         rgb_mask = (r_match & g_match & b_match).astype(np.uint8) * 255
 
-        # --- HSV-фильтрация ---
         hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
         target_hsv = cv2.cvtColor(
             np.uint8([[wall_rgb[::-1]]]),
@@ -591,12 +542,9 @@ class ColorBasedWallDetector:
 
         return combined_mask
 
-    # ============================================================
-    # ОБРАБОТКА СПЕЦИАЛЬНЫХ МЕТОК
-    # ============================================================
+    # ---- СПЕЦИАЛЬНЫЕ МЕТКИ ----
 
     def remove_circular_labels(self, wall_mask: np.ndarray) -> np.ndarray:
-        """Удаляет наиболее выраженную круглую метку комнаты из маски."""
         cleaned = wall_mask.copy()
         blurred = cv2.GaussianBlur(wall_mask, Theme.HOUGH_BLUR_KERNEL, 0)
 
@@ -623,15 +571,12 @@ class ColorBasedWallDetector:
 
         return cleaned
 
-    # ============================================================
-    # ПРЯМОУГОЛЬНАЯ ДЕКОМПОЗИЦИЯ
-    # ============================================================
+    # ---- ПРЯМОУГОЛЬНАЯ ДЕКОМПОЗИЦИЯ ----
 
     @staticmethod
     def _largest_rectangle_in_mask(
         mask_bool: np.ndarray,
     ) -> Optional[Tuple[int, int, int, int, int]]:
-        """Находит наибольший прямоугольник единиц в бинарной матрице."""
         h, w = mask_bool.shape
         heights = np.zeros(w, dtype=np.int32)
 
@@ -679,7 +624,6 @@ class ColorBasedWallDetector:
         img: np.ndarray,
         rect: WallRectangle,
     ) -> WallRectangle:
-        """Расширяет края прямоугольника в пикселях с близким цветом стены."""
         if self.wall_rgb is None:
             return rect
 
@@ -730,33 +674,25 @@ class ColorBasedWallDetector:
             )
 
         for _ in range(self.max_edge_expansion_px):
-            new_x1 = try_expand(
-                x1, -1, is_x=True, fixed_min=y1, fixed_max=y2
-            )
+            new_x1 = try_expand(x1, -1, is_x=True, fixed_min=y1, fixed_max=y2)
             if new_x1 == x1:
                 break
             x1 = new_x1
 
         for _ in range(self.max_edge_expansion_px):
-            new_x2 = try_expand(
-                x2, +1, is_x=True, fixed_min=y1, fixed_max=y2
-            )
+            new_x2 = try_expand(x2, +1, is_x=True, fixed_min=y1, fixed_max=y2)
             if new_x2 == x2:
                 break
             x2 = new_x2
 
         for _ in range(self.max_edge_expansion_px):
-            new_y1 = try_expand(
-                y1, -1, is_x=False, fixed_min=x1, fixed_max=x2
-            )
+            new_y1 = try_expand(y1, -1, is_x=False, fixed_min=x1, fixed_max=x2)
             if new_y1 == y1:
                 break
             y1 = new_y1
 
         for _ in range(self.max_edge_expansion_px):
-            new_y2 = try_expand(
-                y2, +1, is_x=False, fixed_min=x1, fixed_max=x2
-            )
+            new_y2 = try_expand(y2, +1, is_x=False, fixed_min=x1, fixed_max=x2)
             if new_y2 == y2:
                 break
             y2 = new_y2
@@ -784,7 +720,6 @@ class ColorBasedWallDetector:
         wall_mask: np.ndarray,
         img: Optional[np.ndarray] = None,
     ) -> List[WallRectangle]:
-        """Разлагает бинарную маску стен на набор осевых прямоугольников."""
         h, w = wall_mask.shape
         image_area = h * w
         min_area = int(max(1, self.min_rect_area_ratio * image_area))
@@ -832,28 +767,12 @@ class ColorBasedWallDetector:
 
         return rectangles
 
-    # ============================================================
-    # ОСНОВНОЙ МЕТОД ОБРАБОТКИ
-    # ============================================================
+    # ---- ОСНОВНОЙ МЕТОД ОБРАБОТКИ ----
 
     def process(
         self,
         img: np.ndarray,
     ) -> Tuple[np.ndarray, List[WallRectangle], np.ndarray]:
-        """Запускает полный пайплайн обработки изображения.
-
-        Этапы:
-          1. OCR-очистка текстовых меток.
-          2. Цветовая фильтрация стен.
-          3. Удаление круглых меток.
-          4. Морфологическая очистка.
-          5. Прямоугольная декомпозиция.
-          6. Формирование объединённой формы стен.
-          7. Построение только внешних контуров.
-
-        Возвращает:
-            wall_mask, rectangles, outline_mask
-        """
         img_no_text = self.remove_text_labels_ocr(img)
         wall_mask = self.filter_walls_by_color(img_no_text)
         wall_mask = self.remove_circular_labels(wall_mask)
@@ -887,15 +806,10 @@ class ColorBasedWallDetector:
 
         return wall_mask, rectangles, outline_mask
 
-    # ============================================================
-    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
-    # ============================================================
-
     @staticmethod
     def rectangles_to_dict_list(
         rectangles: List[WallRectangle],
     ) -> List[Dict]:
-        """Преобразует список прямоугольников в словари для сериализации."""
         return [
             {
                 "id": r.id,
@@ -909,33 +823,215 @@ class ColorBasedWallDetector:
 
 
 # ============================================================
-# РАСШИРЕННЫЙ ДЕТЕКТОР СТЕН (ЦВЕТ + СТРУКТУРА + ГИБРИД)
-# С ФИЛЬТРАЦИЕЙ МЕБЕЛИ (v4.1)
+# 5. КЛАССИФИКАТОР ТИПА СТЕН (v5.0)
+#    ← После ColorBasedWallDetector (использует его в classify)
 # ============================================================
 
-class VersatileWallDetector(ColorBasedWallDetector):
-    """Универсальный детектор стен: наследует всю цветовую логику
-    и добавляет структурную детекцию для линейных/контурных планировок.
+class WallStyleClassifier:
+    """Определяет, каким способом изображены стены на планировке.
 
-    v4.1: Добавлена многоуровневая фильтрация мебели.
+    Возвращаемые типы:
+      "filled"  — стены залиты одним цветом.
+      "outline" — стены показаны как чёрные контуры (БТИ-стиль).
+      "mixed"   — смесь обоих подходов.
+    """
 
-    Режимы работы (wall_detection_mode):
-      "color"     — только цветовая фильтрация (оригинальное поведение).
-      "structure" — только структурная детекция (линии, контуры, пороги).
-      "hybrid"    — сначала цвет; если покрытие < 2%, → структура.
-      "auto"      — цвет → при низком покрытии → объединение цвета и структуры.
+    @staticmethod
+    def classify(
+        img: np.ndarray,
+        color_detector: Optional[ColorBasedWallDetector] = None,
+    ) -> str:
+        """Классифицирует тип изображения стен.
 
-    Метод структурной детекции (structure_method):
-      "lines"    — LSD / HoughLinesP с дилатацией (быстрый, рекомендуемый).
-      "edges"    — Canny + дилатация (простой, для толстых стен).
-      "contours" — адаптивный порог + контурный анализ.
+        Метрики:
+          1. Доля чёрных пикселей (для outline: 0.5–18%).
+          2. Покрытие цветовой маской (для filled: >1.5%).
+          3. Доля тонких CC (для outline: >25% вытянутых).
+          4. Наличие параллельных пар линий (для outline).
+        """
+        h, w = img.shape[:2]
+        total_pixels = h * w
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    Выходной формат идентичен ColorBasedWallDetector.process().
+        # --- Метрика 1: доля чёрных пикселей ---
+        black_mask = (
+            gray < Theme.CLASSIFIER_BLACK_GRAY_THRESH
+        ).astype(np.uint8) * 255
+        black_ratio = np.count_nonzero(black_mask) / total_pixels
+
+        has_black_outlines = (
+            Theme.CLASSIFIER_OUTLINE_BLACK_RATIO_MIN
+            <= black_ratio
+            <= Theme.CLASSIFIER_OUTLINE_BLACK_RATIO_MAX
+        )
+
+        # --- Метрика 2: покрытие цветовой маской ---
+        color_coverage = 0.0
+        if color_detector is not None:
+            try:
+                color_mask = color_detector.filter_walls_by_color(img)
+                color_coverage = np.count_nonzero(color_mask) / total_pixels
+            except Exception:
+                pass
+
+        has_filled_walls = (
+            color_coverage >= Theme.CLASSIFIER_FILLED_COVERAGE_MIN
+        )
+
+        # --- Метрика 3: доля тонких CC ---
+        thin_ratio = WallStyleClassifier._compute_thin_component_ratio(
+            black_mask
+        )
+        has_thin_lines = (
+            thin_ratio >= Theme.CLASSIFIER_THIN_COMPONENT_RATIO_MIN
+        )
+
+        # --- Метрика 4: параллельные пары ---
+        has_parallel_pairs = WallStyleClassifier._check_parallel_pairs(gray)
+
+        # --- Решение ---
+        outline_score = sum([
+            has_black_outlines,
+            has_thin_lines,
+            has_parallel_pairs,
+        ])
+
+        if has_filled_walls and outline_score >= 2:
+            return "mixed"
+        elif outline_score >= 2:
+            return "outline"
+        elif has_filled_walls:
+            return "filled"
+        elif has_black_outlines:
+            return "outline"
+        else:
+            return "filled"
+
+    @staticmethod
+    def _compute_thin_component_ratio(black_mask: np.ndarray) -> float:
+        """Доля CC с высоким aspect ratio (тонкие/линейные)."""
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            black_mask, connectivity=8
+        )
+        if num_labels <= 1:
+            return 0.0
+
+        thin_count = 0
+        total_count = 0
+
+        for i in range(1, num_labels):
+            comp_w = stats[i, cv2.CC_STAT_WIDTH]
+            comp_h = stats[i, cv2.CC_STAT_HEIGHT]
+            comp_area = stats[i, cv2.CC_STAT_AREA]
+
+            if comp_area < 10:
+                continue
+
+            total_count += 1
+            dim_max = max(comp_w, comp_h)
+            dim_min = max(1, min(comp_w, comp_h))
+            aspect = dim_max / dim_min
+
+            if aspect >= 3.0:
+                thin_count += 1
+
+        return thin_count / max(1, total_count)
+
+    @staticmethod
+    def _check_parallel_pairs(
+        gray: np.ndarray,
+        sample_lines: int = 200,
+    ) -> bool:
+        """Быстрая проверка наличия параллельных пар линий."""
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(
+            edges,
+            rho=1,
+            theta=np.pi / 180,
+            threshold=40,
+            minLineLength=30,
+            maxLineGap=10,
+        )
+        if lines is None or len(lines) < 4:
+            return False
+
+        if len(lines) > sample_lines:
+            indices = np.random.choice(
+                len(lines), sample_lines, replace=False
+            )
+            lines = lines[indices]
+
+        h_lines = []
+        v_lines = []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            angle = abs(np.degrees(np.arctan2(y2 - y1, x2 - x1))) % 180.0
+            if angle <= 10.0 or angle >= 170.0:
+                h_lines.append((x1, y1, x2, y2))
+            elif abs(angle - 90.0) <= 10.0:
+                v_lines.append((x1, y1, x2, y2))
+
+        pair_count = 0
+        dist_min = Theme.PARALLEL_DISTANCE_MIN_PX
+        dist_max = Theme.PARALLEL_DISTANCE_MAX_PX
+
+        for i in range(len(h_lines)):
+            for j in range(i + 1, min(i + 20, len(h_lines))):
+                mid_y_a = (h_lines[i][1] + h_lines[i][3]) / 2.0
+                mid_y_b = (h_lines[j][1] + h_lines[j][3]) / 2.0
+                dist = abs(mid_y_a - mid_y_b)
+                if dist_min <= dist <= dist_max:
+                    xa_min = min(h_lines[i][0], h_lines[i][2])
+                    xa_max = max(h_lines[i][0], h_lines[i][2])
+                    xb_min = min(h_lines[j][0], h_lines[j][2])
+                    xb_max = max(h_lines[j][0], h_lines[j][2])
+                    overlap = max(
+                        0, min(xa_max, xb_max) - max(xa_min, xb_min)
+                    )
+                    span = max(1, min(xa_max - xa_min, xb_max - xb_min))
+                    if overlap / span > 0.4:
+                        pair_count += 1
+
+        for i in range(len(v_lines)):
+            for j in range(i + 1, min(i + 20, len(v_lines))):
+                mid_x_a = (v_lines[i][0] + v_lines[i][2]) / 2.0
+                mid_x_b = (v_lines[j][0] + v_lines[j][2]) / 2.0
+                dist = abs(mid_x_a - mid_x_b)
+                if dist_min <= dist <= dist_max:
+                    ya_min = min(v_lines[i][1], v_lines[i][3])
+                    ya_max = max(v_lines[i][1], v_lines[i][3])
+                    yb_min = min(v_lines[j][1], v_lines[j][3])
+                    yb_max = max(v_lines[j][1], v_lines[j][3])
+                    overlap = max(
+                        0, min(ya_max, yb_max) - max(ya_min, yb_min)
+                    )
+                    span = max(1, min(ya_max - ya_min, yb_max - yb_min))
+                    if overlap / span > 0.4:
+                        pair_count += 1
+
+        return pair_count >= 3
+
+
+# ============================================================
+# 6. ДЕТЕКТОР КОНТУРНЫХ СТЕН БТИ (v5.0)
+#    ← После ColorBasedWallDetector (наследует)
+# ============================================================
+
+class OutlineWallDetector(ColorBasedWallDetector):
+    """Детектор стен для планировок в стиле БТИ.
+
+    Стены = чёрные контуры прямоугольников, «склеенные» в единый контур.
+
+    Пайплайн:
+      1. _extract_black_mask      — извлечение чёрных пикселей
+      2. _remove_text_components   — удаление текста/цифр по CC-геометрии
+      3. _remove_standalone_lines  — удаление размерных линий по связности
+      4. _fill_outline_walls       — заполнение между параллельными линиями
+      5. Финальная очистка + стандартная прямоугольная декомпозиция
     """
 
     def __init__(
         self,
-        # --- Параметры базового класса ---
         wall_color_hex: str = "8E8780",
         color_tolerance: int = 3,
         auto_wall_color: bool = False,
@@ -944,31 +1040,14 @@ class VersatileWallDetector(ColorBasedWallDetector):
         ocr_model: Optional[object] = None,
         edge_expansion_tolerance: int = 8,
         max_edge_expansion_px: int = 10,
-        # --- Параметры структурной детекции (v4.0) ---
-        wall_detection_mode: str = "hybrid",
-        structure_method: str = "lines",
-        line_thickness_estimate_px: int = 8,
-        min_wall_length_ratio: float = 0.02,
-        use_adaptive_threshold: bool = True,
-        # --- Параметры фильтрации мебели (НОВОЕ v4.1) ---
-        enable_furniture_filter: bool = True,
-        enable_internal_object_removal: bool = True,
-        enable_parallel_wall_detection: bool = False,
-        enable_fallback_heuristic: bool = True,
+        # --- Параметры контурной детекции (v5.0) ---
+        black_threshold: Optional[int] = None,
+        use_adaptive: Optional[bool] = None,
+        wall_thickness_range_px: Tuple[int, int] = (4, 30),
+        enable_text_filter: bool = True,
+        enable_dimline_filter: bool = True,
+        enable_ocr_assist: bool = True,
     ) -> None:
-        """Инициализация универсального детектора стен.
-
-        Параметры:
-            wall_detection_mode:         режим детекции.
-            structure_method:            метод структурной детекции.
-            line_thickness_estimate_px:  толщина линий при отрисовке.
-            min_wall_length_ratio:       мин. длина стены (доля диагонали).
-            use_adaptive_threshold:      адаптивная (True) или Otsu (False).
-            enable_furniture_filter:     включить фильтрацию мебели (v4.1).
-            enable_internal_object_removal: flood-fill удаление внутренних объектов.
-            enable_parallel_wall_detection: детекция параллельных пар.
-            enable_fallback_heuristic:   фоллбэк на цвет при избытке компонент.
-        """
         super().__init__(
             wall_color_hex=wall_color_hex,
             color_tolerance=color_tolerance,
@@ -980,8 +1059,461 @@ class VersatileWallDetector(ColorBasedWallDetector):
             max_edge_expansion_px=max_edge_expansion_px,
         )
 
-        # Валидация режима
-        valid_modes = ("color", "structure", "hybrid", "auto")
+        self.black_threshold = (
+            black_threshold
+            if black_threshold is not None
+            else Theme.OUTLINE_BLACK_THRESH
+        )
+        self.use_adaptive = (
+            use_adaptive
+            if use_adaptive is not None
+            else Theme.OUTLINE_USE_ADAPTIVE
+        )
+        self.wall_thickness_min = wall_thickness_range_px[0]
+        self.wall_thickness_max = wall_thickness_range_px[1]
+        self.enable_text_filter = enable_text_filter
+        self.enable_dimline_filter = enable_dimline_filter
+        self.enable_ocr_assist = enable_ocr_assist
+
+    # ---- ШАГ 1: ИЗВЛЕЧЕНИЕ ЧЁРНЫХ ПИКСЕЛЕЙ ----
+
+    def _extract_black_mask(self, img: np.ndarray) -> np.ndarray:
+        """Двойной порог (глобальный AND адаптивный) для чёрных линий."""
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        _, global_mask = cv2.threshold(
+            gray,
+            self.black_threshold,
+            255,
+            cv2.THRESH_BINARY_INV,
+        )
+
+        if not self.use_adaptive:
+            return global_mask
+
+        adaptive_mask = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            Theme.OUTLINE_ADAPTIVE_BLOCK,
+            Theme.OUTLINE_ADAPTIVE_C,
+        )
+
+        combined = cv2.bitwise_and(global_mask, adaptive_mask)
+        return combined
+
+    # ---- ШАГ 2: УДАЛЕНИЕ ТЕКСТА / ЦИФР ----
+
+    def _remove_text_components(
+        self,
+        mask: np.ndarray,
+        img: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """Двухуровневая фильтрация: CC-геометрия + OCR bbox'ы."""
+        cleaned = mask.copy()
+        h_img, w_img = mask.shape[:2]
+        total_pixels = h_img * w_img
+
+        max_text_area = int(Theme.TEXT_FILTER_MAX_AREA_RATIO * total_pixels)
+        min_text_h = int(Theme.TEXT_FILTER_MIN_HEIGHT_RATIO * h_img)
+        max_text_h = int(Theme.TEXT_FILTER_MAX_HEIGHT_RATIO * h_img)
+
+        # --- OCR bbox'ы ---
+        ocr_bboxes: List[Tuple[int, int, int, int]] = []
+        if (
+            self.enable_ocr_assist
+            and img is not None
+            and self.ocr_model is not None
+        ):
+            try:
+                ocr_bboxes = self.get_ocr_bboxes(
+                    img,
+                    bbox_expansion_px=Theme.OCR_BBOX_EXPANSION_DEFAULT + 2,
+                )
+            except Exception:
+                pass
+
+        if ocr_bboxes:
+            ocr_erase_mask = np.zeros_like(mask, dtype=np.uint8)
+            for x_min, y_min, x_max, y_max in ocr_bboxes:
+                cv2.rectangle(
+                    ocr_erase_mask,
+                    (x_min, y_min), (x_max, y_max),
+                    255, -1,
+                )
+            cleaned[ocr_erase_mask > 0] = 0
+
+        # --- CC-геометрия ---
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            cleaned, connectivity=8,
+        )
+
+        text_candidates: List[int] = []
+        candidate_centroids: List[Tuple[float, float]] = []
+
+        for i in range(1, num_labels):
+            comp_area = stats[i, cv2.CC_STAT_AREA]
+            comp_w = stats[i, cv2.CC_STAT_WIDTH]
+            comp_h = stats[i, cv2.CC_STAT_HEIGHT]
+
+            if comp_area > max_text_area:
+                continue
+
+            char_height = comp_h
+            if char_height < min_text_h or char_height > max_text_h:
+                continue
+
+            dim_max = max(comp_w, comp_h)
+            dim_min = max(1, min(comp_w, comp_h))
+            aspect = dim_max / dim_min
+            if aspect > Theme.TEXT_FILTER_MAX_ASPECT:
+                continue
+
+            bbox_area = max(1, comp_w * comp_h)
+            fill = comp_area / bbox_area
+            if fill < Theme.TEXT_FILTER_MIN_FILL or fill > Theme.TEXT_FILTER_MAX_FILL:
+                continue
+
+            text_candidates.append(i)
+            cx, cy = centroids[i]
+            candidate_centroids.append((cx, cy))
+
+        # Кластеризация
+        gap = Theme.TEXT_FILTER_CLUSTER_GAP_PX
+        confirmed_text: set = set()
+
+        for idx_a in range(len(text_candidates)):
+            for idx_b in range(idx_a + 1, len(text_candidates)):
+                cx_a, cy_a = candidate_centroids[idx_a]
+                cx_b, cy_b = candidate_centroids[idx_b]
+                dist = np.hypot(cx_b - cx_a, cy_b - cy_a)
+                if dist <= gap:
+                    confirmed_text.add(text_candidates[idx_a])
+                    confirmed_text.add(text_candidates[idx_b])
+
+        # Одиночные в OCR bbox → тоже текст
+        if ocr_bboxes:
+            for idx_a in range(len(text_candidates)):
+                cc_idx = text_candidates[idx_a]
+                if cc_idx in confirmed_text:
+                    continue
+                cx, cy = candidate_centroids[idx_a]
+                for bx1, by1, bx2, by2 in ocr_bboxes:
+                    if bx1 <= cx <= bx2 and by1 <= cy <= by2:
+                        confirmed_text.add(cc_idx)
+                        break
+
+        for cc_idx in confirmed_text:
+            cleaned[labels == cc_idx] = 0
+
+        return cleaned
+
+    # ---- ШАГ 3: УДАЛЕНИЕ РАЗМЕРНЫХ / ВЫНОСНЫХ ЛИНИЙ ----
+
+    def _remove_standalone_lines(self, mask: np.ndarray) -> np.ndarray:
+        """Удаляет тонкие изолированные линии через connectivity к основной CC."""
+        cleaned = mask.copy()
+        h_img, w_img = mask.shape[:2]
+        total_pixels = h_img * w_img
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            cleaned, connectivity=8,
+        )
+
+        if num_labels <= 2:
+            return cleaned
+
+        # Крупнейшая CC = основная стеновая структура
+        areas = [stats[i, cv2.CC_STAT_AREA] for i in range(1, num_labels)]
+        main_cc_label = np.argmax(areas) + 1
+
+        # Дилатируем для проверки связности
+        main_mask = (labels == main_cc_label).astype(np.uint8) * 255
+        radius = Theme.DIMLINE_CONNECTIVITY_RADIUS_PX
+        dilate_kernel = np.ones(
+            (2 * radius + 1, 2 * radius + 1), np.uint8
+        )
+        main_dilated = cv2.dilate(main_mask, dilate_kernel, iterations=1)
+
+        # Итеративно растим множество «связанных» CC
+        connected_labels: set = {main_cc_label}
+        changed = True
+        while changed:
+            changed = False
+            for i in range(1, num_labels):
+                if i in connected_labels:
+                    continue
+                comp_mask = (labels == i)
+                overlap = np.count_nonzero(comp_mask & (main_dilated > 0))
+                if overlap > 0:
+                    connected_labels.add(i)
+                    main_dilated = cv2.dilate(
+                        (
+                            np.isin(labels, list(connected_labels))
+                        ).astype(np.uint8) * 255,
+                        dilate_kernel,
+                        iterations=1,
+                    )
+                    changed = True
+
+        max_thin_dim = Theme.DIMLINE_MAX_THIN_DIM_PX
+        min_dimline_aspect = Theme.DIMLINE_MIN_ASPECT
+        max_dimline_area = Theme.DIMLINE_MAX_AREA_RATIO * total_pixels
+
+        for i in range(1, num_labels):
+            if i in connected_labels:
+                continue
+
+            comp_area = stats[i, cv2.CC_STAT_AREA]
+            comp_w = stats[i, cv2.CC_STAT_WIDTH]
+            comp_h = stats[i, cv2.CC_STAT_HEIGHT]
+            dim_max = max(comp_w, comp_h)
+            dim_min = max(1, min(comp_w, comp_h))
+            aspect = dim_max / dim_min
+
+            is_thin_line = (
+                dim_min <= max_thin_dim
+                and aspect >= min_dimline_aspect
+                and comp_area <= max_dimline_area
+            )
+
+            is_small_isolated = comp_area < max_dimline_area * 0.5
+
+            if is_thin_line or is_small_isolated:
+                cleaned[labels == i] = 0
+
+        return cleaned
+
+    # ---- ШАГ 4: ЗАПОЛНЕНИЕ КОНТУРНЫХ СТЕН ----
+
+    def _fill_outline_walls(self, mask: np.ndarray) -> np.ndarray:
+        """Направленное морфологическое закрытие + AND для заполнения стен."""
+        kl = Theme.OUTLINE_FILL_DIRECTIONAL_KERNEL_LENGTH
+        kw = Theme.OUTLINE_FILL_DIRECTIONAL_KERNEL_WIDTH
+        iterations = Theme.OUTLINE_FILL_CLOSE_ITERATIONS
+
+        # Горизонтальное ядро
+        kernel_h = np.zeros((kw, kl), dtype=np.uint8)
+        kernel_h[kw // 2, :] = 1
+
+        # Вертикальное ядро
+        kernel_v = np.zeros((kl, kw), dtype=np.uint8)
+        kernel_v[:, kw // 2] = 1
+
+        closed_h = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE, kernel_h, iterations=iterations
+        )
+        closed_v = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE, kernel_v, iterations=iterations
+        )
+
+        # AND: только если оба направления подтвердили
+        filled = cv2.bitwise_and(closed_h, closed_v)
+
+        # Вернуть исходные пиксели
+        filled = cv2.bitwise_or(filled, mask)
+
+        # Изотропное закрытие
+        iso_k = Theme.OUTLINE_FILL_CLOSE_KERNEL
+        kernel_iso = np.ones((iso_k, iso_k), np.uint8)
+        filled = cv2.morphologyEx(
+            filled, cv2.MORPH_CLOSE, kernel_iso, iterations=1
+        )
+
+        # Удаление случайно заполненных комнат
+        filled = self._remove_overfilled_regions(filled, mask)
+
+        # Финальное открытие
+        open_k = Theme.OUTLINE_FINAL_OPEN_KERNEL
+        kernel_open = np.ones((open_k, open_k), np.uint8)
+        filled = cv2.morphologyEx(
+            filled, cv2.MORPH_OPEN, kernel_open,
+            iterations=Theme.OUTLINE_FINAL_OPEN_ITERATIONS,
+        )
+
+        return filled
+
+    def _remove_overfilled_regions(
+        self,
+        filled_mask: np.ndarray,
+        original_outline_mask: np.ndarray,
+    ) -> np.ndarray:
+        """Удаляет области, случайно заполненные при закрытии (комнаты)."""
+        cleaned = filled_mask.copy()
+        total_pixels = filled_mask.size
+
+        new_pixels = cv2.bitwise_and(
+            filled_mask,
+            cv2.bitwise_not(original_outline_mask),
+        )
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            new_pixels, connectivity=8,
+        )
+
+        room_hole_min = Theme.OUTLINE_ROOM_HOLE_MIN_RATIO * total_pixels
+
+        for i in range(1, num_labels):
+            comp_area = stats[i, cv2.CC_STAT_AREA]
+            comp_w = stats[i, cv2.CC_STAT_WIDTH]
+            comp_h = stats[i, cv2.CC_STAT_HEIGHT]
+
+            if comp_area > room_hole_min:
+                bbox_area = max(1, comp_w * comp_h)
+                fill_ratio = comp_area / bbox_area
+                if fill_ratio > 0.4:
+                    cleaned[labels == i] = 0
+
+        return cleaned
+
+    # ---- ПОЛНЫЙ ПАЙПЛАЙН ----
+
+    def detect_outline_walls(self, img: np.ndarray) -> np.ndarray:
+        """Полный пайплайн детекции контурных стен."""
+        # 1. Извлечение чёрных пикселей
+        black_mask = self._extract_black_mask(img)
+
+        # 2. Лёгкая очистка шума
+        kernel_small = np.ones((2, 2), np.uint8)
+        black_mask = cv2.morphologyEx(
+            black_mask, cv2.MORPH_OPEN, kernel_small, iterations=1
+        )
+
+        # 3. Удаление текста / цифр
+        if self.enable_text_filter:
+            black_mask = self._remove_text_components(black_mask, img)
+
+        # 4. Удаление размерных линий
+        if self.enable_dimline_filter:
+            black_mask = self._remove_standalone_lines(black_mask)
+
+        # 5. Заполнение контурных стен
+        wall_mask = self._fill_outline_walls(black_mask)
+
+        # 6. Удаление мелких CC
+        wall_mask = self._remove_small_filled_components(wall_mask)
+
+        return wall_mask
+
+    def _remove_small_filled_components(
+        self, mask: np.ndarray,
+    ) -> np.ndarray:
+        total_pixels = mask.size
+        min_area = int(
+            Theme.OUTLINE_MIN_FILLED_COMPONENT_RATIO * total_pixels
+        )
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            mask, connectivity=8,
+        )
+        cleaned = np.zeros_like(mask, dtype=np.uint8)
+
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] >= min_area:
+                cleaned[labels == i] = 255
+
+        return cleaned
+
+    # ---- process() для контурного режима ----
+
+    def process(
+        self,
+        img: np.ndarray,
+    ) -> Tuple[np.ndarray, List[WallRectangle], np.ndarray]:
+        img_no_text = self.remove_text_labels_ocr(img)
+        wall_mask = self.detect_outline_walls(img_no_text)
+        wall_mask = self.remove_circular_labels(wall_mask)
+        wall_mask = morphological_cleanup(wall_mask)
+
+        rectangles = self._decompose_to_rectangles(
+            wall_mask, img=img_no_text
+        )
+
+        union_mask = np.zeros_like(wall_mask, dtype=np.uint8)
+        for rect in rectangles:
+            cv2.rectangle(
+                union_mask,
+                (rect.x1, rect.y1),
+                (rect.x2, rect.y2),
+                255, -1,
+            )
+
+        if self.rect_visual_gap_px > 0:
+            k = 2 * self.rect_visual_gap_px + 1
+            kernel = np.ones((k, k), np.uint8)
+            union_mask = cv2.morphologyEx(
+                union_mask, cv2.MORPH_CLOSE, kernel, iterations=1,
+            )
+
+        contours, _ = cv2.findContours(
+            union_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        outline_mask = np.zeros_like(wall_mask, dtype=np.uint8)
+        cv2.drawContours(outline_mask, contours, -1, 255, 1)
+
+        return wall_mask, rectangles, outline_mask
+
+
+# ============================================================
+# 7. РАСШИРЕННЫЙ ДЕТЕКТОР СТЕН (v5.0)
+#    ← После всех зависимостей: ColorBasedWallDetector,
+#      WallStyleClassifier, OutlineWallDetector
+# ============================================================
+
+class VersatileWallDetector(ColorBasedWallDetector):
+    """Универсальный детектор стен v5.0.
+
+    Режимы (wall_detection_mode):
+      "color"     — только цветовая фильтрация.
+      "structure" — структурная детекция (линии, контуры, пороги).
+      "outline"   — контурная детекция для БТИ-планировок (v5.0).
+      "hybrid"    — сначала цвет; при низком покрытии → структура.
+      "auto"      — автоклассификация → выбор оптимального метода.
+    """
+
+    def __init__(
+        self,
+        # --- Базовый класс ---
+        wall_color_hex: str = "8E8780",
+        color_tolerance: int = 3,
+        auto_wall_color: bool = False,
+        min_rect_area_ratio: float = 0.0002,
+        rect_visual_gap_px: int = Theme.RECT_VISUAL_GAP_DEFAULT,
+        ocr_model: Optional[object] = None,
+        edge_expansion_tolerance: int = 8,
+        max_edge_expansion_px: int = 10,
+        # --- Структурная детекция (v4.0) ---
+        wall_detection_mode: str = "auto",
+        structure_method: str = "lines",
+        line_thickness_estimate_px: int = 8,
+        min_wall_length_ratio: float = 0.02,
+        use_adaptive_threshold: bool = True,
+        # --- Фильтрация мебели (v4.1) ---
+        enable_furniture_filter: bool = True,
+        enable_internal_object_removal: bool = True,
+        enable_parallel_wall_detection: bool = False,
+        enable_fallback_heuristic: bool = True,
+        # --- Контурная детекция (v5.0) ---
+        outline_black_threshold: Optional[int] = None,
+        outline_use_adaptive: Optional[bool] = None,
+        outline_wall_thickness_range_px: Tuple[int, int] = (4, 30),
+        outline_enable_text_filter: bool = True,
+        outline_enable_dimline_filter: bool = True,
+        outline_enable_ocr_assist: bool = True,
+    ) -> None:
+        super().__init__(
+            wall_color_hex=wall_color_hex,
+            color_tolerance=color_tolerance,
+            auto_wall_color=auto_wall_color,
+            min_rect_area_ratio=min_rect_area_ratio,
+            rect_visual_gap_px=rect_visual_gap_px,
+            ocr_model=ocr_model,
+            edge_expansion_tolerance=edge_expansion_tolerance,
+            max_edge_expansion_px=max_edge_expansion_px,
+        )
+
+        valid_modes = ("color", "structure", "outline", "hybrid", "auto")
         if wall_detection_mode not in valid_modes:
             raise ValueError(
                 f"wall_detection_mode must be one of {valid_modes}, "
@@ -1001,88 +1533,135 @@ class VersatileWallDetector(ColorBasedWallDetector):
         self.min_wall_length_ratio = float(min_wall_length_ratio)
         self.use_adaptive_threshold = bool(use_adaptive_threshold)
 
-        # v4.1 feature flags
+        # v4.1
         self.enable_furniture_filter = bool(enable_furniture_filter)
-        self.enable_internal_object_removal = bool(
-            enable_internal_object_removal
-        )
-        self.enable_parallel_wall_detection = bool(
-            enable_parallel_wall_detection
-        )
+        self.enable_internal_object_removal = bool(enable_internal_object_removal)
+        self.enable_parallel_wall_detection = bool(enable_parallel_wall_detection)
         self.enable_fallback_heuristic = bool(enable_fallback_heuristic)
 
-    # ============================================================
-    # ЕДИНАЯ ТОЧКА ВХОДА ДЛЯ СОЗДАНИЯ МАСКИ
-    # ============================================================
+        # v5.0: внутренний OutlineWallDetector (переиспользует OCR модель)
+        self._outline_detector = OutlineWallDetector(
+            wall_color_hex=wall_color_hex,
+            color_tolerance=color_tolerance,
+            auto_wall_color=auto_wall_color,
+            min_rect_area_ratio=min_rect_area_ratio,
+            rect_visual_gap_px=rect_visual_gap_px,
+            ocr_model=self.ocr_model,
+            edge_expansion_tolerance=edge_expansion_tolerance,
+            max_edge_expansion_px=max_edge_expansion_px,
+            black_threshold=outline_black_threshold,
+            use_adaptive=outline_use_adaptive,
+            wall_thickness_range_px=outline_wall_thickness_range_px,
+            enable_text_filter=outline_enable_text_filter,
+            enable_dimline_filter=outline_enable_dimline_filter,
+            enable_ocr_assist=outline_enable_ocr_assist,
+        )
+
+        # Кэш последней классификации
+        self._last_classified_style: Optional[str] = None
+
+    @property
+    def last_classified_style(self) -> Optional[str]:
+        """Тип стен, определённый при последнем вызове process()."""
+        return self._last_classified_style
+
+    # ---- СОЗДАНИЕ МАСКИ ----
 
     def create_wall_mask(self, img: np.ndarray) -> np.ndarray:
-        """Создаёт бинарную маску стен в соответствии с выбранным режимом.
-
-        Параметры:
-            img: входное изображение в формате BGR (уже без текстовых меток).
-
-        Возвращает:
-            Бинарную маску стен (0 / 255).
-        """
         if self.wall_detection_mode == "color":
+            self._last_classified_style = "filled"
             return self.filter_walls_by_color(img)
 
+        elif self.wall_detection_mode == "outline":
+            self._last_classified_style = "outline"
+            return self._outline_detector.detect_outline_walls(img)
+
         elif self.wall_detection_mode == "structure":
+            self._last_classified_style = "structure"
             return self._structure_with_furniture_filter(img)
 
         elif self.wall_detection_mode == "hybrid":
             color_mask = self.filter_walls_by_color(img)
             coverage = np.count_nonzero(color_mask) / color_mask.size
             if coverage > Theme.HYBRID_COLOR_COVERAGE_THRESHOLD:
+                self._last_classified_style = "filled"
                 return color_mask
+            self._last_classified_style = "structure"
             return self._structure_with_furniture_filter(img)
 
         else:  # "auto"
-            return self._auto_select_detection(img)
+            return self._auto_select_detection_v5(img)
 
-    # ============================================================
-    # СТРУКТУРНАЯ ДЕТЕКЦИЯ С ФИЛЬТРАЦИЕЙ МЕБЕЛИ (v4.1)
-    # ============================================================
+    # ---- АВТО-ВЫБОР v5.0 ----
+
+    def _auto_select_detection_v5(self, img: np.ndarray) -> np.ndarray:
+        """Классификация → диспетчеризация → фоллбэк."""
+        style = WallStyleClassifier.classify(img, color_detector=self)
+        self._last_classified_style = style
+
+        if style == "filled":
+            color_mask = self.filter_walls_by_color(img)
+            color_coverage = np.count_nonzero(color_mask) / color_mask.size
+
+            if color_coverage >= Theme.AUTO_COLOR_COVERAGE_THRESHOLD:
+                return color_mask
+
+            # Фоллбэк → outline
+            self._last_classified_style = "outline_fallback"
+            outline_mask = self._outline_detector.detect_outline_walls(img)
+            outline_coverage = np.count_nonzero(outline_mask) / outline_mask.size
+
+            if outline_coverage > color_coverage:
+                return outline_mask
+            return color_mask
+
+        elif style == "outline":
+            outline_mask = self._outline_detector.detect_outline_walls(img)
+            outline_coverage = np.count_nonzero(outline_mask) / outline_mask.size
+
+            if outline_coverage >= Theme.OUTLINE_MIN_WALL_AREA_RATIO * 10:
+                return outline_mask
+
+            # Фоллбэк → structure
+            self._last_classified_style = "structure_fallback"
+            struct_mask = self._structure_with_furniture_filter(img)
+            struct_coverage = np.count_nonzero(struct_mask) / struct_mask.size
+
+            if struct_coverage > outline_coverage:
+                return struct_mask
+            return outline_mask
+
+        else:  # "mixed"
+            color_mask = self.filter_walls_by_color(img)
+            outline_mask = self._outline_detector.detect_outline_walls(img)
+
+            fused = cv2.bitwise_or(color_mask, outline_mask)
+            k = Theme.AUTO_FUSION_CLOSE_KERNEL
+            kernel = np.ones((k, k), np.uint8)
+            fused = cv2.morphologyEx(
+                fused, cv2.MORPH_CLOSE, kernel, iterations=1
+            )
+            return fused
+
+    # ---- СТРУКТУРА + ФИЛЬТРАЦИЯ МЕБЕЛИ (v4.1) ----
 
     def _structure_with_furniture_filter(
         self, img: np.ndarray,
     ) -> np.ndarray:
-        """Структурная детекция с последовательной фильтрацией мебели.
-
-        Пайплайн:
-          1. Базовая структурная детекция (filter_walls_by_structure).
-          2. Проверка фоллбэка: если слишком много компонент → цвет + морфология.
-          3. Фильтрация компонент по форме (aspect ratio, fill ratio).
-          4. Удаление внутренних объектов через flood-fill.
-          5. Опциональная детекция параллельных пар стен.
-
-        Параметры:
-            img: входное изображение BGR.
-
-        Возвращает:
-            Очищенную бинарную маску стен.
-        """
         mask = self.filter_walls_by_structure(img)
 
-        # --- Шаг 2: фоллбэк при избытке компонент ---
-        if self.enable_fallback_heuristic and self._should_fallback_to_color(
-            mask
-        ):
+        if self.enable_fallback_heuristic and self._should_fallback_to_color(mask):
             color_mask = self.filter_walls_by_color(img)
             color_mask = morphological_cleanup(color_mask)
-            # Если цветовая маска тоже пуста, вернём структурную
             if np.count_nonzero(color_mask) > 0:
                 return color_mask
 
-        # --- Шаг 3: фильтрация компонент по геометрии ---
         if self.enable_furniture_filter:
             mask = self._filter_components_by_shape(mask)
 
-        # --- Шаг 4: удаление внутренних объектов ---
         if self.enable_internal_object_removal:
             mask = self._remove_internal_objects(mask)
 
-        # --- Шаг 5: параллельные пары ---
         if self.enable_parallel_wall_detection:
             parallel_mask = self._detect_parallel_wall_pairs(img)
             if parallel_mask is not None:
@@ -1090,31 +1669,16 @@ class VersatileWallDetector(ColorBasedWallDetector):
 
         return mask
 
-    # ============================================================
-    # СТРУКТУРНАЯ ДЕТЕКЦИЯ СТЕН (v4.0, без изменений)
-    # ============================================================
+    # ---- СТРУКТУРНАЯ ДЕТЕКЦИЯ (v4.0) ----
 
     def filter_walls_by_structure(self, img: np.ndarray) -> np.ndarray:
-        """Детектирует стены, определённые контурами/линиями.
-
-        Параметры:
-            img: входное изображение в формате BGR.
-
-        Возвращает:
-            Бинарную маску стен (0 / 255).
-        """
-        # --- 1. Подготовка ---
-        if (
-            hasattr(self, 'remove_text_labels_ocr')
-            and self.ocr_model is not None
-        ):
+        if self.ocr_model is not None:
             img_clean = self.remove_text_labels_ocr(img)
         else:
             img_clean = img
 
         gray = cv2.cvtColor(img_clean, cv2.COLOR_BGR2GRAY)
 
-        # --- 2. Бинаризация ---
         if self.use_adaptive_threshold:
             binary = cv2.adaptiveThreshold(
                 gray, 255,
@@ -1129,22 +1693,14 @@ class VersatileWallDetector(ColorBasedWallDetector):
                 cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
             )
 
-        # --- 3. Морфологическая очистка базовой бинаризации ---
         binary = morphological_cleanup(binary)
 
-        # --- 4. Детекция линий ---
         if self.structure_method == "lines":
             binary = self._detect_lines_lsd_or_hough(gray, binary)
         elif self.structure_method == "edges":
             binary = self._detect_edges_canny(gray, binary)
-        # "contours" — только бинаризация + морфология
 
-        # --- 5. Финальная очистка ---
         binary = morphological_cleanup(binary)
-
-        # --- 6. Удаление мелких компонент ---
-        #binary = self._remove_small_components(binary)
-
         return binary
 
     def _detect_lines_lsd_or_hough(
@@ -1152,23 +1708,10 @@ class VersatileWallDetector(ColorBasedWallDetector):
         gray: np.ndarray,
         binary: np.ndarray,
     ) -> np.ndarray:
-        """Детектирует линейные сегменты через LSD или HoughLinesP.
-
-        v4.1: добавлена фильтрация по длине и углу через
-        _filter_lines_by_geometry перед отрисовкой.
-
-        Параметры:
-            gray:   изображение в градациях серого.
-            binary: текущая бинарная маска.
-
-        Возвращает:
-            Обновлённую бинарную маску.
-        """
         thickness = self.line_thickness_estimate_px
         h_img, w_img = gray.shape[:2]
         diagonal = np.hypot(w_img, h_img)
 
-        # Минимальная длина: max из фиксированного порога и доли диагонали
         min_length_fixed = Theme.STRUCT_MIN_LINE_LENGTH
         min_length_ratio = Theme.STRUCT_MIN_LINE_RATIO * diagonal
         min_length = max(min_length_fixed, min_length_ratio)
@@ -1177,11 +1720,9 @@ class VersatileWallDetector(ColorBasedWallDetector):
         raw_lines: List[Tuple[int, int, int, int]] = []
         lines_found = False
 
-        # --- Попытка 1: LSD ---
         try:
             lsd = cv2.createLineSegmentDetector(0)
             lines_result = lsd.detect(gray)
-
             if lines_result is not None:
                 lines = lines_result[0]
                 if lines is not None and len(lines) > 0:
@@ -1192,7 +1733,6 @@ class VersatileWallDetector(ColorBasedWallDetector):
         except (AttributeError, cv2.error):
             pass
 
-        # --- Попытка 2: HoughLinesP ---
         if not lines_found:
             edges = cv2.Canny(
                 gray,
@@ -1213,7 +1753,6 @@ class VersatileWallDetector(ColorBasedWallDetector):
                     x1, y1, x2, y2 = line[0]
                     raw_lines.append((x1, y1, x2, y2))
 
-        # --- v4.1: Фильтрация линий по геометрии ---
         if self.enable_furniture_filter:
             filtered_lines = self._filter_lines_by_geometry(
                 raw_lines, min_length, diagonal
@@ -1224,7 +1763,6 @@ class VersatileWallDetector(ColorBasedWallDetector):
                 if np.hypot(seg[2] - seg[0], seg[3] - seg[1]) >= min_length
             ]
 
-        # Отрисовка отфильтрованных линий
         for x1, y1, x2, y2 in filtered_lines:
             cv2.line(
                 line_mask, (x1, y1), (x2, y2),
@@ -1239,15 +1777,6 @@ class VersatileWallDetector(ColorBasedWallDetector):
         gray: np.ndarray,
         binary: np.ndarray,
     ) -> np.ndarray:
-        """Детектирует стены через Canny + морфологическую дилатацию.
-
-        Параметры:
-            gray:   изображение в градациях серого.
-            binary: текущая бинарная маска.
-
-        Возвращает:
-            Обновлённую бинарную маску.
-        """
         edges = cv2.Canny(
             gray,
             Theme.STRUCT_CANNY_EDGES_LOW,
@@ -1261,66 +1790,10 @@ class VersatileWallDetector(ColorBasedWallDetector):
             edges, kernel,
             iterations=Theme.STRUCT_DILATE_ITERATIONS,
         )
-
         binary = cv2.bitwise_or(binary, dilated)
         return binary
 
-    def _remove_small_components(self, binary: np.ndarray) -> np.ndarray:
-        """Удаляет связные компоненты ниже порога площади.
-
-        Параметры:
-            binary: бинарная маска.
-
-        Возвращает:
-            Маску с удалёнными мелкими компонентами.
-        """
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-            binary, connectivity=8,
-        )
-        min_area = int(Theme.STRUCT_MIN_WALL_AREA_RATIO * binary.size)
-
-        for i in range(1, num_labels):
-            if stats[i, cv2.CC_STAT_AREA] < min_area:
-                binary[labels == i] = 0
-
-        return binary
-
-    # ============================================================
-    # АВТОМАТИЧЕСКИЙ ВЫБОР СТРАТЕГИИ
-    # ============================================================
-
-    def _auto_select_detection(self, img: np.ndarray) -> np.ndarray:
-        """Автоматически выбирает стратегию на основе эвристик.
-
-        Параметры:
-            img: входное изображение BGR.
-
-        Возвращает:
-            Бинарную маску стен.
-        """
-        color_mask = self.filter_walls_by_color(img)
-        coverage = np.count_nonzero(color_mask) / color_mask.size
-
-        if coverage > Theme.AUTO_COLOR_COVERAGE_THRESHOLD:
-            return color_mask
-
-        # Структурная детекция с фильтрацией мебели
-        struct_mask = self._structure_with_furniture_filter(img)
-
-        # Объединение: OR + морфологическое закрытие
-        fused = cv2.bitwise_or(color_mask, struct_mask)
-
-        k = Theme.AUTO_FUSION_CLOSE_KERNEL
-        kernel = np.ones((k, k), np.uint8)
-        fused = cv2.morphologyEx(
-            fused, cv2.MORPH_CLOSE, kernel, iterations=1
-        )
-
-        return fused
-
-    # ============================================================
-    # SOLUTION 1: ФИЛЬТРАЦИЯ ЛИНИЙ ПО ГЕОМЕТРИИ (v4.1)
-    # ============================================================
+    # ---- ФИЛЬТРАЦИЯ ЛИНИЙ ПО ГЕОМЕТРИИ (v4.1) ----
 
     @staticmethod
     def _filter_lines_by_geometry(
@@ -1328,23 +1801,6 @@ class VersatileWallDetector(ColorBasedWallDetector):
         min_length: float,
         diagonal: float,
     ) -> List[Tuple[int, int, int, int]]:
-        """Фильтрует линейные сегменты по длине и ориентации.
-
-        Критерии фильтрации:
-          - Длина >= min_length (порог = max(фиксированный, доля диагонали)).
-          - Ориентация: горизонтальная (±ANGLE_TOLERANCE_DEG от 0°/180°)
-            или вертикальная (±ANGLE_TOLERANCE_DEG от 90°).
-          - Диагональные линии отбрасываются: стены на планировках
-            почти всегда ортогональны.
-
-        Параметры:
-            lines:      список сегментов (x1, y1, x2, y2).
-            min_length:  минимальная длина в пикселях.
-            diagonal:    диагональ изображения (для контекста).
-
-        Возвращает:
-            Отфильтрованный список сегментов.
-        """
         angle_tol = Theme.ANGLE_TOLERANCE_DEG
         filtered: List[Tuple[int, int, int, int]] = []
 
@@ -1353,14 +1809,10 @@ class VersatileWallDetector(ColorBasedWallDetector):
             dy = y2 - y1
             length = np.hypot(dx, dy)
 
-            # Фильтр по длине
             if length < min_length:
                 continue
 
-            # Фильтр по ориентации: вычисляем угол к горизонтали
             angle_deg = abs(np.degrees(np.arctan2(dy, dx)))
-
-            # Нормализация в [0, 180)
             angle_deg = angle_deg % 180.0
 
             is_horizontal = (
@@ -1374,36 +1826,10 @@ class VersatileWallDetector(ColorBasedWallDetector):
 
         return filtered
 
-    # ============================================================
-    # SOLUTION 2: ФИЛЬТРАЦИЯ КОМПОНЕНТ ПО ФОРМЕ (v4.1)
-    # ============================================================
+    # ---- ФИЛЬТРАЦИЯ КОМПОНЕНТ (v4.1) ----
 
     @staticmethod
     def _filter_components_by_shape(mask: np.ndarray) -> np.ndarray:
-        """Фильтрует связные компоненты по aspect ratio и fill ratio.
-
-        Логика:
-          Для каждой связной компоненты вычисляются:
-            - aspect_ratio = max(w, h) / max(1, min(w, h))
-            - fill_ratio = component_area / bounding_box_area
-            - area_ratio = component_area / total_image_pixels
-
-          Компонента СОХРАНЯЕТСЯ, если:
-            (a) aspect_ratio >= FURNITURE_MIN_ASPECT_RATIO (вытянутая = стена)
-            ИЛИ
-            (b) area_ratio >= MAX_FURNITURE_AREA_RATIO (крупная, даже не вытянутая)
-            ИЛИ
-            (c) fill_ratio < FURNITURE_MAX_FILL_RATIO (не плотно заполненная)
-
-          Компактные, мелкие, плотно заполненные компоненты —
-          вероятная мебель — удаляются.
-
-        Параметры:
-            mask: бинарная маска (0/255).
-
-        Возвращает:
-            Очищенную маску.
-        """
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
             mask, connectivity=8,
         )
@@ -1423,10 +1849,7 @@ class VersatileWallDetector(ColorBasedWallDetector):
             fill_ratio = comp_area / bbox_area
             area_ratio = comp_area / total_pixels
 
-            # Правило сохранения
-            is_elongated = (
-                aspect_ratio >= Theme.FURNITURE_MIN_ASPECT_RATIO
-            )
+            is_elongated = aspect_ratio >= Theme.FURNITURE_MIN_ASPECT_RATIO
             is_large = area_ratio >= Theme.MAX_FURNITURE_AREA_RATIO
             is_sparse = fill_ratio < Theme.FURNITURE_MAX_FILL_RATIO
 
@@ -1435,34 +1858,10 @@ class VersatileWallDetector(ColorBasedWallDetector):
 
         return cleaned
 
-    # ============================================================
-    # SOLUTION 3: УДАЛЕНИЕ ВНУТРЕННИХ ОБЪЕКТОВ (v4.1)
-    # ============================================================
+    # ---- УДАЛЕНИЕ ВНУТРЕННИХ ОБЪЕКТОВ (v4.1) ----
 
     @staticmethod
     def _remove_internal_objects(wall_mask: np.ndarray) -> np.ndarray:
-        """Удаляет внутренние объекты (мебель) через контурный анализ.
-
-        Алгоритм:
-          1. Находим все контуры с иерархией (RETR_TREE).
-          2. Контуры верхнего уровня (без родителя) — внешние границы
-             стен или крупных структур.
-          3. Дочерние контуры (уровень 1+) внутри крупных контуров —
-             потенциальная мебель / внутренние объекты.
-          4. Если дочерний контур:
-             - имеет площадь < ROOM_FLOOD_MIN_AREA_RATIO * img_size
-               (не «комната»)
-             - и его bounding box компактен (aspect < FURNITURE_MIN_ASPECT_RATIO)
-             → заполняем его нулями (удаляем из маски).
-          5. Это эффективно убирает столы, диваны, лестницы и т.п.,
-             «вложенные» внутри контура стен.
-
-        Параметры:
-            wall_mask: бинарная маска стен (0/255).
-
-        Возвращает:
-            Очищенную маску.
-        """
         cleaned = wall_mask.copy()
         total_pixels = wall_mask.size
 
@@ -1473,74 +1872,46 @@ class VersatileWallDetector(ColorBasedWallDetector):
         if hierarchy is None or len(contours) == 0:
             return cleaned
 
-        hierarchy = hierarchy[0]  # shape: (N, 4) — next, prev, child, parent
-
+        hierarchy = hierarchy[0]
         min_room_area = Theme.ROOM_FLOOD_MIN_AREA_RATIO * total_pixels
 
         for idx in range(len(contours)):
             parent_idx = hierarchy[idx][3]
-
-            # Обрабатываем только дочерние контуры (есть родитель)
             if parent_idx < 0:
                 continue
 
             contour = contours[idx]
             area = cv2.contourArea(contour)
 
-            # Пропускаем крупные внутренние контуры (комнаты, большие полости)
             if area >= min_room_area:
                 continue
 
-            # Проверяем компактность: мебель обычно компактна
             x, y, w, h = cv2.boundingRect(contour)
             dim_max = max(w, h)
             dim_min = max(1, min(w, h))
             aspect = dim_max / dim_min
 
             if aspect < Theme.FURNITURE_MIN_ASPECT_RATIO:
-                # Компактный внутренний контур → вероятная мебель → удаляем
                 cv2.drawContours(
                     cleaned, [contour], -1, 0, thickness=cv2.FILLED,
                 )
 
-        # Лёгкая эрозия для удаления остаточных артефактов на границах
         erode_size = Theme.ROOM_FLOOD_ERODE_SIZE
         if erode_size > 0:
             kernel = np.ones((erode_size, erode_size), np.uint8)
-            # Эрозия + обратная дилатация (открытие) — удаляет мелкие выступы
             cleaned = cv2.morphologyEx(
                 cleaned, cv2.MORPH_OPEN, kernel, iterations=1,
             )
 
         return cleaned
 
-    # ============================================================
-    # SOLUTION 4: ФИЛЬТРАЦИЯ ПРЯМОУГОЛЬНИКОВ (v4.1)
-    # ============================================================
+    # ---- ФИЛЬТРАЦИЯ ПРЯМОУГОЛЬНИКОВ (v4.1) ----
 
     def _filter_furniture_rects(
         self,
         rectangles: List[WallRectangle],
         img_shape: Tuple[int, int],
     ) -> List[WallRectangle]:
-        """Фильтрует прямоугольники, вероятно являющиеся мебелью.
-
-        Критерии удаления прямоугольника:
-          1. Площадь < RECT_MIN_AREA_RATIO × image_area.
-          2. Aspect ratio < RECT_MIN_ASPECT_RATIO (квадратный → мебель).
-          3. Не связан с другими прямоугольниками и не касается
-             границы изображения (изолированный → мебель).
-
-        Связность проверяется как расстояние между ближайшими
-        краями двух прямоугольников <= RECT_CONNECTIVITY_MARGIN_PX.
-
-        Параметры:
-            rectangles: список прямоугольников из декомпозиции.
-            img_shape:  (height, width) изображения.
-
-        Возвращает:
-            Отфильтрованный список прямоугольников (с пересчитанными id).
-        """
         if not rectangles:
             return rectangles
 
@@ -1551,7 +1922,6 @@ class VersatileWallDetector(ColorBasedWallDetector):
         margin = Theme.RECT_CONNECTIVITY_MARGIN_PX
 
         def touches_border(r: WallRectangle) -> bool:
-            """Проверяет, касается ли прямоугольник границы изображения."""
             return (
                 r.x1 <= margin
                 or r.y1 <= margin
@@ -1559,41 +1929,29 @@ class VersatileWallDetector(ColorBasedWallDetector):
                 or r.y2 >= img_h - 1 - margin
             )
 
-        def rects_connected(
-            a: WallRectangle, b: WallRectangle,
-        ) -> bool:
-            """Проверяет, находятся ли два прямоугольника рядом."""
-            # Расстояние между ближайшими краями по X и Y
+        def rects_connected(a: WallRectangle, b: WallRectangle) -> bool:
             gap_x = max(0, max(a.x1, b.x1) - min(a.x2, b.x2))
             gap_y = max(0, max(a.y1, b.y1) - min(a.y2, b.y2))
             return gap_x <= margin and gap_y <= margin
 
-        # Шаг 1: базовая фильтрация по площади и aspect ratio
         candidates: List[Tuple[int, WallRectangle, bool]] = []
         for idx, rect in enumerate(rectangles):
             dim_max = max(rect.width, rect.height)
             dim_min = max(1, min(rect.width, rect.height))
             aspect = dim_max / dim_min
 
-            # Автоматически сохраняем: крупные ИЛИ вытянутые
             auto_keep = rect.area >= min_area and aspect >= min_aspect
-            # Также сохраняем крупные даже при низком aspect
-            force_keep = rect.area >= min_area * 5  # очень крупные
+            force_keep = rect.area >= min_area * 5
             candidates.append((idx, rect, auto_keep or force_keep))
 
-        # Шаг 2: проверка связности для «сомнительных» прямоугольников
         kept_rects: List[WallRectangle] = []
         for idx, rect, auto_kept in candidates:
             if auto_kept:
                 kept_rects.append(rect)
                 continue
-
-            # Проверяем: касается границы?
             if touches_border(rect):
                 kept_rects.append(rect)
                 continue
-
-            # Проверяем: связан с каким-либо «хорошим» прямоугольником?
             connected_to_good = any(
                 rects_connected(rect, other_rect)
                 for other_idx, other_rect, other_kept in candidates
@@ -1601,12 +1959,7 @@ class VersatileWallDetector(ColorBasedWallDetector):
             )
             if connected_to_good:
                 kept_rects.append(rect)
-                continue
 
-            # Иначе — отбрасываем как вероятную мебель
-            # (можно добавить логирование здесь при отладке)
-
-        # Пересчёт id
         result: List[WallRectangle] = []
         for new_id, rect in enumerate(kept_rects):
             result.append(WallRectangle(
@@ -1619,32 +1972,11 @@ class VersatileWallDetector(ColorBasedWallDetector):
 
         return result
 
-    # ============================================================
-    # SOLUTION 5: ДЕТЕКЦИЯ ПАРАЛЛЕЛЬНЫХ ПАР СТЕН (v4.1)
-    # ============================================================
+    # ---- ПАРАЛЛЕЛЬНЫЕ ПАРЫ (v4.1) ----
 
     def _detect_parallel_wall_pairs(
         self, img: np.ndarray,
     ) -> Optional[np.ndarray]:
-        """Находит пары параллельных линий на заданном расстоянии
-        и заполняет область между ними (двойные стены).
-
-        Алгоритм:
-          1. Извлекаем все линии через LSD/Hough.
-          2. Группируем по ориентации (горизонтальные / вертикальные).
-          3. Для каждой пары проверяем:
-             - Параллельность (разница углов < PARALLEL_ANGLE_TOLERANCE_DEG).
-             - Расстояние между ними в диапазоне
-               [PARALLEL_DISTANCE_MIN_PX, PARALLEL_DISTANCE_MAX_PX].
-             - Перекрытие проекций > 50%.
-          4. Рисуем заполненную область между такими парами.
-
-        Параметры:
-            img: входное изображение BGR.
-
-        Возвращает:
-            Маску параллельных стен или None если ничего не найдено.
-        """
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         h_img, w_img = gray.shape[:2]
         diagonal = np.hypot(w_img, h_img)
@@ -1653,7 +1985,6 @@ class VersatileWallDetector(ColorBasedWallDetector):
             Theme.STRUCT_MIN_LINE_RATIO * diagonal,
         )
 
-        # Извлечение линий
         raw_lines: List[Tuple[int, int, int, int]] = []
         try:
             lsd = cv2.createLineSegmentDetector(0)
@@ -1676,7 +2007,6 @@ class VersatileWallDetector(ColorBasedWallDetector):
                 for line in hough:
                     raw_lines.append(tuple(line[0]))
 
-        # Фильтрация по длине и углу
         filtered = self._filter_lines_by_geometry(
             raw_lines, min_length, diagonal
         )
@@ -1684,15 +2014,12 @@ class VersatileWallDetector(ColorBasedWallDetector):
         if len(filtered) < 2:
             return None
 
-        # Разделение на горизонтальные и вертикальные
         horizontal: List[Tuple[int, int, int, int, float]] = []
         vertical: List[Tuple[int, int, int, int, float]] = []
         angle_tol = Theme.ANGLE_TOLERANCE_DEG
 
         for x1, y1, x2, y2 in filtered:
             angle = np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180.0
-            length = np.hypot(x2 - x1, y2 - y1)
-
             if angle <= angle_tol or angle >= (180.0 - angle_tol):
                 horizontal.append((x1, y1, x2, y2, angle))
             elif abs(angle - 90.0) <= angle_tol:
@@ -1705,11 +2032,9 @@ class VersatileWallDetector(ColorBasedWallDetector):
         dist_max = Theme.PARALLEL_DISTANCE_MAX_PX
         par_angle_tol = Theme.PARALLEL_ANGLE_TOLERANCE_DEG
 
-        # Поиск горизонтальных пар (сортировка по Y)
         for group in [horizontal, vertical]:
             if len(group) < 2:
                 continue
-
             is_horiz = (group is horizontal)
 
             for i in range(len(group)):
@@ -1717,53 +2042,37 @@ class VersatileWallDetector(ColorBasedWallDetector):
                     x1a, y1a, x2a, y2a, ang_a = group[i]
                     x1b, y1b, x2b, y2b, ang_b = group[j]
 
-                    # Проверка параллельности
                     angle_diff = abs(ang_a - ang_b)
                     angle_diff = min(angle_diff, 180.0 - angle_diff)
                     if angle_diff > par_angle_tol:
                         continue
 
-                    # Расстояние между линиями
                     if is_horiz:
-                        # Для горизонтальных: расстояние по Y
                         mid_y_a = (y1a + y2a) / 2.0
                         mid_y_b = (y1b + y2b) / 2.0
                         dist = abs(mid_y_a - mid_y_b)
-
-                        # Перекрытие по X
                         xa_min, xa_max = min(x1a, x2a), max(x1a, x2a)
                         xb_min, xb_max = min(x1b, x2b), max(x1b, x2b)
-                        overlap_start = max(xa_min, xb_min)
-                        overlap_end = min(xa_max, xb_max)
-                        overlap = max(0, overlap_end - overlap_start)
-                        span = max(
-                            1,
-                            min(xa_max - xa_min, xb_max - xb_min),
+                        overlap = max(
+                            0, min(xa_max, xb_max) - max(xa_min, xb_min)
                         )
+                        span = max(1, min(xa_max - xa_min, xb_max - xb_min))
                     else:
-                        # Для вертикальных: расстояние по X
                         mid_x_a = (x1a + x2a) / 2.0
                         mid_x_b = (x1b + x2b) / 2.0
                         dist = abs(mid_x_a - mid_x_b)
-
-                        # Перекрытие по Y
                         ya_min, ya_max = min(y1a, y2a), max(y1a, y2a)
                         yb_min, yb_max = min(y1b, y2b), max(y1b, y2b)
-                        overlap_start = max(ya_min, yb_min)
-                        overlap_end = min(ya_max, yb_max)
-                        overlap = max(0, overlap_end - overlap_start)
-                        span = max(
-                            1,
-                            min(ya_max - ya_min, yb_max - yb_min),
+                        overlap = max(
+                            0, min(ya_max, yb_max) - max(ya_min, yb_min)
                         )
+                        span = max(1, min(ya_max - ya_min, yb_max - yb_min))
 
-                    # Проверки
                     if dist < dist_min or dist > dist_max:
                         continue
                     if overlap / span < 0.5:
                         continue
 
-                    # Рисуем заполненный полигон между двумя линиями
                     pts = np.array([
                         [x1a, y1a], [x2a, y2a],
                         [x2b, y2b], [x1b, y1b],
@@ -1773,107 +2082,63 @@ class VersatileWallDetector(ColorBasedWallDetector):
 
         return parallel_mask if found_any else None
 
-    # ============================================================
-    # SOLUTION 6: ЭВРИСТИКА ФОЛЛБЭКА (v4.1)
-    # ============================================================
+    # ---- ФОЛЛБЭК (v4.1) ----
 
     @staticmethod
     def _should_fallback_to_color(mask: np.ndarray) -> bool:
-        """Определяет, нужно ли переключиться на цветовой режим.
-
-        Эвристика: если структурная детекция порождает слишком много
-        мелких разрозненных компонент, это признак того, что
-        она «подхватила» мебель, текстуры и шумы вместо стен.
-
-        Параметры:
-            mask: бинарная маска после структурной детекции.
-
-        Возвращает:
-            True если нужен фоллбэк, False иначе.
-        """
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
             mask, connectivity=8,
         )
-        # Вычитаем 1 (фон)
         num_components = num_labels - 1
 
         if num_components > Theme.STRUCT_MAX_COMPONENTS_BEFORE_FALLBACK:
             return True
 
-        # Дополнительная проверка: если медианная площадь компонент
-        # слишком мала — тоже признак шума/мебели
         if num_components > 0:
             areas = [
-                stats[i, cv2.CC_STAT_AREA]
-                for i in range(1, num_labels)
+                stats[i, cv2.CC_STAT_AREA] for i in range(1, num_labels)
             ]
             median_area = float(np.median(areas))
             min_expected = Theme.STRUCT_MIN_WALL_AREA_RATIO * mask.size
-            # Если медианная компонента меньше 2× минимального порога
             if median_area < 2.0 * min_expected:
                 return True
 
         return False
 
-    # ============================================================
-    # ПЕРЕОПРЕДЕЛЕНИЕ process() — v4.1 С ФИЛЬТРАЦИЕЙ МЕБЕЛИ
-    # ============================================================
+    # ---- process() v5.0 ----
 
     def process(
         self,
         img: np.ndarray,
     ) -> Tuple[np.ndarray, List[WallRectangle], np.ndarray]:
-        """Запускает полный пайплайн с фильтрацией мебели (v4.1).
-
-        Этапы:
-          1. OCR-очистка текстовых меток.
-          2. Создание маски стен (цвет / структура / гибрид / авто)
-             с фильтрацией мебели на уровне маски.
-          3. Удаление круглых меток.
-          4. Морфологическая очистка.
-          5. Прямоугольная декомпозиция.
-          6. Фильтрация прямоугольников-мебели (v4.1).
-          7. Формирование объединённой формы стен.
-          8. Построение только внешних контуров.
-
-        Параметры:
-            img: входное изображение BGR.
-
-        Возвращает:
-            wall_mask:    бинарная маска стен.
-            rectangles:   список прямоугольников декомпозиции.
-            outline_mask: маска с внешними контурами.
-        """
-        # 1. Удаление текстовых меток через OCR + инпэйнтинг
+        """Полный пайплайн v5.0 с авто-классификацией стен."""
+        # 1. OCR-очистка
         img_no_text = self.remove_text_labels_ocr(img)
 
-        # 2. Создание маски стен (ВКЛЮЧАЕТ фильтрацию мебели на
-        #    уровне маски для structure/hybrid/auto режимов)
+        # 2. Маска стен (автоклассификация внутри create_wall_mask)
         wall_mask = self.create_wall_mask(img_no_text)
 
-        # 3. Удаление наиболее выраженной круглой метки
+        # 3. Круглые метки
         wall_mask = self.remove_circular_labels(wall_mask)
 
-        # 4. Морфологическая очистка шума и мелких компонент
+        # 4. Морфологическая очистка
         wall_mask = morphological_cleanup(wall_mask)
 
-        # 5. Жадная прямоугольная декомпозиция маски
+        # 5. Прямоугольная декомпозиция
         rectangles = self._decompose_to_rectangles(
             wall_mask, img=img_no_text
         )
 
-        # 6. Фильтрация прямоугольников-мебели (v4.1)
-        #    Применяется только для не-цветовых режимов,
-        #    где структурная детекция может породить ложные rect'ы.
+        # 6. Фильтрация мебельных rect'ов (не для чистого «filled»)
         if (
             self.enable_furniture_filter
-            and self.wall_detection_mode != "color"
+            and self._last_classified_style not in ("filled",)
         ):
             rectangles = self._filter_furniture_rects(
                 rectangles, wall_mask.shape,
             )
 
-        # 7. Объединённая форма из всех прямоугольников
+        # 7. Объединённая форма
         union_mask = np.zeros_like(wall_mask, dtype=np.uint8)
         for rect in rectangles:
             cv2.rectangle(
@@ -1883,7 +2148,6 @@ class VersatileWallDetector(ColorBasedWallDetector):
                 255, -1,
             )
 
-        # Закрываем зазоры между соседними прямоугольниками
         if self.rect_visual_gap_px > 0:
             k = 2 * self.rect_visual_gap_px + 1
             kernel = np.ones((k, k), np.uint8)
@@ -1891,7 +2155,7 @@ class VersatileWallDetector(ColorBasedWallDetector):
                 union_mask, cv2.MORPH_CLOSE, kernel, iterations=1,
             )
 
-        # 8. Только внешние контуры объединённой формы
+        # 8. Внешние контуры
         contours, _ = cv2.findContours(
             union_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
         )
