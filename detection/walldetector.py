@@ -67,11 +67,26 @@ class Theme:
     RECT_VISUAL_GAP_DEFAULT: int = 3
 
     # --- Автодетекция цвета стен (K-means) ---
-    KMEANS_K: int = 6
+    KMEANS_K: int = 8
     KMEANS_MAX_SAMPLES: int = 2_000_000
-    KMEANS_MIN_FRACTION: float = 0.03
+    KMEANS_MIN_FRACTION: float = 0.02
     KMEANS_ITERATIONS: int = 10
     KMEANS_EPSILON: float = 1.0
+
+    # --- Автодетекция: фильтрация кластеров по яркости (LAB L*) ---
+    AUTO_L_MIN: int = 15          # exclude near-black (text, thin lines)
+    AUTO_L_MAX: int = 210         # exclude near-white (background, floor fill)
+
+    # --- Автодетекция: пространственная когерентность ---
+    AUTO_COHERENCE_MIN_COMPONENT_AREA: int = 500   # min CC area in pixels
+    AUTO_COHERENCE_WEIGHT: float = 0.6              # weight for spatial score
+    AUTO_AREA_WEIGHT: float = 0.4                   # weight for pixel-count score
+
+    # --- Автодетекция: адаптивные допуски HSV ---
+    AUTO_HSV_H_TOLERANCE: int = 6
+    AUTO_HSV_S_TOLERANCE: int = 25
+    AUTO_HSV_V_TOLERANCE: int = 20
+    AUTO_RGB_TOLERANCE: int = 18
 
     # --- OCR-очистка ---
     OCR_INPAINT_RADIUS_DEFAULT: int = 3
@@ -225,6 +240,89 @@ def morphological_cleanup(mask: np.ndarray) -> np.ndarray:
         if area > Theme.MORPH_COMPONENT_MIN_AREA:
             cleaned[labels == i] = 255
     return cleaned
+
+
+def refine_wall_mask_by_enclosed_regions(
+    wall_mask: np.ndarray,
+    img: np.ndarray,
+    fill_threshold: float = 0.50,
+    black_threshold: int = 60,
+    min_region_area: int = 200,
+) -> np.ndarray:
+    """Refine wall mask using enclosed regions bounded by black outlines.
+
+    Algorithm:
+      1. Extract black outline pixels from the image (grayscale < black_threshold).
+      2. Find all enclosed regions (connected components of non-black pixels).
+      3. Exclude background — regions touching the image border.
+      4. For each interior enclosed region:
+         - If ≥ fill_threshold of its area is covered by wall_mask → fill entirely.
+         - Otherwise → clear all wall_mask pixels in that region.
+
+    This produces cleaner wall masks where partial color coverage inside a
+    wall outline is filled solid, and non-wall enclosed spaces (rooms, etc.)
+    are cleaned of stray wall-color pixels.
+
+    Args:
+        wall_mask: Binary mask (0/255) of detected wall pixels.
+        img: Original BGR image (used to find black outlines).
+        fill_threshold: Minimum fraction of wall coverage to fill a region (default 0.50).
+        black_threshold: Grayscale value below which a pixel is considered "black outline".
+        min_region_area: Ignore regions smaller than this (noise).
+
+    Returns:
+        Refined wall mask (0/255), same shape as input.
+    """
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
+    h, w = gray.shape[:2]
+
+    # Black outlines = barrier
+    outline_pixels = (gray < black_threshold).astype(np.uint8) * 255
+
+    # Thicken outlines slightly to close small gaps in lines
+    kernel = np.ones((3, 3), np.uint8)
+    outline_pixels = cv2.dilate(outline_pixels, kernel, iterations=1)
+
+    # Non-outline regions: these are the "enclosed spaces"
+    non_outline = cv2.bitwise_not(outline_pixels)
+
+    # Find connected components of non-outline pixels
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        non_outline, connectivity=4
+    )
+
+    # Identify background labels — any component that touches the image border
+    border_labels = set()
+    border_labels.update(np.unique(labels[0, :]))       # top row
+    border_labels.update(np.unique(labels[h - 1, :]))   # bottom row
+    border_labels.update(np.unique(labels[:, 0]))        # left column
+    border_labels.update(np.unique(labels[:, w - 1]))    # right column
+    border_labels.discard(0)  # label 0 = outline pixels themselves
+
+    refined = wall_mask.copy()
+    wall_binary = (wall_mask > 0)
+
+    for label_id in range(1, num_labels):
+        # Skip background regions
+        if label_id in border_labels:
+            continue
+
+        area = stats[label_id, cv2.CC_STAT_AREA]
+        if area < min_region_area:
+            continue
+
+        region_mask = (labels == label_id)
+        wall_pixels_in_region = np.count_nonzero(wall_binary & region_mask)
+        coverage = wall_pixels_in_region / area
+
+        if coverage >= fill_threshold:
+            # Fill entire enclosed region with wall
+            refined[region_mask] = 255
+        else:
+            # Clear wall pixels from this non-wall region
+            refined[region_mask] = 0
+
+    return refined
 
 
 # ============================================================
@@ -445,6 +543,18 @@ class ColorBasedWallDetector:
         k: int = Theme.KMEANS_K,
         max_samples: int = Theme.KMEANS_MAX_SAMPLES,
     ) -> Tuple[int, int, int]:
+        """Auto-detect the dominant wall color via K-means + spatial coherence.
+
+        Algorithm:
+          1. K-means on pixel colors (BGR).
+          2. Filter clusters: exclude near-black (text) and near-white (bg).
+          3. For each surviving cluster, compute a spatial coherence score:
+             largest connected component area in that cluster's mask.
+          4. Rank by weighted combination of pixel count and coherence.
+          5. Among the top candidates, prefer the darkest (walls are typically
+             darker than furniture fill but lighter than text).
+        """
+        h_img, w_img = img.shape[:2]
         pixels = img.reshape(-1, 3).astype(np.float32)
 
         if pixels.shape[0] > max_samples:
@@ -469,37 +579,109 @@ class ColorBasedWallDetector:
             Theme.KMEANS_ITERATIONS,
             Theme.KMEANS_EPSILON,
         )
-        _, labels, centers = cv2.kmeans(
+        _, labels_flat, centers = cv2.kmeans(
             sample, K, None, criteria, 3, cv2.KMEANS_PP_CENTERS
         )
-        labels = labels.flatten()
+        labels_flat = labels_flat.flatten()
         centers = centers.astype(np.uint8)
 
-        counts = np.bincount(labels, minlength=K).astype(np.float32)
-        fractions = counts / float(labels.size)
+        counts = np.bincount(labels_flat, minlength=K).astype(np.float32)
+        fractions = counts / float(labels_flat.size)
 
+        # --- Convert cluster centers to LAB for lightness filtering ---
         centers_bgr = centers.reshape(K, 1, 3)
         centers_lab = cv2.cvtColor(
             centers_bgr, cv2.COLOR_BGR2LAB
         ).reshape(K, 3)
-        L = centers_lab[:, 0]
+        L = centers_lab[:, 0].astype(float)
 
-        candidate_idx = np.where(fractions >= min_fraction)[0]
+        # --- Filter: exclude near-black (text) and near-white (background) ---
+        candidate_mask = (
+            (fractions >= min_fraction)
+            & (L >= Theme.AUTO_L_MIN)
+            & (L <= Theme.AUTO_L_MAX)
+        )
+        candidate_idx = np.where(candidate_mask)[0]
+
+        if candidate_idx.size == 0:
+            # Relax: only exclude near-white
+            candidate_idx = np.where(
+                (fractions >= min_fraction) & (L <= Theme.AUTO_L_MAX)
+            )[0]
+        if candidate_idx.size == 0:
+            # Fully relax: any cluster above min_fraction
+            candidate_idx = np.where(fractions >= min_fraction)[0]
         if candidate_idx.size == 0:
             candidate_idx = np.arange(K)
 
-        darkest_idx = candidate_idx[np.argmin(L[candidate_idx])]
-        chosen_bgr = centers[darkest_idx]
+        if candidate_idx.size == 1:
+            chosen_bgr = centers[candidate_idx[0]]
+            return int(chosen_bgr[2]), int(chosen_bgr[1]), int(chosen_bgr[0])
 
+        # --- Spatial coherence: build per-cluster label map on full image ---
+        label_map = self._build_label_map(img, centers, K)
+
+        # For each candidate, find the area of its largest connected component
+        coherence = np.zeros(K, dtype=np.float64)
+        for ci in candidate_idx:
+            cluster_mask = (label_map == ci).astype(np.uint8)
+            num_labels, _, stats, _ = cv2.connectedComponentsWithStats(
+                cluster_mask, connectivity=8
+            )
+            if num_labels <= 1:
+                continue
+            areas = stats[1:, cv2.CC_STAT_AREA]
+            max_cc = int(areas.max()) if areas.size > 0 else 0
+            if max_cc >= Theme.AUTO_COHERENCE_MIN_COMPONENT_AREA:
+                coherence[ci] = float(max_cc)
+
+        # --- Score candidates: weighted combination of area + coherence ---
+        max_count = float(counts[candidate_idx].max()) or 1.0
+        max_coherence = float(coherence[candidate_idx].max()) or 1.0
+
+        best_score = -1.0
+        best_idx = candidate_idx[0]
+        for ci in candidate_idx:
+            area_score = counts[ci] / max_count
+            coh_score = coherence[ci] / max_coherence
+            combined = (
+                Theme.AUTO_AREA_WEIGHT * area_score
+                + Theme.AUTO_COHERENCE_WEIGHT * coh_score
+            )
+            if combined > best_score:
+                best_score = combined
+                best_idx = ci
+
+        chosen_bgr = centers[best_idx]
         return int(chosen_bgr[2]), int(chosen_bgr[1]), int(chosen_bgr[0])
+
+    @staticmethod
+    def _build_label_map(
+        img: np.ndarray, centers: np.ndarray, k: int,
+    ) -> np.ndarray:
+        """Assign each pixel to its nearest K-means cluster center (L2)."""
+        h, w = img.shape[:2]
+        pixels = img.reshape(-1, 3).astype(np.float32)
+        centers_f = centers.astype(np.float32)
+        # Broadcast: (N,1,3) - (1,K,3) → (N,K,3)
+        diff = pixels[:, np.newaxis, :] - centers_f[np.newaxis, :, :]
+        dist = (diff * diff).sum(axis=2)  # (N, K)
+        label_map = dist.argmin(axis=1).astype(np.int32).reshape(h, w)
+        return label_map
 
     def filter_walls_by_color(self, img: np.ndarray) -> np.ndarray:
         if self.auto_wall_color:
             wall_rgb = self._detect_wall_color_auto(img)
             self.wall_rgb = wall_rgb
+            return self._filter_walls_auto(img, wall_rgb)
         else:
             wall_rgb = self.wall_rgb
+            return self._filter_walls_manual(img, wall_rgb)
 
+    def _filter_walls_manual(
+        self, img: np.ndarray, wall_rgb: Tuple[int, int, int],
+    ) -> np.ndarray:
+        """Original dual RGB+HSV gate for manually specified wall color."""
         target_r, target_g, target_b = wall_rgb
         tol = self.color_tolerance
 
@@ -538,6 +720,75 @@ class ColorBasedWallDetector:
         )
         combined_mask = cv2.morphologyEx(
             combined_mask, cv2.MORPH_CLOSE, kernel, iterations=1
+        )
+
+        return combined_mask
+
+    def _filter_walls_auto(
+        self, img: np.ndarray, wall_rgb: Tuple[int, int, int],
+    ) -> np.ndarray:
+        """Wider HSV-primary gate for auto-detected wall color.
+
+        Uses broader tolerances since the auto-detected color is already an
+        approximation.  The RGB gate uses the wider AUTO_RGB_TOLERANCE and is
+        combined with OR (union) instead of AND, then intersected with HSV so
+        that anti-aliased / JPEG-degraded edge pixels are not lost.
+        """
+        target_r, target_g, target_b = wall_rgb
+        tol = Theme.AUTO_RGB_TOLERANCE
+
+        # --- RGB mask (wider tolerance) ---
+        img_16 = img.astype(np.int16)
+        r_match = np.abs(img_16[:, :, 2] - target_r) <= tol
+        g_match = np.abs(img_16[:, :, 1] - target_g) <= tol
+        b_match = np.abs(img_16[:, :, 0] - target_b) <= tol
+        rgb_mask = (r_match & g_match & b_match).astype(np.uint8) * 255
+
+        # --- HSV mask (wider tolerance) ---
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        target_hsv = cv2.cvtColor(
+            np.uint8([[wall_rgb[::-1]]]),
+            cv2.COLOR_BGR2HSV,
+        )[0, 0]
+
+        h = hsv[:, :, 0].astype(np.int16)
+        s = hsv[:, :, 1].astype(np.int16)
+        v = hsv[:, :, 2].astype(np.int16)
+
+        target_h = int(target_hsv[0])
+        target_s = int(target_hsv[1])
+        target_v = int(target_hsv[2])
+
+        h_diff = np.abs(h - target_h)
+        h_diff = np.minimum(h_diff, 180 - h_diff)
+        h_match = h_diff <= Theme.AUTO_HSV_H_TOLERANCE
+
+        s_match = np.abs(s - target_s) <= Theme.AUTO_HSV_S_TOLERANCE
+        v_match = np.abs(v - target_v) <= Theme.AUTO_HSV_V_TOLERANCE
+        hsv_mask = (h_match & s_match & v_match).astype(np.uint8) * 255
+
+        # --- Combine: HSV is the primary gate; RGB is a confirming filter ---
+        combined_mask = cv2.bitwise_and(rgb_mask, hsv_mask)
+
+        # Also include pixels that pass a tighter RGB check (±tol*0.6) even
+        # if HSV drifted (useful for very dark / desaturated wall colors where
+        # HSV hue is unstable).
+        tight_tol = int(tol * 0.6)
+        r_tight = np.abs(img_16[:, :, 2] - target_r) <= tight_tol
+        g_tight = np.abs(img_16[:, :, 1] - target_g) <= tight_tol
+        b_tight = np.abs(img_16[:, :, 0] - target_b) <= tight_tol
+        tight_rgb = (r_tight & g_tight & b_tight).astype(np.uint8) * 255
+        combined_mask = cv2.bitwise_or(combined_mask, tight_rgb)
+
+        # --- Morphological cleanup ---
+        kernel = np.ones(
+            (Theme.MORPH_KERNEL_SIZE, Theme.MORPH_KERNEL_SIZE), np.uint8
+        )
+        combined_mask = cv2.morphologyEx(
+            combined_mask, cv2.MORPH_CLOSE, kernel, iterations=2
+        )
+        combined_mask = cv2.morphologyEx(
+            combined_mask, cv2.MORPH_OPEN, kernel, iterations=1
         )
 
         return combined_mask
@@ -777,6 +1028,7 @@ class ColorBasedWallDetector:
         wall_mask = self.filter_walls_by_color(img_no_text)
         wall_mask = self.remove_circular_labels(wall_mask)
         wall_mask = morphological_cleanup(wall_mask)
+        wall_mask = refine_wall_mask_by_enclosed_regions(wall_mask, img)
 
         rectangles = self._decompose_to_rectangles(
             wall_mask, img=img_no_text

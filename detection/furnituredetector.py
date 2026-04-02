@@ -23,7 +23,7 @@ from pathlib import Path
 # ============================================================
 
 current_dir = os.getcwd()
-yolo_path = os.path.join("D:/ReFloorBRUSNIKA", 'utils', 'yolov9')
+yolo_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'utils', 'yolov9')
 
 if os.path.exists(yolo_path):
     if yolo_path not in sys.path:
@@ -259,7 +259,6 @@ class YOLODoorWindowDetector:
         if img is None or img.size == 0:
             raise ValueError("Пустое изображение")
 
-        original_img = img.copy()
         h0, w0 = img.shape[:2]
 
         # Этап 1: Предобработка изображения
@@ -269,13 +268,15 @@ class YOLODoorWindowDetector:
 
         # Этап 2: Преобразование в тензор PyTorch
         im = torch.from_numpy(img_input).to(self.device)
+        del img_input  # free preprocessed numpy array
         im = im.half() if self.model.fp16 else im.float()
         im /= 255.0  # Нормализация к [0, 1]
         if len(im.shape) == 3:
             im = im[None]  # Добавление batch dimension
 
-        # Этап 3: Инференс модели
-        pred = self.model(im, augment=False, visualize=False)
+        # Этап 3: Инференс модели (no_grad — skip autograd, saves ~2x RAM)
+        with torch.no_grad():
+            pred = self.model(im, augment=False, visualize=False)
 
         # Этап 4: Non-Maximum Suppression
         pred = non_max_suppression(pred, self.conf_threshold, self.iou_threshold, classes=None, agnostic=False)
@@ -288,10 +289,12 @@ class YOLODoorWindowDetector:
         combined_window_mask = np.zeros((h0, w0), dtype=np.uint8)
 
         det = pred[0]
+        im_shape = im.shape[2:]  # save shape before freeing tensor
+        del im, pred  # free GPU/CPU tensor memory
 
         if len(det):
             # Масштабирование координат bbox к исходному размеру изображения
-            det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], (h0, w0)).round()
+            det[:, :4] = scale_boxes(im_shape, det[:, :4], (h0, w0)).round()
 
             for *xyxy, conf, cls in reversed(det):
                 x1, y1, x2, y2 = map(int, xyxy)
@@ -308,20 +311,20 @@ class YOLODoorWindowDetector:
 
                 class_name = self.CLASS_NAMES.get(class_id, f"class_{class_id}")
 
-                # Создание маски из ограничивающего прямоугольника
-                bbox_mask = np.zeros((h0, w0), dtype=np.uint8)
-                bbox_mask[y1:y2, x1:x2] = 255
-
-                # Создание объекта детекции
+                # Создание объекта детекции (no per-detection mask to save RAM)
                 detection = YOLODetection(
                     class_id=class_id,
                     class_name=class_name,
                     confidence=conf_val,
                     bbox=(x1, y1, x2, y2),
-                    mask=bbox_mask
+                    mask=None
                 )
 
                 all_detections.append(detection)
+
+                # Build bbox mask for combined masks
+                bbox_mask = np.zeros((h0, w0), dtype=np.uint8)
+                cv2.rectangle(bbox_mask, (x1, y1), (x2, y2), 255, -1)
 
                 # Классификация по типу объекта
                 if class_id == 0:  # Дверь

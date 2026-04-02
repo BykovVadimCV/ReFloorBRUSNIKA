@@ -116,6 +116,8 @@ class StylePreset(str, Enum):
     JAPANESE_MINIMAL = "japanese_minimal"
     MEDITERRANEAN = "mediterranean"
     NIGHT_MODE = "night_mode"
+    BW_OUTLINE = "bw_outline"
+    BW_SOLID = "bw_solid"
     CUSTOM = "custom"
 
 
@@ -440,6 +442,56 @@ def _register_themes():
         },
     )
 
+    # B&W Outline — black outlines on white, no room fills, no annotations
+    _BW_WHITE = (255, 255, 255)
+    _BW_BLACK = (0, 0, 0)
+    _bw_rooms = {
+        rt: RoomStyle(fill=_BW_WHITE, stroke=_BW_BLACK)
+        for rt in [
+            "living", "kitchen", "bedroom", "bathroom", "corridor",
+            "dining", "home_office", "laundry", "walk_in_closet",
+            "terrace", "gym", "atrium", "winter_garden",
+        ]
+    }
+    _THEMES["bw_outline"] = ThemeSpec(
+        name="bw_outline",
+        background=_BW_WHITE,
+        wall_color=_BW_BLACK,
+        wall_ext_color=_BW_BLACK,
+        furniture_fill=_BW_WHITE,
+        furniture_stroke=_BW_BLACK,
+        window_color=_BW_BLACK,
+        door_color=_BW_BLACK,
+        label_color=_BW_BLACK,
+        balcony_stripe=_BW_BLACK,
+        shadow_offset=0,
+        accent_public=_BW_WHITE,
+        accent_private=_BW_WHITE,
+        accent_service=_BW_WHITE,
+        accent_circulation=_BW_WHITE,
+        room_styles=_bw_rooms,
+    )
+
+    # B&W Solid — black filled walls and furniture on white, no room fills, no annotations
+    _THEMES["bw_solid"] = ThemeSpec(
+        name="bw_solid",
+        background=_BW_WHITE,
+        wall_color=_BW_BLACK,
+        wall_ext_color=_BW_BLACK,
+        furniture_fill=_BW_BLACK,
+        furniture_stroke=_BW_BLACK,
+        window_color=_BW_BLACK,
+        door_color=_BW_BLACK,
+        label_color=_BW_BLACK,
+        balcony_stripe=_BW_BLACK,
+        shadow_offset=0,
+        accent_public=_BW_WHITE,
+        accent_private=_BW_WHITE,
+        accent_service=_BW_WHITE,
+        accent_circulation=_BW_WHITE,
+        room_styles=deepcopy(_bw_rooms),
+    )
+
 
 _register_themes()
 
@@ -506,7 +558,7 @@ class FloorPlanConfig(BaseModel):
     vary_wall_thickness: bool = True
     vary_room_counts: bool = True
     vary_balcony: bool = True
-    wall_thickness_range: Tuple[int, int] = (7, 30)
+    wall_thickness_range: Tuple[int, int] = (7, 100)
     balcony_probability: float = Field(0.7, ge=0.0, le=1.0)
     augmentation_probability: float = Field(0.3, ge=0.0, le=1.0)
     rotation_probability: float = Field(0.15, ge=0.0, le=1.0)
@@ -540,6 +592,7 @@ class FloorPlanConfig(BaseModel):
     door_draw_style: str = Field("random", description="Door drawing style: slab, cross, or random")
     generate_unet_masks: bool = Field(True, description="Generate U-Net segmentation masks")
     unet_mask_colorized: bool = Field(False, description="Also save colorized mask visualization")
+
 
     class Config:
         use_enum_values = True
@@ -1971,6 +2024,10 @@ class TextureEngine:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# 6b. B&W MULTI-CANVAS MIRROR HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # 7. SEMANTIC FURNITURE PLACER (unchanged from v5.0)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2036,7 +2093,8 @@ class SemanticFurniturePlacer:
         fill = self.theme.furniture_fill
         stroke = self.theme.furniture_stroke
         for _ in range(10):
-            shape = self.rng.choice(["rectangle", "ellipse", "circle"])
+            shape = self.rng.choice(["rectangle", "ellipse", "circle",
+                                     "toilet", "sink", "bathtub", "framed"])
             rw, rh = room.width, room.height
             if shape == "rectangle":
                 w = self.rng.randint(int(rw * 0.15), max(20, int(rw * 0.40)))
@@ -2068,7 +2126,7 @@ class SemanticFurniturePlacer:
                 cv2.ellipse(img, (cx, cy), (a, b), 0, 0, 360, stroke, 1, cv2.LINE_AA)
                 self.add_occupied(cx - a, cy - b, cx + a, cy + b, "furniture")
                 break
-            else:
+            elif shape == "circle":
                 r = self.rng.randint(int(min(rw, rh) * 0.08),
                                      max(10, int(min(rw, rh) * 0.18)))
                 cx_range = room.x2 - margin - r - (room.x1 + margin + r)
@@ -2082,6 +2140,23 @@ class SemanticFurniturePlacer:
                 cv2.circle(img, (cx, cy), r, fill, -1, cv2.LINE_AA)
                 cv2.circle(img, (cx, cy), r, stroke, 1, cv2.LINE_AA)
                 self.add_occupied(cx - r, cy - r, cx + r, cy + r, "furniture")
+                break
+            else:
+                # Fixture shapes: toilet, sink, bathtub, framed
+                w = self.rng.randint(int(rw * 0.10), max(15, int(rw * 0.30)))
+                h = self.rng.randint(int(rh * 0.10), max(15, int(rh * 0.30)))
+                pos = self._pick_wall_adjacent_pos(room, w, h, margin=margin)
+                if pos is None:
+                    continue
+                x, y = pos
+                draw_fn = {
+                    "toilet": self._draw_toilet,
+                    "sink": self._draw_sink,
+                    "bathtub": self._draw_bathtub,
+                    "framed": self._draw_framed_element,
+                }[shape]
+                draw_fn(img, x, y, w, h)
+                self.add_occupied(x, y, x + w, y + h, "furniture")
                 break
 
     def _place_kitchen_suite(self, img, room):
@@ -2125,48 +2200,197 @@ class SemanticFurniturePlacer:
             cv2.rectangle(img, (x1, y1), (x2, y2), stroke, 1, cv2.LINE_AA)
             self.add_occupied(x1, y1, x2, y2, "furniture")
 
+    # ------------------------------------------------------------------
+    # Fixture drawing primitives
+    # ------------------------------------------------------------------
+
+    def _draw_toilet(self, img, x, y, w, h):
+        """Toilet: rounded rectangle tank + circular bowl."""
+        fill = self.theme.furniture_fill
+        stroke = self.theme.furniture_stroke
+        # Tank (upper portion ~35%)
+        tank_h = max(3, int(h * 0.35))
+        r_tank = max(1, min(w // 6, tank_h // 6))
+        pts_tank = self._rounded_rect_pts(x, y, w, tank_h, r_tank)
+        cv2.fillPoly(img, [pts_tank], fill, cv2.LINE_AA)
+        cv2.polylines(img, [pts_tank], True, stroke, 1, cv2.LINE_AA)
+        # Bowl (circle in remaining space)
+        bowl_cy = y + tank_h + (h - tank_h) // 2
+        bowl_cx = x + w // 2
+        bowl_r = min(w // 2 - 1, (h - tank_h) // 2 - 1)
+        if bowl_r > 1:
+            cv2.circle(img, (bowl_cx, bowl_cy), bowl_r, fill, -1, cv2.LINE_AA)
+            cv2.circle(img, (bowl_cx, bowl_cy), bowl_r, stroke, 1, cv2.LINE_AA)
+
+    def _draw_sink(self, img, x, y, w, h):
+        """Sink: square outline + cross inside."""
+        fill = self.theme.furniture_fill
+        stroke = self.theme.furniture_stroke
+        cv2.rectangle(img, (x, y), (x + w, y + h), fill, -1, cv2.LINE_AA)
+        cv2.rectangle(img, (x, y), (x + w, y + h), stroke, 1, cv2.LINE_AA)
+        # Cross
+        mx, my = x + w // 2, y + h // 2
+        pad = max(2, min(w, h) // 5)
+        cv2.line(img, (mx, y + pad), (mx, y + h - pad), stroke, 1, cv2.LINE_AA)
+        cv2.line(img, (x + pad, my), (x + w - pad, my), stroke, 1, cv2.LINE_AA)
+
+    def _draw_bathtub(self, img, x, y, w, h):
+        """Bathtub: rounded rectangle outer + inner inset."""
+        fill = self.theme.furniture_fill
+        stroke = self.theme.furniture_stroke
+        bg = self.theme.background
+        r_out = max(1, min(w // 4, h // 4))
+        pts_out = self._rounded_rect_pts(x, y, w, h, r_out)
+        cv2.fillPoly(img, [pts_out], fill, cv2.LINE_AA)
+        cv2.polylines(img, [pts_out], True, stroke, 1, cv2.LINE_AA)
+        pad = max(2, int(min(w, h) * 0.10))
+        r_in = max(1, min((w - 2 * pad) // 4, (h - 2 * pad) // 4))
+        pts_in = self._rounded_rect_pts(x + pad, y + pad, w - 2 * pad, h - 2 * pad, r_in)
+        cv2.fillPoly(img, [pts_in], bg, cv2.LINE_AA)
+        cv2.polylines(img, [pts_in], True, stroke, 1, cv2.LINE_AA)
+
+    def _draw_framed_element(self, img, x, y, w, h):
+        """Framed element: rectangle + zigzag line inside."""
+        fill = self.theme.furniture_fill
+        stroke = self.theme.furniture_stroke
+        cv2.rectangle(img, (x, y), (x + w, y + h), fill, -1, cv2.LINE_AA)
+        cv2.rectangle(img, (x, y), (x + w, y + h), stroke, 1, cv2.LINE_AA)
+        # Zigzag across the shorter dimension
+        pad = max(2, min(w, h) // 5)
+        if w >= h:
+            # Horizontal zigzag
+            n_zags = max(2, w // max(4, h // 2))
+            step = (w - 2 * pad) / n_zags
+            pts = []
+            for i in range(n_zags + 1):
+                px = int(x + pad + i * step)
+                py = y + pad if i % 2 == 0 else y + h - pad
+                pts.append((px, py))
+            for i in range(len(pts) - 1):
+                cv2.line(img, pts[i], pts[i + 1], stroke, 1, cv2.LINE_AA)
+        else:
+            # Vertical zigzag
+            n_zags = max(2, h // max(4, w // 2))
+            step = (h - 2 * pad) / n_zags
+            pts = []
+            for i in range(n_zags + 1):
+                py = int(y + pad + i * step)
+                px = x + pad if i % 2 == 0 else x + w - pad
+                pts.append((px, py))
+            for i in range(len(pts) - 1):
+                cv2.line(img, pts[i], pts[i + 1], stroke, 1, cv2.LINE_AA)
+
+    @staticmethod
+    def _rounded_rect_pts(x, y, w, h, r):
+        """Return numpy points for a rounded rectangle as polyline."""
+        r = min(r, w // 2, h // 2)
+        pts = []
+        # top-left corner arc
+        for a in range(180, 270, 10):
+            rad = math.radians(a)
+            pts.append((int(x + r + r * math.cos(rad)),
+                        int(y + r + r * math.sin(rad))))
+        # top-right corner arc
+        for a in range(270, 360, 10):
+            rad = math.radians(a)
+            pts.append((int(x + w - r + r * math.cos(rad)),
+                        int(y + r + r * math.sin(rad))))
+        # bottom-right corner arc
+        for a in range(0, 90, 10):
+            rad = math.radians(a)
+            pts.append((int(x + w - r + r * math.cos(rad)),
+                        int(y + h - r + r * math.sin(rad))))
+        # bottom-left corner arc
+        for a in range(90, 180, 10):
+            rad = math.radians(a)
+            pts.append((int(x + r + r * math.cos(rad)),
+                        int(y + h - r + r * math.sin(rad))))
+        return np.array(pts, dtype=np.int32)
+
+    def _pick_wall_adjacent_pos(self, room, w, h, margin=5):
+        """Pick a position adjacent to one wall of the room, or floating.
+        Returns (x, y) or None if no fit.  ~60% wall-adjacent, 40% floating.
+        """
+        if self.rng.random() < 0.6:
+            # Wall-adjacent placement
+            side = self.rng.choice(["top", "bottom", "left", "right"])
+            if side == "top":
+                y = room.y1 + margin
+                x_max = room.x2 - margin - w
+                x_min = room.x1 + margin
+            elif side == "bottom":
+                y = room.y2 - margin - h
+                x_max = room.x2 - margin - w
+                x_min = room.x1 + margin
+            elif side == "left":
+                x = room.x1 + margin
+                y_max = room.y2 - margin - h
+                y_min = room.y1 + margin
+            else:
+                x = room.x2 - margin - w
+                y_max = room.y2 - margin - h
+                y_min = room.y1 + margin
+            if side in ("top", "bottom"):
+                if x_max <= x_min:
+                    return None
+                x = self.rng.randint(x_min, x_max)
+            else:
+                if y_max <= y_min:
+                    return None
+                y = self.rng.randint(y_min, y_max)
+        else:
+            # Floating placement
+            x_max = room.x2 - margin - w
+            x_min = room.x1 + margin
+            y_max = room.y2 - margin - h
+            y_min = room.y1 + margin
+            if x_max <= x_min or y_max <= y_min:
+                return None
+            x = self.rng.randint(x_min, x_max)
+            y = self.rng.randint(y_min, y_max)
+        if self.check_collision(x, y, x + w, y + h):
+            return None
+        return (x, y)
+
     def _place_bathroom_suite(self, img, room):
         rw, rh = room.width, room.height
         if rw < 80 or rh < 80:
             return
-        fill = self.theme.furniture_fill
-        stroke = self.theme.furniture_stroke
-        bg = self.theme.background
-        if rw >= rh:
-            tub_len = int(rw * self.rng.uniform(0.45, 0.75))
-            tub_depth = int(rh * self.rng.uniform(0.35, 0.5))
-            x1 = self.rng.randint(room.x1 + 8, room.x2 - 8 - tub_len)
-            y1 = room.y1 + 5
-            x2, y2 = x1 + tub_len, y1 + tub_depth
-        else:
-            tub_len = int(rh * self.rng.uniform(0.45, 0.75))
-            tub_depth = int(rw * self.rng.uniform(0.35, 0.5))
-            x1 = room.x1 + 5
-            y1 = self.rng.randint(room.y1 + 8, room.y2 - 8 - tub_len)
-            x2, y2 = x1 + tub_depth, y1 + tub_len
-        cv2.rectangle(img, (x1, y1), (x2, y2), fill, -1, cv2.LINE_AA)
-        cv2.rectangle(img, (x1, y1), (x2, y2), stroke, 1, cv2.LINE_AA)
-        self.add_occupied(x1, y1, x2, y2, "furniture")
-        pad = max(3, int(min(x2 - x1, y2 - y1) * 0.08))
-        cv2.rectangle(img, (x1 + pad, y1 + pad), (x2 - pad, y2 - pad), bg, -1, cv2.LINE_AA)
-        cv2.rectangle(img, (x1 + pad, y1 + pad), (x2 - pad, y2 - pad), stroke, 1, cv2.LINE_AA)
         base = min(rw, rh)
-        sw, sh = int(base * 0.18), int(base * 0.14)
-        sx1 = room.x2 - sw - 8
-        sy1 = room.y2 - sh - 8
-        cv2.rectangle(img, (sx1, sy1), (sx1 + sw, sy1 + sh), fill, -1, cv2.LINE_AA)
-        cv2.rectangle(img, (sx1, sy1), (sx1 + sw, sy1 + sh), stroke, 1, cv2.LINE_AA)
-        self.add_occupied(sx1, sy1, sx1 + sw, sy1 + sh, "furniture")
-        wc_r = int(base * 0.06)
-        wc_cx, wc_cy = room.x1 + 12 + wc_r, room.y2 - 12 - wc_r
-        cv2.circle(img, (wc_cx, wc_cy), wc_r, fill, -1, cv2.LINE_AA)
-        cv2.circle(img, (wc_cx, wc_cy), wc_r, stroke, 1, cv2.LINE_AA)
-        cv2.rectangle(img, (wc_cx - wc_r // 2, wc_cy - wc_r * 2),
-                      (wc_cx + wc_r // 2, wc_cy - wc_r), fill, -1, cv2.LINE_AA)
-        cv2.rectangle(img, (wc_cx - wc_r // 2, wc_cy - wc_r * 2),
-                      (wc_cx + wc_r // 2, wc_cy - wc_r), stroke, 1, cv2.LINE_AA)
-        self.add_occupied(wc_cx - wc_r, wc_cy - wc_r * 2,
-                          wc_cx + wc_r, wc_cy + wc_r, "furniture")
+
+        # Bathtub — always wall-adjacent (top or left wall)
+        if rw >= rh:
+            tub_w = int(rw * self.rng.uniform(0.45, 0.75))
+            tub_h = int(rh * self.rng.uniform(0.30, 0.45))
+        else:
+            tub_w = int(rw * self.rng.uniform(0.30, 0.45))
+            tub_h = int(rh * self.rng.uniform(0.45, 0.75))
+        for _ in range(10):
+            pos = self._pick_wall_adjacent_pos(room, tub_w, tub_h, margin=5)
+            if pos:
+                self._draw_bathtub(img, pos[0], pos[1], tub_w, tub_h)
+                self.add_occupied(pos[0], pos[1], pos[0] + tub_w, pos[1] + tub_h, "furniture")
+                break
+
+        # Sink
+        sw = int(base * self.rng.uniform(0.14, 0.22))
+        sh = int(base * self.rng.uniform(0.12, 0.18))
+        for _ in range(10):
+            pos = self._pick_wall_adjacent_pos(room, sw, sh, margin=5)
+            if pos:
+                self._draw_sink(img, pos[0], pos[1], sw, sh)
+                self.add_occupied(pos[0], pos[1], pos[0] + sw, pos[1] + sh, "furniture")
+                break
+
+        # Toilet
+        tw = int(base * self.rng.uniform(0.10, 0.16))
+        th = int(base * self.rng.uniform(0.16, 0.24))
+        for _ in range(10):
+            pos = self._pick_wall_adjacent_pos(room, tw, th, margin=5)
+            if pos:
+                self._draw_toilet(img, pos[0], pos[1], tw, th)
+                self.add_occupied(pos[0], pos[1], pos[0] + tw, pos[1] + th, "furniture")
+                break
 
     def _place_decorative_element(self, img, room, margin):
         fill = self.theme.furniture_fill
@@ -2359,10 +2583,14 @@ class ThemeRenderer:
                 cv2.rectangle(img, (room.x1, room.y1), (room.x2, room.y2),
                               fill, -1, cv2.LINE_AA)
 
-    def draw_walls(self, img, walls):
+    def draw_walls(self, img, walls, override_color=None, override_bg=None,
+                   force_style=None):
         """Draw walls with either SOLID or OUTLINED style.
         For OUTLINED style, wall contour edges are clipped so they don't
         draw over intersecting wall rectangles — eliminating overlap artefacts.
+
+        Optional overrides allow reusing this method for B&W variant canvases
+        without duplicating the clipping logic.
         """
         # Pre-compute axis-aligned bounding rects for all non-guardrail walls
         def wall_rect(w):
@@ -2377,16 +2605,20 @@ class ThemeRenderer:
         non_gr = [w for w in walls if not w.is_guardrail]
         rects = [wall_rect(w) for w in non_gr]
 
+        eff_color = override_color or self.theme.wall_color
+        eff_bg = override_bg or self.theme.background
+        eff_style = force_style or self.wall_draw_style
+
         for w in walls:
             if w.is_guardrail:
                 cv2.line(img, (w.x1, w.y1), (w.x2, w.y2),
-                         self.theme.wall_color, self._th(2), cv2.LINE_AA)
+                         eff_color, self._th(2), cv2.LINE_AA)
                 continue
 
             half = w.thickness // 2
             x1, x2 = min(w.x1, w.x2), max(w.x1, w.x2)
             y1, y2 = min(w.y1, w.y2), max(w.y1, w.y2)
-            color = self.theme.wall_color
+            color = eff_color
 
             if w.x1 == w.x2:
                 pt1, pt2 = (x1 - half, y1), (x1 + half, y2)
@@ -2395,14 +2627,14 @@ class ThemeRenderer:
 
             wx1, wy1, wx2, wy2 = pt1[0], pt1[1], pt2[0], pt2[1]
 
-            if self.theme.shadow_offset > 0:
+            if self.theme.shadow_offset > 0 and override_color is None:
                 so = self.theme.shadow_offset
                 cv2.rectangle(img, (wx1 + so, wy1 + so), (wx2 + so, wy2 + so),
                               self.theme.shadow_color, -1, cv2.LINE_AA)
 
-            if self.wall_draw_style == "outlined":
+            if eff_style == "outlined":
                 # Fill interior with background first
-                bg = self.theme.background
+                bg = eff_bg
                 cv2.rectangle(img, (wx1, wy1), (wx2, wy2), bg, -1, cv2.LINE_AA)
                 contour_th = min(3, max(1, self._th(max(2, w.thickness // 5))))
 
@@ -2468,6 +2700,7 @@ class ThemeRenderer:
             else:
                 # SOLID: filled rectangle
                 cv2.rectangle(img, (wx1, wy1), (wx2, wy2), color, -1, cv2.LINE_AA)
+
 
     def draw_walls_on_mask(self, mask, walls, class_id):
         """Draw walls onto segmentation mask."""
@@ -2553,7 +2786,8 @@ class StyleRotator:
         return self.rng.choice(ranges)
 
     def next_wall_thickness(self):
-        presets = [(5, 15), (7, 30), (15, 40)]
+        presets = [(5, 15), (7, 30), (15, 40), (20, 50), (30, 60),
+                   (40, 80), (50, 100)]
         return self.rng.choice(presets)
 
     def next_balcony_prob(self):
@@ -2653,6 +2887,15 @@ class SmartFloorPlanGenerator:
         else:
             self.current_door_style = "slab"
 
+    def _override_style_for_bw_theme(self):
+        """Force wall/door style when a B&W theme is active."""
+        if self.theme.name == "bw_outline":
+            self.current_wall_style = "outlined"
+            self.current_door_style = "cross"
+        elif self.theme.name == "bw_solid":
+            self.current_wall_style = "solid"
+            self.current_door_style = "slab"
+
     def generate_brief(self):
         styles = ["compact", "spacious", "linear", "square"]
         style_weights = [0.3, 0.25, 0.25, 0.2]
@@ -2685,18 +2928,23 @@ class SmartFloorPlanGenerator:
         self._resolve_wall_draw_style()
         self._resolve_door_draw_style()
 
+        _is_bw = lambda t: t.name in ("bw_outline", "bw_solid")
+
         if not self.style_rotator:
-            if self.config.color_jitter_intensity > 0:
-                self.theme = self.config.get_theme().jittered_copy(
+            self.theme = self.config.get_theme()
+            if self.config.color_jitter_intensity > 0 and not _is_bw(self.theme):
+                self.theme = self.theme.jittered_copy(
                     self.rng, self.config.color_jitter_intensity)
-                self._rebuild_with_theme()
+            self._override_style_for_bw_theme()
+            self._rebuild_with_theme()
             return overrides
 
         self.theme = self.style_rotator.next_theme()
-        if self.config.color_jitter_intensity > 0:
+        if self.config.color_jitter_intensity > 0 and not _is_bw(self.theme):
             self.theme = self.theme.jittered_copy(
                 self.rng, self.config.color_jitter_intensity)
         overrides["theme"] = self.theme.name
+        self._override_style_for_bw_theme()
         self._rebuild_with_theme()
 
         if self.config.vary_strategies:
@@ -2794,10 +3042,11 @@ class SmartFloorPlanGenerator:
                 mask = cv2.resize(hi_res_mask, (self.out_size, self.out_size),
                                   interpolation=cv2.INTER_NEAREST)
 
-            # Apply rotation to both img and mask together so they stay aligned
+            # Apply rotation
             if self.rng.random() < self.config.rotation_probability:
                 img, labels, mask = self._apply_rotation(img, labels, mask)
 
+            # Augmentations
             if self.rng.random() < self.config.augmentation_probability:
                 img = self._apply_augmentations(img)
 
@@ -2882,15 +3131,15 @@ class SmartFloorPlanGenerator:
                       f"wall={self.current_wall_style} door={self.current_door_style}")
 
         if self.style_rotator:
-            print(f"\n── Style distribution across {n_images} images ──")
+            print(f"\n-- Style distribution across {n_images} images --")
             for name, count in sorted(style_counts.items()):
                 pct = 100 * count / n_images
-                bar = "█" * int(pct / 2)
+                bar = "#" * int(pct / 2)
                 print(f"  {name:<22s} {count:>5d} ({pct:5.1f}%) {bar}")
-            print(f"\n── Strategy distribution ──")
+            print(f"\n-- Strategy distribution --")
             for name, count in sorted(strategy_counts.items()):
                 pct = 100 * count / n_images
-                bar = "█" * int(pct / 2)
+                bar = "#" * int(pct / 2)
                 print(f"  {name:<22s} {count:>5d} ({pct:5.1f}%) {bar}")
 
     # ── Single plan generation ────────────────────────────────────────────────
@@ -2924,12 +3173,12 @@ class SmartFloorPlanGenerator:
                 walls, rooms, ext_wall_thickness
             )
 
-        # Render rooms
+        # Render rooms (themed canvas only — B&W stays white)
         self.renderer.fill_rooms(img, rooms)
 
         # Rooms, balconies, furniture are all background in the 3-class schema.
 
-        # Balconies
+        # Balconies (themed canvas only)
         self.renderer.draw_balcony_floor(img, balconies)
         for b in balconies:
             x1, x2 = min(b.x1, b.x2), max(b.x1, b.x2)
@@ -2978,7 +3227,9 @@ class SmartFloorPlanGenerator:
                 if box:
                     labels.append((0, *box))
 
-        self.renderer.add_annotations(img, rooms)
+        # Annotations — skip for B&W themes
+        if self.theme.name not in ("bw_outline", "bw_solid"):
+            self.renderer.add_annotations(img, rooms)
 
         if self.config.multi_story and self.config.num_floors > 1:
             self._draw_staircase_symbol(img, rooms, semantic_mask)
@@ -3178,7 +3429,8 @@ class SmartFloorPlanGenerator:
 
             for el_type, s, e in elements:
                 box = self._draw_interface_element(img, w, s, e, el_type, b.side,
-                                                    semantic_mask)
+                                                    semantic_mask,
+                                                    )
                 if box:
                     labels.append((0 if el_type == "door" else 1, *box))
         return labels
@@ -3216,7 +3468,8 @@ class SmartFloorPlanGenerator:
             # Door on interface
             if self.current_door_style == "cross":
                 self._draw_cross_door_at(img, p1, p2, is_vert, wc, bg, line_th,
-                                          semantic_mask, wall_th=th)
+                                          semantic_mask, wall_th=th,
+                                          )
             else:
                 door_len = end - start
                 swing_angle = self.rng.uniform(10, 45)
@@ -3417,7 +3670,8 @@ class SmartFloorPlanGenerator:
                 cv2.rectangle(img, (start, y1), (end, y2), bg, -1, cv2.LINE_AA)
                 self._draw_window_subtype(img, window_subtype, True,
                                            start, end, l1y, l2y, y1, y2,
-                                           center_y, wc, line_th)
+                                           center_y, wc, line_th,
+                                           )
                 # Separation caps — same weight as wall border
                 cv2.line(img, (start, y1), (start, y2), wc, border_th, cv2.LINE_AA)
                 cv2.line(img, (end,   y1), (end,   y2), wc, border_th, cv2.LINE_AA)
@@ -3463,7 +3717,8 @@ class SmartFloorPlanGenerator:
                 cv2.rectangle(img, (x1, start), (x2, end), bg, -1, cv2.LINE_AA)
                 self._draw_window_subtype(img, window_subtype, False,
                                            start, end, l1x, l2x, x1, x2,
-                                           center_x, wc, line_th)
+                                           center_x, wc, line_th,
+                                           )
                 # Separation caps — same weight as wall border
                 cv2.line(img, (x1, start), (x2, start), wc, border_th, cv2.LINE_AA)
                 cv2.line(img, (x1, end),   (x2, end),   wc, border_th, cv2.LINE_AA)
@@ -3536,9 +3791,11 @@ class SmartFloorPlanGenerator:
     def _place_door(self, img, w, occupied_spans, semantic_mask=None):
         """Place a door. Style depends on self.current_door_style."""
         if self.current_door_style == "cross":
-            return self._place_cross_door(img, w, occupied_spans, semantic_mask)
+            return self._place_cross_door(img, w, occupied_spans, semantic_mask,
+                                          )
         else:
-            return self._place_slab_door(img, w, occupied_spans, semantic_mask)
+            return self._place_slab_door(img, w, occupied_spans, semantic_mask,
+                                         )
 
     def _place_cross_door(self, img, w, occupied_spans, semantic_mask=None):
         """
@@ -3578,7 +3835,8 @@ class SmartFloorPlanGenerator:
                 p1 = (gap_s, y1)
                 p2 = (gap_e, y2)
                 self._draw_cross_door_at(img, p1, p2, False, wc, bg, line_th,
-                                          semantic_mask, wall_th=w.thickness)
+                                          semantic_mask, wall_th=w.thickness,
+                                          )
                 self.furniture_placer.add_occupied(*bbox, "door")
                 return self._points_to_yolo([p1, p2])
         else:
@@ -3608,7 +3866,8 @@ class SmartFloorPlanGenerator:
                 p1 = (x1, gap_s)
                 p2 = (x2, gap_e)
                 self._draw_cross_door_at(img, p1, p2, True, wc, bg, line_th,
-                                          semantic_mask, wall_th=w.thickness)
+                                          semantic_mask, wall_th=w.thickness,
+                                          )
                 self.furniture_placer.add_occupied(*bbox, "door")
                 return self._points_to_yolo([p1, p2])
         return None
@@ -4003,8 +4262,8 @@ def main():
     generator = DatasetGenerator(cfg)
     generator.generate_dataset()
 
-    print("\n✓ Dataset generation complete.")
-    print(f"  → {os.path.abspath(cfg.output_dir)}")
+    print("\nDataset generation complete.")
+    print(f"  Output: {os.path.abspath(cfg.output_dir)}")
 
 
 if __name__ == "__main__":

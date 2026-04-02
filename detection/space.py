@@ -100,10 +100,15 @@ class RoomSizeAnalyzer:
         self.white_threshold = white_threshold
         self.closing_kernel_ratio = closing_kernel_ratio
         self.debug_ocr = debug_ocr
-        self._init_ocr()
+        # OCR model is set externally by FloorplanPipeline to avoid
+        # loading a duplicate instance (~400 MB).  Falls back to lazy
+        # loading if used standalone.
+        self.ocr_model = None
 
     def _init_ocr(self) -> None:
-        """Инициализация модели OCR (docTR)."""
+        """Инициализация модели OCR (docTR) — lazy fallback."""
+        if self.ocr_model is not None:
+            return
         try:
             from doctr.models import ocr_predictor
             self.ocr_model = ocr_predictor(pretrained=True)
@@ -616,15 +621,18 @@ class RoomSizeAnalyzer:
 
     def detect_room_areas_ocr(self,
                               image: np.ndarray,
-                              img_path: str) -> List[Dict]:
+                              img_path: str,
+                              wall_mask: Optional[np.ndarray] = None,
+                              interior_mask: Optional[np.ndarray] = None) -> List[Dict]:
         """
-        Определение общей площади квартиры через OCR.
+        Определение площадей комнат через OCR.
 
         Особенности:
         - Использует docTR для распознавания текста
         - Объединяет соседние слова в одну строку
         - Ищет шаблон чисел вида '137,8 м²', '52.0 m2' и т.п.
-        - Выбирает только наибольшую площадь (стратегия "largest area")
+        - Находит связные компоненты жилого пространства (комнаты)
+        - Для каждой комнаты берёт число только если оно единственное в ней
 
         Параметры:
             image: Изображение для анализа
@@ -634,6 +642,8 @@ class RoomSizeAnalyzer:
             Список с единственным элементом - общей площадью квартиры
         """
         if self.ocr_model is None:
+            self._init_ocr()  # lazy fallback for standalone usage
+        if self.ocr_model is None:
             return []
 
         from doctr.io import DocumentFile
@@ -642,9 +652,11 @@ class RoomSizeAnalyzer:
         h, w = image.shape[:2]
         result = self.ocr_model(doc)
 
-        # Шаблон для поиска площади
+        # Шаблон для поиска площади.
+        # Группа 1: число; группа 2 (опциональная): единица измерения.
+        # has_unit=True означает, что это подписанная общая площадь (напр. "87,0 м²").
         area_pattern = re.compile(
-            r'^(\d{1,3}[.,]\d{1,2})\s*(?:m²|м²|m2|м2|кв\.?\s*м\.?)?$',
+            r'^(\d{1,3}[.,]\d{1,2})\s*(m²|м²|m2|м2|М²|М2|кв\.?\s*м\.?)?$',
             re.IGNORECASE
         )
 
@@ -785,7 +797,8 @@ class RoomSizeAnalyzer:
                     'text': text,
                     'bbox': (x1, y1, x2, y2),
                     'center': center,
-                    'confidence': box['confidence']
+                    'confidence': box['confidence'],
+                    'has_unit': bool(match.group(2)),
                 })
 
         # Обработка индивидуальных слов (fallback)
@@ -816,17 +829,47 @@ class RoomSizeAnalyzer:
                     'text': text,
                     'bbox': (x1, y1, x2, y2),
                     'center': center,
-                    'confidence': word['confidence']
+                    'confidence': word['confidence'],
+                    'has_unit': bool(match.group(2)),
                 })
 
-        if detected:
-            # Сортировка по площади и выбор наибольшей
-            detected.sort(key=lambda x: x['area_m2'], reverse=True)
-            largest = detected[0]
-            # Возвращаем список из одного элемента - общей площади квартиры
-            return [largest]
-        else:
+        if not detected:
             return []
+
+        # Tag each detected entry with 'room_pixels' when a connected interior
+        # region (with doorways closed by dilation) contains exactly ONE non-unit
+        # area label.  Entries without 'room_pixels' are still returned for
+        # visualization but are not used for per-room scale calibration.
+        if wall_mask is not None and interior_mask is not None:
+            h_img, w_img = image.shape[:2]
+
+            # Dilate walls to close typical doorway openings (~80 cm ≈ 25 px at
+            # the default 2.54 cm/px scale) so that each room becomes an
+            # isolated connected component.
+            door_close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+            thick_walls = cv2.dilate(wall_mask, door_close_kernel, iterations=1)
+            room_space = cv2.bitwise_and(interior_mask, cv2.bitwise_not(thick_walls))
+            num_labels, labels = cv2.connectedComponents(room_space, connectivity=8)
+
+            for label_id in range(1, num_labels):
+                room_px = int(np.count_nonzero(labels == label_id))
+                if room_px < 500:
+                    continue
+
+                # Candidates: non-unit entries whose centre falls in this region
+                candidates = [
+                    nb for nb in detected
+                    if not nb.get('has_unit')
+                    and labels[
+                        max(0, min(h_img - 1, nb['center'][1])),
+                        max(0, min(w_img - 1, nb['center'][0]))
+                    ] == label_id
+                ]
+
+                if len(candidates) == 1:
+                    candidates[0]['room_pixels'] = room_px
+
+        return detected
 
     def calculate_pixel_scale(self,
                               apartment_area_pixels: int,
@@ -990,18 +1033,43 @@ class RoomSizeAnalyzer:
         if apartment_area_pixels == 0:
             return None
 
-        # Этап 4: Определение общей площади
+        # Этапы 4–5: Определение площадей комнат и расчёт масштаба
         room_areas: List[Dict] = []
+        pixel_scale = 0.0
+
+        total_m2 = 0.0
         if known_area_m2 is not None:
-            total_area_m2 = known_area_m2
+            total_m2 = known_area_m2
+            pixel_scale = self.calculate_pixel_scale(apartment_area_pixels, known_area_m2)
         else:
-            room_areas = self.detect_room_areas_ocr(image, img_path)
+            room_areas = self.detect_room_areas_ocr(image, img_path,
+                                                     wall_mask=wall_mask,
+                                                     interior_mask=interior_mask)
             if not room_areas:
                 return None
-            total_area_m2 = float(sum(r['area_m2'] for r in room_areas))
 
-        # Этап 5: Расчёт масштаба (на основе полной площади включая стены)
-        pixel_scale = self.calculate_pixel_scale(apartment_area_pixels, total_area_m2)
+            # Primary: average scale across individually-matched rooms.
+            # detect_room_areas_ocr tags entries with 'room_pixels' when a
+            # connected interior region (doorways closed) contained exactly one
+            # non-unit area label.  Each such room provides an independent
+            # scale estimate; their mean is more robust than using the total.
+            room_matched = [r for r in room_areas if r.get('room_pixels', 0) > 0]
+            if room_matched:
+                scales = [
+                    float(np.sqrt(r['area_m2'] / r['room_pixels']))
+                    for r in room_matched
+                ]
+                pixel_scale = float(np.mean(scales))
+
+            # Fallback: largest unit-suffixed area ("87,0 м²") or, absent that,
+            # the largest number overall (likely the printed total).
+            if pixel_scale == 0:
+                unit_areas = [r for r in room_areas if r.get('has_unit')]
+                if unit_areas:
+                    total_m2 = float(max(r['area_m2'] for r in unit_areas))
+                else:
+                    total_m2 = float(max(r['area_m2'] for r in room_areas))
+                pixel_scale = self.calculate_pixel_scale(apartment_area_pixels, total_m2)
 
         if pixel_scale == 0:
             return None
@@ -1019,7 +1087,7 @@ class RoomSizeAnalyzer:
         )
 
         return RoomMeasurements(
-            area_m2=total_area_m2,
+            area_m2=total_m2,
             pixel_scale=pixel_scale,
             apartment_area_pixels=apartment_area_pixels,
             living_space_pixels=living_space_pixels,

@@ -2,34 +2,16 @@
 ================================================================================
 СИСТЕМА АВТОМАТИЧЕСКОГО АНАЛИЗА ПЛАНИРОВОК КВАРТИР «БРУСНИКА»
 Модуль: FastAPI-сервер обработки планировок (api.py)
-Версия: 6.0 — Single-Request Edition
-Автор: BykovVadimCV
-Дата:  23 февраля 2026 г.
-
-Описание модуля:
-  Синхронный REST API на базе FastAPI/uvicorn.
-  Принимает изображение планировки формата «Брусника», запускает
-  HybridWallAnalyzer в пуле потоков и возвращает единым ответом:
-    - Sweet Home 3D файл (.sh3d) в base64
-    - GLTF-модель (.gltf) в base64
-    - Визуализацию (PNG) в base64
-    - Метаданные детекции (двери, окна, площадь)
+Версия: 6.0 — Clean Architecture Edition
 
 Эндпоинты:
   GET  /health   — статус сервера
-  POST /process  — отправить изображение, получить результат
+  POST /process  — отправить изображение, получить SH3D + GLTF + PNG
 
 Архитектура:
-  - Один экземпляр HybridWallAnalyzer создаётся при старте (singleton)
+  - Один экземпляр FloorplanPipeline создаётся при старте (singleton)
   - asyncio.Semaphore ограничивает параллельные задачи
   - CPU-тяжёлая обработка выполняется в run_in_executor (thread pool)
-  - Клиент получает полный результат в теле единственного HTTP-ответа
-
-Принципы:
-  - Single Responsibility: каждая функция решает одну задачу
-  - Все константы конфигурации — в SERVER_CONFIG
-  - Сбой инициализации анализатора прерывает старт сервера
-  - Никаких фоновых задач и опросов статуса — один запрос, один ответ
 ================================================================================
 """
 
@@ -49,10 +31,11 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from PIL import Image
 from pydantic import BaseModel
 
-from main import HybridWallAnalyzer
+from core.config import PipelineConfig
+from pipeline import FloorplanPipeline
 
 # ============================================================
-# SH3D → GLTF INTEGRATION
+# GLTF CONVERSION (optional)
 # ============================================================
 
 PROJECT_ROOT = Path(__file__).parent
@@ -62,14 +45,15 @@ sys.path.insert(0, str(SH3DTOGLTF_PATH))
 try:
     from sh3d2gltf import convert_sh3d_to_gltf
     GLTF_CONVERTER_AVAILABLE = True
-    print("✓ SH3DtoGLTF converter loaded successfully")
+    print("✓ SH3DtoGLTF converter loaded")
 except ImportError as e:
     GLTF_CONVERTER_AVAILABLE = False
     convert_sh3d_to_gltf = None
-    print(f"⚠️  SH3DtoGLTF not found: {e} — GLTF export disabled")
+    print(f"⚠  SH3DtoGLTF not found: {e} — GLTF export disabled")
+
 
 # ============================================================
-# Конфигурация сервера
+# SERVER CONFIGURATION
 # ============================================================
 
 SERVER_CONFIG: Dict = {
@@ -77,7 +61,7 @@ SERVER_CONFIG: Dict = {
     "port": 8000,
     "max_concurrent_jobs": 1,
     "max_image_size_mb": 20,
-    "yolo_model_path": "weights/weights.pt",
+    "yolo_model_path": "weights/best.pt",
     "wall_color_hex": "8E8780",
     "color_tolerance": 3,
     "yolo_conf_threshold": 0.25,
@@ -86,14 +70,17 @@ SERVER_CONFIG: Dict = {
     "pixels_to_cm": 2.54,
 }
 
-# ============================================================
-# Модели ответа
-# ============================================================
 
+# ============================================================
+# RESPONSE MODELS
+# ============================================================
 
 class DetectionInfo(BaseModel):
+    walls: int
     doors: int
     windows: int
+    rooms: int
+    door_arcs: int
     area_sqm: float
 
 
@@ -104,44 +91,46 @@ class ProcessingResult(BaseModel):
 
 
 # ============================================================
-# Глобальное состояние
+# GLOBAL STATE
 # ============================================================
 
-app = FastAPI(title="Sweet Home 3D Processing API")
+app = FastAPI(
+    title="ReFloor Brusnika API",
+    description="Floorplan to SweetHome3D conversion service",
+    version="6.0",
+)
 processing_semaphore: asyncio.Semaphore = asyncio.Semaphore(
     SERVER_CONFIG["max_concurrent_jobs"]
 )
-analyzer: Optional[HybridWallAnalyzer] = None
+pipeline: Optional[FloorplanPipeline] = None
+
 
 # ============================================================
-# Инициализация анализатора
+# PIPELINE INITIALIZATION
 # ============================================================
 
-
-def _initialize_analyzer() -> None:
-    global analyzer
-    print("Initializing HybridWallAnalyzer...")
-    analyzer = HybridWallAnalyzer(
-        yolo_model_path=SERVER_CONFIG["yolo_model_path"],
+def _initialize_pipeline() -> None:
+    global pipeline
+    print("Initializing FloorplanPipeline...")
+    config = PipelineConfig(
+        yolo_weights_path=SERVER_CONFIG["yolo_model_path"],
         wall_color_hex=SERVER_CONFIG["wall_color_hex"],
         color_tolerance=SERVER_CONFIG["color_tolerance"],
-        yolo_conf_threshold=SERVER_CONFIG["yolo_conf_threshold"],
-        device=SERVER_CONFIG["device"],
-        auto_wall_color=False,
-        enable_measurements=True,
-        enable_visuals=True,
-        enable_sh3d_export=True,
+        yolo_confidence=SERVER_CONFIG["yolo_conf_threshold"],
+        yolo_device=SERVER_CONFIG["device"],
         wall_height_cm=SERVER_CONFIG["wall_height_cm"],
         pixels_to_cm=SERVER_CONFIG["pixels_to_cm"],
-        auto_create_room=True,
+        enable_room_measurement=True,
+        enable_door_arcs=True,
     )
-    print("Analyzer initialized")
+    pipeline = FloorplanPipeline(config)
+    pipeline.initialize()
+    print("Pipeline initialized")
 
 
 # ============================================================
-# Вспомогательные функции
+# HELPERS
 # ============================================================
-
 
 def _read_file_as_base64(path: str) -> str:
     with open(path, "rb") as f:
@@ -155,64 +144,23 @@ def _placeholder_png_base64() -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _find_visualization(temp_path: Path, stem: str, color_data: Dict) -> str:
-    candidates = [
-        color_data.get("viz_path"),
-        str(temp_path / f"{stem}_summary.png"),
-        str(temp_path / f"{stem}_overlay.png"),
-    ]
-    for path in candidates:
-        if path and os.path.exists(path):
-            return _read_file_as_base64(path)
-    return _placeholder_png_base64()
-
-
 def _convert_to_gltf(sh3d_path: str) -> str:
-    """Возвращает base64-encoded GLTF или пустую строку при неудаче."""
+    """Convert SH3D to GLTF. Returns base64 or empty string."""
     if not GLTF_CONVERTER_AVAILABLE or convert_sh3d_to_gltf is None:
-        print("GLTF conversion skipped (converter unavailable)")
         return ""
     try:
         gltf_path = str(Path(sh3d_path).with_suffix(".gltf"))
-        print(f"→ Converting {Path(sh3d_path).name} → GLTF")
         convert_sh3d_to_gltf(sh3d_path, gltf_path)
         if os.path.exists(gltf_path):
-            data = _read_file_as_base64(gltf_path)
-            print(f"✓ GLTF ready ({os.path.getsize(gltf_path) // 1024} KB)")
-            return data
-        print("⚠️ GLTF file was not created")
+            return _read_file_as_base64(gltf_path)
     except Exception as exc:
-        print(f"⚠️ GLTF conversion failed: {exc}")
+        print(f"⚠  GLTF conversion failed: {exc}")
     return ""
 
 
-def _count_detections(result: Dict) -> tuple[int, int]:
-    """Подсчёт дверей и окон из результатов YOLO + цветового анализа."""
-    doors = 0
-    windows = 0
-
-    yolo = result.get("yolo")
-    if yolo is not None:
-        if hasattr(yolo, "doors") and yolo.doors:
-            doors = len(yolo.doors)
-        if hasattr(yolo, "windows") and yolo.windows:
-            windows = len(yolo.windows)
-
-    windows += len(result.get("color", {}).get("algo_windows", []))
-    return doors, windows
-
-
-def _extract_area(result: Dict) -> float:
-    measurements = result.get("measurements")
-    if measurements and hasattr(measurements, "area_m2"):
-        return float(measurements.area_m2)
-    return 0.0
-
-
 # ============================================================
-# Ядро обработки (CPU-bound, запускается в thread pool)
+# CORE PROCESSING (CPU-bound, runs in thread pool)
 # ============================================================
-
 
 def _process_image_sync(image_data: bytes) -> ProcessingResult:
     start = time.time()
@@ -224,32 +172,41 @@ def _process_image_sync(image_data: bytes) -> ProcessingResult:
 
         Image.open(io.BytesIO(image_data)).save(input_path)
 
-        result = analyzer.process_image(
-            str(input_path),
-            str(temp_path),
-            run_color_detection=True,
-        )
+        result = pipeline.process(str(input_path), str(temp_path))
 
-        color_data = result.get("color", {})
-        doors, windows = _count_detections(result)
-        area_sqm = _extract_area(result)
+        if not result.sh3d_path or not os.path.exists(result.sh3d_path):
+            raise RuntimeError("SH3D file was not created")
 
-        sh3d_path = color_data.get("sh3d_path")
-        if not sh3d_path or not os.path.exists(sh3d_path):
-            raise RuntimeError("Sweet Home 3D file was not created")
+        sh3d_b64 = _read_file_as_base64(result.sh3d_path)
+        gltf_b64 = _convert_to_gltf(result.sh3d_path)
 
-        sh3d_b64 = _read_file_as_base64(sh3d_path)
-        viz_b64 = _find_visualization(temp_path, stem, color_data)
-        gltf_b64 = _convert_to_gltf(sh3d_path)
+        # Find visualization
+        viz_b64 = ""
+        for candidate in [result.summary_path, result.rooms_ocr_path]:
+            if candidate and os.path.exists(candidate):
+                viz_b64 = _read_file_as_base64(candidate)
+                break
+        if not viz_b64:
+            viz_b64 = _placeholder_png_base64()
+
+        area_sqm = 0.0
+        if result.raw_measurements and hasattr(result.raw_measurements, 'area_m2'):
+            area_sqm = float(result.raw_measurements.area_m2)
 
     elapsed_ms = int((time.time() - start) * 1000)
-    print(f"Completed: {doors} doors, {windows} windows, {area_sqm:.1f} m², {elapsed_ms} ms")
+    print(
+        f"Completed: {result.n_walls} walls, {result.n_doors} doors, "
+        f"{result.n_windows} windows, {area_sqm:.1f} m², {elapsed_ms} ms"
+    )
 
     return ProcessingResult(
         processing_time_ms=elapsed_ms,
         detection_info=DetectionInfo(
-            doors=doors,
-            windows=windows,
+            walls=result.n_walls,
+            doors=result.n_doors,
+            windows=result.n_windows,
+            rooms=len(result.rooms),
+            door_arcs=len(result.door_arcs),
             area_sqm=area_sqm,
         ),
         files={
@@ -261,22 +218,20 @@ def _process_image_sync(image_data: bytes) -> ProcessingResult:
 
 
 # ============================================================
-# Эндпоинты
+# ENDPOINTS
 # ============================================================
-
 
 @app.get("/health")
 async def health() -> Dict:
     return {
-        "status": "ready" if analyzer is not None else "initializing",
+        "status": "ready" if pipeline is not None else "initializing",
         "timestamp": datetime.now().isoformat(),
     }
 
 
 @app.post("/process", response_model=ProcessingResult)
 async def process(image: UploadFile = File(...)) -> ProcessingResult:
-    # ---- проверки ----
-    if analyzer is None:
+    if pipeline is None:
         raise HTTPException(status_code=503, detail="Server is still initializing")
 
     if not image.content_type or not image.content_type.startswith("image/"):
@@ -293,7 +248,6 @@ async def process(image: UploadFile = File(...)) -> ProcessingResult:
             ),
         )
 
-    # ---- обработка (с семафором и оффлоадом в тред) ----
     async with processing_semaphore:
         loop = asyncio.get_running_loop()
         try:
@@ -305,31 +259,26 @@ async def process(image: UploadFile = File(...)) -> ProcessingResult:
 
 
 # ============================================================
-# Старт сервера
+# SERVER STARTUP
 # ============================================================
-
 
 @app.on_event("startup")
 async def on_startup() -> None:
     try:
-        _initialize_analyzer()
+        _initialize_pipeline()
     except Exception as exc:
-        print(f"ERROR: Failed to initialize analyzer: {exc}")
-        print("Please check:")
-        print("  1. YOLO model path is correct in SERVER_CONFIG")
-        print("  2. All dependencies are installed")
-        print("  3. Required detection modules are available")
+        print(f"ERROR: Failed to initialize pipeline: {exc}")
         raise
 
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Sweet Home 3D Processing Server  (single-request mode)")
+    print("ReFloor Brusnika API Server v6.0")
     print("=" * 60)
-    print(f"Host:             {SERVER_CONFIG['host']}:{SERVER_CONFIG['port']}")
-    print(f"Max concurrency:  {SERVER_CONFIG['max_concurrent_jobs']}")
-    print(f"Max image size:   {SERVER_CONFIG['max_image_size_mb']} MB")
-    print(f"YOLO model:       {SERVER_CONFIG['yolo_model_path']}")
+    print(f"Host:            {SERVER_CONFIG['host']}:{SERVER_CONFIG['port']}")
+    print(f"Max concurrency: {SERVER_CONFIG['max_concurrent_jobs']}")
+    print(f"Max image size:  {SERVER_CONFIG['max_image_size_mb']} MB")
+    print(f"YOLO model:      {SERVER_CONFIG['yolo_model_path']}")
     print("=" * 60)
     uvicorn.run(
         app,

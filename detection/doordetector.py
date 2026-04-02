@@ -1386,6 +1386,9 @@ class AlgorithmicDoorArcDetector:
                 result.append((int(d[0]), int(d[1]), int(d[2]), int(d[3])))
             elif hasattr(d, "x1"):
                 result.append((int(d.x1), int(d.y1), int(d.x2), int(d.y2)))
+            elif hasattr(d, "bbox"):
+                b = d.bbox
+                result.append((int(b[0]), int(b[1]), int(b[2]), int(b[3])))
             elif hasattr(d, "xyxy"):
                 b = d.xyxy
                 result.append((int(b[0]), int(b[1]), int(b[2]), int(b[3])))
