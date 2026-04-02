@@ -62,12 +62,7 @@ SERVER_CONFIG: Dict = {
     "max_concurrent_jobs": 1,
     "max_image_size_mb": 20,
     "yolo_model_path": "weights/best.pt",
-    "wall_color_hex": "8E8780",
-    "color_tolerance": 3,
-    "yolo_conf_threshold": 0.25,
     "device": "cpu",
-    "wall_height_cm": 243.84,
-    "pixels_to_cm": 2.54,
 }
 
 
@@ -112,16 +107,12 @@ pipeline: Optional[FloorplanPipeline] = None
 def _initialize_pipeline() -> None:
     global pipeline
     print("Initializing FloorplanPipeline...")
+    # Use PipelineConfig defaults for all processing parameters — identical to
+    # running main.py with default CLI arguments.  Only override infrastructure
+    # settings that are specific to the server environment.
     config = PipelineConfig(
         yolo_weights_path=SERVER_CONFIG["yolo_model_path"],
-        wall_color_hex=SERVER_CONFIG["wall_color_hex"],
-        color_tolerance=SERVER_CONFIG["color_tolerance"],
-        yolo_confidence=SERVER_CONFIG["yolo_conf_threshold"],
         yolo_device=SERVER_CONFIG["device"],
-        wall_height_cm=SERVER_CONFIG["wall_height_cm"],
-        pixels_to_cm=SERVER_CONFIG["pixels_to_cm"],
-        enable_room_measurement=True,
-        enable_door_arcs=True,
     )
     pipeline = FloorplanPipeline(config)
     pipeline.initialize()
