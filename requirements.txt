@@ -1,81 +1,24 @@
-# ===================================================================
-# ReFloor Brusnika Edition - Dependencies
-# Python 3.8 - 3.11
-# ===================================================================
+# Core pipeline
+opencv-python-headless
+numpy
+Pillow
+torch
+torchvision
+python-doctr[torch]
+scipy
+matplotlib
+PyYAML
+rich
 
-# ===== Core Deep Learning =====
-torch==2.5.1
-torchvision==0.20.1
-# For CUDA support, install from: https://pytorch.org/get-started/locally/
-# torch==2.5.1+cu118
-# torchvision==0.20.1+cu118
+# API server
+fastapi
+uvicorn[standard]
+pydantic
 
-# ===== Computer Vision =====
-opencv-python==4.12.0.88
-opencv-contrib-python==4.12.0.88  # For extended CV features (ximgproc, etc.)
-scikit-image==0.24.0
-Pillow==12.0.0
+# Dataset generator
+shapely
+networkx
 
-# ===== OCR =====
-python-doctr[torch]==0.10.0  # Document Text Recognition
-# Alternative CPU-only: python-doctr==0.10.0
-
-# ===== Scientific Computing =====
-numpy==2.2.6
-scipy==1.16.3
-pandas==2.3.3
-
-# ===== Visualization =====
-matplotlib==3.10.7
-seaborn==0.13.2
-
-# ===== YOLO Dependencies =====
-PyYAML==6.0.3
-tqdm==4.67.1
-requests==2.32.5
-pycocotools==2.0.10
-psutil==7.1.3
-thop==0.1.1-2209072238
-ultralytics-thop==2.0.18
-
-# ===== Utilities =====
-ipython==9.8.0  # For interactive debugging
-
-# ===================================================================
-# Optional GPU Acceleration
-# ===================================================================
-# Uncomment if using NVIDIA GPU:
-# nvidia-ml-py3==7.352.0  # For GPU monitoring
-
-# ===================================================================
-# Development Tools (Optional)
-# ===================================================================
-# black==24.4.2           # Code formatter
-# flake8==7.0.0          # Linter
-# pytest==8.2.1          # Testing
-# mypy==1.10.0           # Type checking
-
-# ===================================================================
-# Installation Notes
-# ===================================================================
-# 1. For CPU-only installation:
-#    pip install -r requirements.txt
-#
-# 2. For GPU installation (CUDA 11.8):
-#    pip install torch==2.5.1+cu118 torchvision==0.20.1+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
-#    pip install -r requirements.txt
-#
-# 3. For GPU installation (CUDA 12.1):
-#    pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
-#    pip install -r requirements.txt
-#
-# 4. YOLOv9 Installation:
-#    cd utils
-#    git clone https://github.com/WongKinYiu/yolov9.git
-#    cd yolov9
-#    pip install -r requirements.txt
-#
-# 5. Verify installation:
-#    python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA: {torch.cuda.is_available()}')"
-#    python -c "import cv2; print(f'OpenCV: {cv2.__version__}')"
-#    python -c "from doctr.models import ocr_predictor; print('docTR: OK')"
+# U-Net training/inference (detect_unet.py, test.py)
+segmentation-models-pytorch
+albumentations
