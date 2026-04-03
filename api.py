@@ -249,6 +249,50 @@ async def process(image: UploadFile = File(...)) -> ProcessingResult:
     return result
 
 
+@app.post("/process/sh3d")
+async def process_sh3d(image: UploadFile = File(...)):
+    """Process a floorplan image and return the .sh3d file directly."""
+    if pipeline is None:
+        raise HTTPException(status_code=503, detail="Server is still initializing")
+
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="File must be an image")
+
+    image_data = await image.read()
+    size_mb = len(image_data) / (1024 * 1024)
+    if size_mb > SERVER_CONFIG["max_image_size_mb"]:
+        raise HTTPException(status_code=413, detail=f"Image too large ({size_mb:.1f} MB)")
+
+    async with processing_semaphore:
+        loop = asyncio.get_running_loop()
+        try:
+            sh3d_path = await loop.run_in_executor(None, _process_sh3d_sync, image_data)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        sh3d_path,
+        media_type="application/zip",
+        filename="floorplan.sh3d",
+    )
+
+
+def _process_sh3d_sync(image_data: bytes) -> str:
+    """Process image and return path to the .sh3d file."""
+    temp_dir = tempfile.mkdtemp()
+    temp_path = Path(temp_dir)
+    input_path = temp_path / "input.png"
+    Image.open(io.BytesIO(image_data)).save(input_path)
+
+    result = pipeline.process(str(input_path), str(temp_dir))
+
+    if not result.sh3d_path or not os.path.exists(result.sh3d_path):
+        raise RuntimeError("SH3D file was not created")
+
+    return result.sh3d_path
+
+
 # ============================================================
 # SERVER STARTUP
 # ============================================================

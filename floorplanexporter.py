@@ -1664,9 +1664,15 @@ class SweetHome3DExporter:
                 parent.start.x + t_clamped * (parent.end.x - parent.start.x),
                 parent.start.y + t_clamped * (parent.end.y - parent.start.y),
             )
-            # Depth = wall thickness (already set at creation, but refresh
-            # in case the wall was adjusted during connection processing)
-            o.depth = parent.thickness
+            # Depth = thinnest wall the opening is connected to.
+            # For doors in a gap between two structural walls, this is
+            # min(wall_at_start.thickness, wall_at_end.thickness).
+            connected_thicknesses = [parent.thickness]
+            for wid in (parent.wall_at_start, parent.wall_at_end):
+                neighbor = wall_by_id.get(wid)
+                if neighbor:
+                    connected_thicknesses.append(neighbor.thickness)
+            o.depth = min(connected_thicknesses)
 
     def _write_sh3d_file(self, output_path: str, xml_content: str) -> None:
         if not output_path.endswith('.sh3d'):

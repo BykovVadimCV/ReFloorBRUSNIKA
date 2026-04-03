@@ -1272,6 +1272,8 @@ class FloorplanPipeline:
         _notify("detecting openings")
         logger.info("[%s] Stage 2: Opening detection", base_name)
 
+        ocr_bboxes = self._get_ocr_bboxes(img)
+
         _use_unet_openings = (
             (unet_detection is not None or has_unet_openings)
             and (unet_door_bboxes or unet_window_bboxes)
@@ -1297,7 +1299,6 @@ class FloorplanPipeline:
                 except Exception as e:
                     logger.warning("YOLO detection failed: %s", e)
 
-            ocr_bboxes = self._get_ocr_bboxes(img)
             pixel_scale = self.config.pixels_to_m
 
             openings, door_arcs = self._run_opening_detection(
@@ -1312,6 +1313,7 @@ class FloorplanPipeline:
                 base_name=base_name,
             )
 
+        openings = self._filter_windows_by_regions(openings, img, ocr_bboxes)
         result.openings = openings
         result.door_arcs = door_arcs
 
@@ -1708,6 +1710,81 @@ class FloorplanPipeline:
                 logger.warning("Door arc extraction failed (non-fatal): %s", e)
 
         return openings, door_arcs
+
+    def _filter_windows_by_regions(
+        self,
+        openings: List[Opening],
+        img: np.ndarray,
+        ocr_bboxes: List,
+        min_region_overlap: float = 0.80,
+    ) -> List[Opening]:
+        """Remove windows that fail enclosed-region checks.
+
+        Rule 1: window bbox must overlap >= min_region_overlap with enclosed
+                 interior regions (label > 0). Windows mostly outside are invalid.
+        Rule 2: window overlapping an enclosed region that contains an OCR
+                 bounding box is invalid (OCR text = room interior, not wall).
+        """
+        num_labels, labels = _build_enclosed_regions(img)
+        if num_labels <= 1:
+            return openings  # no enclosed regions found
+
+        # Build set of region labels that contain OCR text
+        ocr_region_ids: set = set()
+        for bbox in (ocr_bboxes or []):
+            x1, y1, x2, y2 = bbox[:4]
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
+            h, w = labels.shape
+            if 0 <= cy < h and 0 <= cx < w:
+                lbl = labels[cy, cx]
+                if lbl > 0:
+                    ocr_region_ids.add(int(lbl))
+
+        kept: List[Opening] = []
+        removed = 0
+        for op in openings:
+            if not op.is_window:
+                kept.append(op)
+                continue
+
+            b = op.bbox
+            x1 = max(0, int(b.x1))
+            y1 = max(0, int(b.y1))
+            x2 = min(labels.shape[1], int(b.x2))
+            y2 = min(labels.shape[0], int(b.y2))
+            bbox_area = (x2 - x1) * (y2 - y1)
+            if bbox_area <= 0:
+                kept.append(op)
+                continue
+
+            region_patch = labels[y1:y2, x1:x2]
+
+            # Rule 1: overlap with any enclosed region
+            enclosed_count = int(np.count_nonzero(region_patch > 0))
+            overlap_ratio = enclosed_count / bbox_area
+            if overlap_ratio < min_region_overlap:
+                removed += 1
+                logger.debug(
+                    "Window removed (low region overlap %.0f%%): %s",
+                    overlap_ratio * 100, b,
+                )
+                continue
+
+            # Rule 2: overlaps region containing OCR text
+            window_region_ids = set(np.unique(region_patch)) - {0}
+            if window_region_ids & ocr_region_ids:
+                removed += 1
+                logger.debug(
+                    "Window removed (overlaps OCR region): %s", b,
+                )
+                continue
+
+            kept.append(op)
+
+        if removed:
+            logger.info("Filtered %d invalid window(s) by region analysis", removed)
+        return kept
 
     def _get_ocr_bboxes(self, img: np.ndarray) -> List:
         """Get OCR text bounding boxes from the wall detector's OCR model."""
