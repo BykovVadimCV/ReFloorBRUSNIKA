@@ -241,6 +241,231 @@ def debug_enclosed_regions(
     _logger.info("Enclosed regions debug image saved: %s", output_path)
 
 
+# ─────────────────────────────────────────────────────────────
+# Unenclosed wall rectangle detection
+# ─────────────────────────────────────────────────────────────
+
+def _extract_wall_outlines(
+    img_bgr: np.ndarray,
+    wall_mask: np.ndarray,
+    black_threshold: int = 80,
+    dilate_mask: int = 10,
+    close_kernel: int = 5,
+    close_iterations: int = 2,
+) -> np.ndarray:
+    """Extract black outline pixels within the U-Net wall region.
+
+    1. Find dark pixels (grayscale < black_threshold).
+    2. Dilate U-Net mask to catch outline edges near predicted boundaries.
+    3. Intersect: keep only dark pixels inside dilated mask.
+    4. Morphological close to bridge small outline gaps.
+
+    Returns binary mask (H, W) uint8: 255 = wall outline, 0 = other.
+    """
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) if len(img_bgr.shape) == 3 else img_bgr
+    dark_pixels = (gray < black_threshold).astype(np.uint8) * 255
+
+    if dilate_mask > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (dilate_mask * 2 + 1, dilate_mask * 2 + 1))
+        expanded_mask = cv2.dilate(wall_mask, kernel, iterations=1)
+    else:
+        expanded_mask = wall_mask
+
+    outlines = cv2.bitwise_and(dark_pixels, expanded_mask)
+
+    if close_kernel > 0 and close_iterations > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (close_kernel, close_kernel))
+        outlines = cv2.morphologyEx(outlines, cv2.MORPH_CLOSE, kernel,
+                                     iterations=close_iterations)
+    return outlines
+
+
+def _enclosed_regions_from_mask(boundary_mask: np.ndarray):
+    """Find enclosed regions using a binary mask as boundaries.
+
+    boundary_mask: (H, W) uint8, 255 = barrier, 0 = fillable.
+    Returns (num_labels, labels) from connectedComponents.
+    Label 0 = background/barriers, 1..N = enclosed regions.
+    """
+    h, w = boundary_mask.shape[:2]
+    fillable = (boundary_mask == 0).astype(np.uint8) * 255
+
+    padded = np.zeros((h + 2, w + 2), dtype=np.uint8)
+    flood = fillable.copy()
+
+    for x in range(w):
+        if flood[0, x] == 255:
+            cv2.floodFill(flood, padded, (x, 0), 128)
+        if flood[h - 1, x] == 255:
+            cv2.floodFill(flood, padded, (x, h - 1), 128)
+    for y in range(h):
+        if flood[y, 0] == 255:
+            cv2.floodFill(flood, padded, (0, y), 128)
+        if flood[y, w - 1] == 255:
+            cv2.floodFill(flood, padded, (w - 1, y), 128)
+
+    enclosed = (flood == 255).astype(np.uint8) * 255
+    return cv2.connectedComponents(enclosed)
+
+
+def _largest_rectangle_in_mask(mask_bool: np.ndarray):
+    """Find the largest axis-aligned rectangle of True pixels (O(H*W))."""
+    h, w = mask_bool.shape
+    heights = np.zeros(w, dtype=np.int32)
+    best_area = 0
+    best_coords = None
+
+    for i in range(h):
+        row = mask_bool[i]
+        heights = heights + row.astype(np.int32)
+        heights[~row] = 0
+
+        stack = []
+        j = 0
+        while j <= w:
+            cur_h = heights[j] if j < w else 0
+            if not stack or cur_h >= heights[stack[-1]]:
+                stack.append(j)
+                j += 1
+            else:
+                top = stack.pop()
+                height = heights[top]
+                if height == 0:
+                    continue
+                width_val = j if not stack else j - stack[-1] - 1
+                area = int(height * width_val)
+                if area > best_area:
+                    best_area = area
+                    y2 = i
+                    y1 = i - height + 1
+                    x2 = j - 1
+                    x1 = (stack[-1] + 1) if stack else 0
+                    best_coords = (x1, y1, x2, y2)
+
+    if best_coords is None or best_area <= 0:
+        return None
+    return (*best_coords, best_area)
+
+
+def _extract_rects_from_mask(
+    mask: np.ndarray,
+    min_area: int = 200,
+) -> List[Tuple[int, int, int, int]]:
+    """Greedy largest-rectangle extraction from a binary mask."""
+    kernel = np.ones((3, 3), np.uint8)
+    cleaned = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel, iterations=1)
+
+    work = (cleaned > 0).copy()
+    bboxes = []
+
+    while True:
+        res = _largest_rectangle_in_mask(work)
+        if res is None:
+            break
+        x1, y1, x2, y2, area = res
+        if area < min_area:
+            break
+        bboxes.append((int(x1), int(y1), int(x2), int(y2)))
+        work[y1:y2 + 1, x1:x2 + 1] = False
+        if not work.any():
+            break
+
+    return bboxes
+
+
+def find_unenclosed_wall_rects(
+    img_bgr: np.ndarray,
+    wall_mask: np.ndarray,
+    min_area: int = 200,
+    merge_gap: int = 15,
+    min_merged_area: int = 1000,
+) -> List[Tuple[int, int, int, int]]:
+    """Find axis-aligned bounding boxes for wall regions not in enclosed spaces.
+
+    1. Extract wall outlines (black lines within U-Net mask).
+    2. Find enclosed regions from those outlines.
+    3. Identify wall-mask pixels NOT covered by any enclosed region.
+    4. Greedy largest-rectangle extraction on uncovered wall pixels.
+    5. Merge nearby rects (dilate by merge_gap), re-extract, filter small.
+
+    Returns list of (x1, y1, x2, y2) tuples.
+    """
+    h, w = wall_mask.shape
+
+    # Wall outlines = black pixels inside/near U-Net mask
+    outlines = _extract_wall_outlines(img_bgr, wall_mask)
+
+    # Enclosed regions from outlines
+    n_enc, labels = _enclosed_regions_from_mask(outlines)
+    covered = np.zeros((h, w), dtype=bool)
+    for i in range(1, n_enc):
+        covered |= (labels == i)
+
+    _logger.info("Outline-based enclosed regions: %d, covered %.1f%% of wall mask",
+                 n_enc - 1,
+                 np.sum(covered & (wall_mask > 0)) * 100 / max(1, np.sum(wall_mask > 0)))
+
+    # Uncovered wall pixels
+    uncovered = ((wall_mask > 0) & ~covered).astype(np.uint8) * 255
+
+    # Greedy rectangle extraction
+    raw_bboxes = _extract_rects_from_mask(uncovered, min_area=min_area)
+    _logger.info("Unenclosed wall rects: %d raw", len(raw_bboxes))
+
+    if not raw_bboxes:
+        return []
+
+    # Merge nearby rects: paint → dilate → connected components → re-extract
+    canvas = np.zeros((h, w), dtype=np.uint8)
+    for x1, y1, x2, y2 in raw_bboxes:
+        canvas[y1:y2, x1:x2] = 255
+
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_RECT, (merge_gap * 2 + 1, merge_gap * 2 + 1))
+    dilated = cv2.dilate(canvas, kernel, iterations=1)
+
+    n_cc, cc_labels = cv2.connectedComponents(dilated)
+    merged = []
+    for cc_id in range(1, n_cc):
+        ys, xs = np.where(cc_labels == cc_id)
+        cx1, cy1 = int(xs.min()), int(ys.min())
+        cx2, cy2 = int(xs.max()) + 1, int(ys.max()) + 1
+        region = canvas[cy1:cy2, cx1:cx2]
+        for sx1, sy1, sx2, sy2 in _extract_rects_from_mask(region, min_area=min_merged_area):
+            merged.append((cx1 + sx1, cy1 + sy1, cx1 + sx2, cy1 + sy2))
+
+    _logger.info("Unenclosed wall rects: %d after merge+filter (gap=%d, min=%d)",
+                 len(merged), merge_gap, min_merged_area)
+
+    return merged
+
+
+def paint_unenclosed_walls_grey(
+    grey_img: np.ndarray,
+    rects: List[Tuple[int, int, int, int]],
+    grey_value: int = 160,
+    black_threshold: int = 60,
+) -> np.ndarray:
+    """Paint unenclosed wall rectangles grey, preserving black outlines."""
+    result = grey_img.copy()
+    if len(result.shape) == 3:
+        gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = result
+    for x1, y1, x2, y2 in rects:
+        # Fill grey, but preserve existing black outline pixels
+        roi = gray[y1:y2, x1:x2]
+        not_black = roi >= black_threshold
+        if len(result.shape) == 3:
+            result[y1:y2, x1:x2][not_black] = grey_value
+        else:
+            result[y1:y2, x1:x2][not_black] = grey_value
+    return result
+
+
 def detect_dominant_wall_color(image: np.ndarray) -> Tuple[int, int, int]:
     """
     Detect the dominant wall color in a floorplan image using K-means

@@ -39,6 +39,8 @@ from detection.walls import (
     _build_enclosed_regions,
     build_grey_wall_image,
     debug_enclosed_regions,
+    find_unenclosed_wall_rects,
+    paint_unenclosed_walls_grey,
     refine_wall_mask_by_enclosed_regions,
     snap_walls,
     wall_rectangle_to_segment,
@@ -1230,6 +1232,17 @@ class FloorplanPipeline:
                 wall_mask=unet_wall_mask,
                 coverage_threshold=0.50,
             )
+
+            # Add unenclosed wall rects (walls the U-Net sees but
+            # enclosed-region analysis missed due to outline gaps)
+            unenclosed_rects = find_unenclosed_wall_rects(
+                img, unet_wall_mask,
+                min_area=200, merge_gap=15, min_merged_area=1000)
+            if unenclosed_rects:
+                grey_img = paint_unenclosed_walls_grey(
+                    grey_img, unenclosed_rects, grey_value=160)
+                logger.info("[%s] Added %d unenclosed wall rects to grey image",
+                            base_name, len(unenclosed_rects))
 
             grey_path = os.path.join(output_dir, f"{base_name}_grey_walls.png")
             cv2.imwrite(grey_path, grey_img)
