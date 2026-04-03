@@ -113,6 +113,7 @@ def _initialize_pipeline() -> None:
     config = PipelineConfig(
         yolo_weights_path=SERVER_CONFIG["yolo_model_path"],
         yolo_device=SERVER_CONFIG["device"],
+        enable_unet=True,
     )
     pipeline = FloorplanPipeline(config)
     pipeline.initialize()
@@ -153,15 +154,16 @@ def _convert_to_gltf(sh3d_path: str) -> str:
 # CORE PROCESSING (CPU-bound, runs in thread pool)
 # ============================================================
 
-def _process_image_sync(image_data: bytes) -> ProcessingResult:
+def _process_image_sync(image_data: bytes, filename: str = "input.jpg") -> ProcessingResult:
     start = time.time()
 
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
-        stem = "input"
-        input_path = temp_path / f"{stem}.png"
+        ext = Path(filename).suffix.lower() or ".jpg"
+        input_path = temp_path / f"input{ext}"
 
-        Image.open(io.BytesIO(image_data)).save(input_path)
+        # Write raw bytes — no PIL re-encoding, identical to reading from disk
+        input_path.write_bytes(image_data)
 
         result = pipeline.process(str(input_path), str(temp_path))
 
@@ -242,7 +244,9 @@ async def process(image: UploadFile = File(...)) -> ProcessingResult:
     async with processing_semaphore:
         loop = asyncio.get_running_loop()
         try:
-            result = await loop.run_in_executor(None, _process_image_sync, image_data)
+            result = await loop.run_in_executor(
+                None, _process_image_sync, image_data, image.filename or "input.jpg"
+            )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 
@@ -266,7 +270,9 @@ async def process_sh3d(image: UploadFile = File(...)):
     async with processing_semaphore:
         loop = asyncio.get_running_loop()
         try:
-            sh3d_path = await loop.run_in_executor(None, _process_sh3d_sync, image_data)
+            sh3d_path = await loop.run_in_executor(
+                None, _process_sh3d_sync, image_data, image.filename or "input.jpg"
+            )
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc))
 
@@ -278,12 +284,13 @@ async def process_sh3d(image: UploadFile = File(...)):
     )
 
 
-def _process_sh3d_sync(image_data: bytes) -> str:
+def _process_sh3d_sync(image_data: bytes, filename: str = "input.jpg") -> str:
     """Process image and return path to the .sh3d file."""
     temp_dir = tempfile.mkdtemp()
     temp_path = Path(temp_dir)
-    input_path = temp_path / "input.png"
-    Image.open(io.BytesIO(image_data)).save(input_path)
+    ext = Path(filename).suffix.lower() or ".jpg"
+    input_path = temp_path / f"input{ext}"
+    input_path.write_bytes(image_data)
 
     result = pipeline.process(str(input_path), str(temp_dir))
 
