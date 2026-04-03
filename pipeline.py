@@ -580,7 +580,7 @@ def _validate_room_areas(
             ratio = computed_m2 / matched_area if matched_area > 0 else 0
             status = "ok" if abs(ratio - 1.0) <= tolerance_ratio else "mismatch"
             if status == "mismatch":
-                logger.warning(
+                logger.debug(
                     "Room %s area mismatch: computed=%.1f m², OCR=%.1f m² (ratio=%.2f)",
                     room.name, computed_m2, matched_area, ratio,
                 )
@@ -1533,7 +1533,11 @@ class FloorplanPipeline:
 
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        from detect_unet import run_unet_subprocess as _detect_unet_subprocess
+        try:
+            from detect_unet import run_unet_subprocess as _detect_unet_subprocess
+        except ImportError as exc:
+            logger.info("U-Net dependencies not available (%s), skipping", exc)
+            return None
         unet_result = _detect_unet_subprocess(
             image_rgb=img_rgb,
             checkpoint_path=ckpt,

@@ -26,12 +26,6 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 import torch
-import segmentation_models_pytorch as smp
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-from PIL import Image
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Config — must match training
@@ -60,6 +54,7 @@ COLOR_DOOR = (200, 160, 0)     # cyan
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_model(num_classes: int = NUM_CLASSES, encoder: str = ENCODER):
+    import segmentation_models_pytorch as smp
     return smp.Unet(
         encoder_name=encoder,
         encoder_weights=None,
@@ -75,16 +70,15 @@ def load_checkpoint(model, ckpt_path: str, device: torch.device):
         model.load_state_dict(state["model"])
         epoch = state.get("epoch", "?")
         miou = state.get("best_val_iou", None)
-        print(f"Loaded epoch checkpoint  epoch={epoch}"
-              + (f"  best_val_mIoU={miou:.4f}" if miou else ""))
     else:
         model.load_state_dict(state)
-        print("Loaded bare state_dict")
     model.eval()
     return model
 
 
 def get_val_transform(img_size: int):
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
     return A.Compose([
         A.Resize(img_size, img_size),
         A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
@@ -1049,6 +1043,7 @@ def colorize_mask(mask: np.ndarray) -> np.ndarray:
 
 def overlay_prediction(image_rgb: np.ndarray, mask: np.ndarray,
                        alpha: float = 0.45) -> np.ndarray:
+    from PIL import Image
     h_orig, w_orig = image_rgb.shape[:2]
     colour_rgb = colorize_mask(mask)
     colour_pil = Image.fromarray(colour_rgb).resize(
@@ -1105,6 +1100,9 @@ def display_results(
     fname: str,
 ) -> None:
     """Show original, mask, and bbox visualization side-by-side."""
+    from PIL import Image
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
     h_orig, w_orig = image_rgb.shape[:2]
     colour_rgb = colorize_mask(mask)
     colour_resized = np.array(
@@ -1313,6 +1311,7 @@ def is_outline_style(image_rgb: np.ndarray, wall_bboxes, white_threshold=200):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    from PIL import Image
     parser = argparse.ArgumentParser(
         description="U-Net floorplan detection: semantic mask -> bounding boxes",
     )
