@@ -1241,6 +1241,11 @@ class SweetHome3DExporter:
         self._move_opening_walls_to_structural_centerlines(
             opening_walls, structural_walls
         )
+        if original_image is not None:
+            self._validate_opening_walls_with_image(
+                opening_walls, openings, original_image,
+            )
+            all_walls = structural_walls + opening_walls
         if original_image is not None and debug_image_path is not None:
             door_dbg = self._draw_door_placement_debug(
                 original_image, structural_walls,
@@ -1279,6 +1284,76 @@ class SweetHome3DExporter:
             )
             cv2.imwrite(debug_image_path, debug_img)
         return rooms
+
+    # ----- pixel-based door validation -----
+    def _validate_opening_walls_with_image(
+        self,
+        opening_walls: List[Wall],
+        openings: List[Opening],
+        image: 'np.ndarray',
+    ) -> None:
+        """Check both ends of each door for wall pixels. Shift laterally
+        if needed; remove the door entirely if no walls are found."""
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        img_h, img_w = gray.shape[:2]
+        s = self.pixels_to_cm
+        DARK = 100          # grayscale threshold
+        PROBE = 5           # pixels beyond endpoint to sample
+        R = 3               # probe patch half-size
+        MAX_SHIFT = 30      # max lateral shift in pixels
+
+        def _dark(px_x: int, px_y: int) -> bool:
+            y1, y2 = max(0, px_y - R), min(img_h, px_y + R + 1)
+            x1, x2 = max(0, px_x - R), min(img_w, px_x + R + 1)
+            if x1 >= x2 or y1 >= y2:
+                return False
+            return bool(np.any(gray[y1:y2, x1:x2] < DARK))
+
+        to_remove: set = set()
+
+        for ow in opening_walls:
+            if ow.is_horizontal:
+                lx = int(min(ow.start.x, ow.end.x) / s) - PROBE
+                rx = int(max(ow.start.x, ow.end.x) / s) + PROBE
+                cy = int(ow.get_centerline_y() / s)
+
+                if _dark(lx, cy) and _dark(rx, cy):
+                    continue
+
+                found = False
+                for d in range(1, MAX_SHIFT + 1):
+                    for try_y in (cy - d, cy + d):
+                        if 0 <= try_y < img_h and _dark(lx, try_y) and _dark(rx, try_y):
+                            ow.start.y = ow.end.y = try_y * s
+                            found = True
+                            break
+                    if found:
+                        break
+                if not found:
+                    to_remove.add(ow.wall_id)
+            else:
+                ty = int(min(ow.start.y, ow.end.y) / s) - PROBE
+                by = int(max(ow.start.y, ow.end.y) / s) + PROBE
+                cx = int(ow.get_centerline_x() / s)
+
+                if _dark(cx, ty) and _dark(cx, by):
+                    continue
+
+                found = False
+                for d in range(1, MAX_SHIFT + 1):
+                    for try_x in (cx - d, cx + d):
+                        if 0 <= try_x < img_w and _dark(try_x, ty) and _dark(try_x, by):
+                            ow.start.x = ow.end.x = try_x * s
+                            found = True
+                            break
+                    if found:
+                        break
+                if not found:
+                    to_remove.add(ow.wall_id)
+
+        if to_remove:
+            opening_walls[:] = [w for w in opening_walls if w.wall_id not in to_remove]
+            openings[:] = [o for o in openings if o.parent_wall_id not in to_remove]
 
     # ----- opening-wall → structural-centerline snapping (unchanged) -----
     def _move_opening_walls_to_structural_centerlines(
