@@ -297,6 +297,7 @@ PARENT_WALL_SEARCH_TOLERANCE: float = 50.0
 CENTERLINE_SEARCH_RADIUS: float = 150.0
 OPENING_AXIS_SNAP_TOLERANCE: float = 30.0
 OPENING_EXTENSION_TOLERANCE: float = 30.0
+WALL_FACING_TOLERANCE: float = 40.0
 
 # --- REMOVED: these constants are no longer used ---
 # DEFAULT_DOOR_WIDTH / DEFAULT_WINDOW_WIDTH — opening width now comes
@@ -667,13 +668,21 @@ class ParentWallFinder:
             length_sq = dx * dx + dy * dy
             if length_sq < 0.001:
                 continue
+            wall_length = math.sqrt(length_sq)
             t = (
                 (center.x - wall.start.x) * dx
                 + (center.y - wall.start.y) * dy
             ) / length_sq
-            if t < 0.0 or t > 1.0:
+            # Allow the opening centre to project slightly beyond the
+            # wall endpoints — doors in a gap between two walls have
+            # their centre between the endpoints of adjacent segments.
+            margin = (opening_width / 2) / wall_length if wall_length > 0 else 0.5
+            if t < -margin or t > 1 + margin:
                 continue
-            proj = Point(wall.start.x + t * dx, wall.start.y + t * dy)
+            proj = Point(
+                wall.start.x + max(0.0, min(1.0, t)) * dx,
+                wall.start.y + max(0.0, min(1.0, t)) * dy,
+            )
             perp_dist = center.distance_to(proj)
             if perp_dist < self.tolerance and perp_dist < best_distance:
                 best_distance = perp_dist
@@ -1232,6 +1241,14 @@ class SweetHome3DExporter:
         self._move_opening_walls_to_structural_centerlines(
             opening_walls, structural_walls
         )
+        if original_image is not None and debug_image_path is not None:
+            door_dbg = self._draw_door_placement_debug(
+                original_image, structural_walls,
+            )
+            door_dbg_path = debug_image_path.replace(
+                '_debug.png', '_door_debug.png',
+            )
+            cv2.imwrite(door_dbg_path, door_dbg)
         self._process_wall_connections(all_walls, structural_walls, opening_walls)
         self._update_openings_from_walls(openings, all_walls)
 
@@ -1272,10 +1289,12 @@ class SweetHome3DExporter:
         horiz_s = [w for w in structural_walls if w.is_horizontal]
         vert_s = [w for w in structural_walls if not w.is_horizontal]
         search_r = CENTERLINE_SEARCH_RADIUS
+        self._door_placement_debug: List[dict] = []
 
         for ow in opening_walls:
             if ow.length < 0.1:
                 continue
+            _orig = (ow.start.x, ow.start.y, ow.end.x, ow.end.y)
             if ow.is_horizontal:
                 ow_y = ow.get_centerline_y()
                 ow_cx = (ow.get_min_x() + ow.get_max_x()) / 2
@@ -1294,23 +1313,53 @@ class SweetHome3DExporter:
                     ow.start.y = ow.end.y = best_y
                 best_gap, best_lx, best_rx = float('inf'), None, None
                 left_c = [
-                    (sw.get_centerline_x(), sw) for sw in vert_s
+                    (sw.get_centerline_x() + sw.thickness / 2, sw) for sw in vert_s
                     if (
-                        sw.get_min_y() - search_r <= ow_y <= sw.get_max_y() + search_r
+                        sw.get_min_y() - WALL_FACING_TOLERANCE <= ow_y <= sw.get_max_y() + WALL_FACING_TOLERANCE
                         and sw.get_centerline_x() < ow_cx
                         and abs(sw.get_centerline_x() - ow_cx) <= search_r
                     )
                 ]
-                right_c = [
-                    (sw.get_centerline_x(), sw) for sw in vert_s
+                left_c.extend([
+                    (sw.get_max_x(), sw) for sw in horiz_s
                     if (
-                        sw.get_min_y() - search_r <= ow_y <= sw.get_max_y() + search_r
+                        abs(sw.get_centerline_y() - ow_y) <= WALL_FACING_TOLERANCE
+                        and sw.get_max_x() < ow_cx
+                        and abs(sw.get_max_x() - ow_cx) <= search_r
+                    )
+                ])
+                right_c = [
+                    (sw.get_centerline_x() - sw.thickness / 2, sw) for sw in vert_s
+                    if (
+                        sw.get_min_y() - WALL_FACING_TOLERANCE <= ow_y <= sw.get_max_y() + WALL_FACING_TOLERANCE
                         and sw.get_centerline_x() >= ow_cx
                         and abs(sw.get_centerline_x() - ow_cx) <= search_r
                     )
                 ]
-                for lx, _ in left_c:
-                    for rx, _ in right_c:
+                right_c.extend([
+                    (sw.get_min_x(), sw) for sw in horiz_s
+                    if (
+                        abs(sw.get_centerline_y() - ow_y) <= WALL_FACING_TOLERANCE
+                        and sw.get_min_x() >= ow_cx
+                        and abs(sw.get_min_x() - ow_cx) <= search_r
+                    )
+                ])
+                for lx, lw in left_c:
+                    for rx, rw in right_c:
+                        if not (lw.get_min_y() - WALL_FACING_TOLERANCE <= ow_y <= lw.get_max_y() + WALL_FACING_TOLERANCE):
+                            continue
+                        if not (rw.get_min_y() - WALL_FACING_TOLERANCE <= ow_y <= rw.get_max_y() + WALL_FACING_TOLERANCE):
+                            continue
+                        if lw.is_horizontal and rw.is_horizontal:
+                            y_ovl = min(
+                                lw.get_centerline_y() + lw.thickness / 2,
+                                rw.get_centerline_y() + rw.thickness / 2,
+                            ) - max(
+                                lw.get_centerline_y() - lw.thickness / 2,
+                                rw.get_centerline_y() - rw.thickness / 2,
+                            )
+                            if y_ovl < -5.0:
+                                continue
                         gap = rx - lx
                         if gap <= 5.0 or gap >= best_gap:
                             continue
@@ -1322,7 +1371,7 @@ class SweetHome3DExporter:
                             and oow.get_max_x() > lx
                             for oow in opening_walls
                         ) or any(
-                            abs(sw.get_centerline_y() - ow_y) < 20.0
+                            abs(sw.get_centerline_y() - ow.get_centerline_y()) < 20.0
                             and sw.get_min_x() <= lx + 5
                             and sw.get_max_x() >= rx - 5
                             for sw in horiz_s
@@ -1331,6 +1380,14 @@ class SweetHome3DExporter:
                             best_gap, best_lx, best_rx = gap, lx, rx
                 if best_lx is not None:
                     ow.start.x, ow.end.x = best_lx, best_rx
+                elif best_y is not None:
+                    ow.start.y = ow.end.y = (_orig[1] + _orig[3]) / 2
+                self._door_placement_debug.append({
+                    'h': True, 'orig': _orig,
+                    'lc': list(left_c), 'rc': list(right_c),
+                    'sel': (best_lx, best_rx) if best_lx is not None else None,
+                    'final': (ow.start.x, ow.start.y, ow.end.x, ow.end.y),
+                })
             else:
                 ow_x = ow.get_centerline_x()
                 ow_cy = (ow.get_min_y() + ow.get_max_y()) / 2
@@ -1349,23 +1406,53 @@ class SweetHome3DExporter:
                     ow.start.x = ow.end.x = best_x
                 best_gap, best_ty, best_by = float('inf'), None, None
                 top_c = [
-                    (sw.get_centerline_y(), sw) for sw in horiz_s
+                    (sw.get_centerline_y() + sw.thickness / 2, sw) for sw in horiz_s
                     if (
-                        sw.get_min_x() - search_r <= ow_x <= sw.get_max_x() + search_r
+                        sw.get_min_x() - WALL_FACING_TOLERANCE <= ow_x <= sw.get_max_x() + WALL_FACING_TOLERANCE
                         and sw.get_centerline_y() < ow_cy
                         and abs(sw.get_centerline_y() - ow_cy) <= search_r
                     )
                 ]
-                bot_c = [
-                    (sw.get_centerline_y(), sw) for sw in horiz_s
+                top_c.extend([
+                    (sw.get_max_y(), sw) for sw in vert_s
                     if (
-                        sw.get_min_x() - search_r <= ow_x <= sw.get_max_x() + search_r
+                        abs(sw.get_centerline_x() - ow_x) <= WALL_FACING_TOLERANCE
+                        and sw.get_max_y() < ow_cy
+                        and abs(sw.get_max_y() - ow_cy) <= search_r
+                    )
+                ])
+                bot_c = [
+                    (sw.get_centerline_y() - sw.thickness / 2, sw) for sw in horiz_s
+                    if (
+                        sw.get_min_x() - WALL_FACING_TOLERANCE <= ow_x <= sw.get_max_x() + WALL_FACING_TOLERANCE
                         and sw.get_centerline_y() >= ow_cy
                         and abs(sw.get_centerline_y() - ow_cy) <= search_r
                     )
                 ]
-                for ty, _ in top_c:
-                    for by_, _ in bot_c:
+                bot_c.extend([
+                    (sw.get_min_y(), sw) for sw in vert_s
+                    if (
+                        abs(sw.get_centerline_x() - ow_x) <= WALL_FACING_TOLERANCE
+                        and sw.get_min_y() >= ow_cy
+                        and abs(sw.get_min_y() - ow_cy) <= search_r
+                    )
+                ])
+                for ty, tw in top_c:
+                    for by_, bw in bot_c:
+                        if not (tw.get_min_x() - WALL_FACING_TOLERANCE <= ow_x <= tw.get_max_x() + WALL_FACING_TOLERANCE):
+                            continue
+                        if not (bw.get_min_x() - WALL_FACING_TOLERANCE <= ow_x <= bw.get_max_x() + WALL_FACING_TOLERANCE):
+                            continue
+                        if not tw.is_horizontal and not bw.is_horizontal:
+                            x_ovl = min(
+                                tw.get_centerline_x() + tw.thickness / 2,
+                                bw.get_centerline_x() + bw.thickness / 2,
+                            ) - max(
+                                tw.get_centerline_x() - tw.thickness / 2,
+                                bw.get_centerline_x() - bw.thickness / 2,
+                            )
+                            if x_ovl < -5.0:
+                                continue
                         gap = by_ - ty
                         if gap <= 5.0 or gap >= best_gap:
                             continue
@@ -1377,7 +1464,7 @@ class SweetHome3DExporter:
                             and oow.get_max_y() > ty
                             for oow in opening_walls
                         ) or any(
-                            abs(sw.get_centerline_x() - ow_x) < 20.0
+                            abs(sw.get_centerline_x() - ow.get_centerline_x()) < 20.0
                             and sw.get_min_y() <= ty + 5
                             and sw.get_max_y() >= by_ - 5
                             for sw in vert_s
@@ -1389,6 +1476,122 @@ class SweetHome3DExporter:
                         ow.start.y, ow.end.y = best_ty, best_by
                     else:
                         ow.start.y, ow.end.y = best_by, best_ty
+                elif best_x is not None:
+                    ow.start.x = ow.end.x = (_orig[0] + _orig[2]) / 2
+                self._door_placement_debug.append({
+                    'h': False, 'orig': _orig,
+                    'tc': list(top_c), 'bc': list(bot_c),
+                    'sel': (best_ty, best_by) if best_ty is not None else None,
+                    'final': (ow.start.x, ow.start.y, ow.end.x, ow.end.y),
+                })
+
+    def _draw_door_placement_debug(
+        self,
+        original_image: 'np.ndarray',
+        structural_walls: List[Wall],
+    ) -> 'np.ndarray':
+        """Draw debug overlay showing door placement decisions."""
+        canvas = original_image.copy()
+        s = self.pixels_to_cm
+
+        def c(v: float) -> int:
+            return int(round(v / s))
+
+        # Structural wall bounding boxes — thin dark-blue
+        for sw in structural_walls:
+            if sw.is_horizontal:
+                p1 = (c(sw.get_min_x()), c(sw.get_centerline_y() - sw.thickness / 2))
+                p2 = (c(sw.get_max_x()), c(sw.get_centerline_y() + sw.thickness / 2))
+            else:
+                p1 = (c(sw.get_centerline_x() - sw.thickness / 2), c(sw.get_min_y()))
+                p2 = (c(sw.get_centerline_x() + sw.thickness / 2), c(sw.get_max_y()))
+            cv2.rectangle(canvas, p1, p2, (180, 130, 70), 1)
+
+        for entry in self._door_placement_debug:
+            is_h = entry['h']
+            o = entry['orig']
+            f = entry['final']
+
+            # Original position — thin red
+            cv2.line(canvas, (c(o[0]), c(o[1])), (c(o[2]), c(o[3])),
+                     (0, 0, 255), 1)
+
+            if is_h:
+                fy = c(f[1])
+                # Left candidates — orange edge lines
+                for pos, sw in entry['lc']:
+                    px = c(pos)
+                    if not sw.is_horizontal:
+                        y1, y2 = c(sw.get_min_y()), c(sw.get_max_y())
+                    else:
+                        y1 = c(sw.get_centerline_y() - sw.thickness / 2)
+                        y2 = c(sw.get_centerline_y() + sw.thickness / 2)
+                    cv2.line(canvas, (px, y1), (px, y2), (0, 165, 255), 1)
+                    cv2.putText(canvas, 'L', (px - 8, y1 - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 165, 255), 1)
+                # Right candidates — cyan edge lines
+                for pos, sw in entry['rc']:
+                    px = c(pos)
+                    if not sw.is_horizontal:
+                        y1, y2 = c(sw.get_min_y()), c(sw.get_max_y())
+                    else:
+                        y1 = c(sw.get_centerline_y() - sw.thickness / 2)
+                        y2 = c(sw.get_centerline_y() + sw.thickness / 2)
+                    cv2.line(canvas, (px, y1), (px, y2), (255, 255, 0), 1)
+                    cv2.putText(canvas, 'R', (px + 2, y1 - 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
+                # Selected boundaries — green
+                sel = entry['sel']
+                if sel:
+                    cv2.line(canvas, (c(sel[0]), fy - 20), (c(sel[0]), fy + 20),
+                             (0, 255, 0), 2)
+                    cv2.line(canvas, (c(sel[1]), fy - 20), (c(sel[1]), fy + 20),
+                             (0, 255, 0), 2)
+                    gap = abs(sel[1] - sel[0])
+                    mid = c((sel[0] + sel[1]) / 2)
+                    cv2.putText(canvas, f'{gap:.0f}cm', (mid - 15, fy - 25),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
+            else:
+                fx = c(f[0])
+                # Top candidates — orange
+                for pos, sw in entry['tc']:
+                    py = c(pos)
+                    if sw.is_horizontal:
+                        x1, x2 = c(sw.get_min_x()), c(sw.get_max_x())
+                    else:
+                        x1 = c(sw.get_centerline_x() - sw.thickness / 2)
+                        x2 = c(sw.get_centerline_x() + sw.thickness / 2)
+                    cv2.line(canvas, (x1, py), (x2, py), (0, 165, 255), 1)
+                    cv2.putText(canvas, 'T', (x2 + 2, py + 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 165, 255), 1)
+                # Bottom candidates — cyan
+                for pos, sw in entry['bc']:
+                    py = c(pos)
+                    if sw.is_horizontal:
+                        x1, x2 = c(sw.get_min_x()), c(sw.get_max_x())
+                    else:
+                        x1 = c(sw.get_centerline_x() - sw.thickness / 2)
+                        x2 = c(sw.get_centerline_x() + sw.thickness / 2)
+                    cv2.line(canvas, (x1, py), (x2, py), (255, 255, 0), 1)
+                    cv2.putText(canvas, 'B', (x2 + 2, py + 4),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
+                # Selected boundaries — green
+                sel = entry['sel']
+                if sel:
+                    cv2.line(canvas, (fx - 20, c(sel[0])), (fx + 20, c(sel[0])),
+                             (0, 255, 0), 2)
+                    cv2.line(canvas, (fx - 20, c(sel[1])), (fx + 20, c(sel[1])),
+                             (0, 255, 0), 2)
+                    gap = abs(sel[1] - sel[0])
+                    mid = c((sel[0] + sel[1]) / 2)
+                    cv2.putText(canvas, f'{gap:.0f}cm', (fx + 25, mid),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
+
+            # Final door wall — thick green
+            cv2.line(canvas, (c(f[0]), c(f[1])), (c(f[2]), c(f[3])),
+                     (0, 255, 0), 3)
+
+        return canvas
 
     def _process_wall_connections(
         self,
@@ -1564,7 +1767,11 @@ class SweetHome3DExporter:
                 ox = other.get_centerline_x()
                 if not (other.get_min_y() - half <= wy <= other.get_max_y() + half):
                     return None
-                return (abs(point.x - ox) - half, ox, True)
+                if point.x < ox:
+                    edge = ox - other.thickness / 2
+                else:
+                    edge = ox + other.thickness / 2
+                return (max(0, abs(point.x - edge)), edge, True)
         else:
             wx = point.x
             if not other.is_horizontal:
@@ -1586,7 +1793,11 @@ class SweetHome3DExporter:
                 oy = other.get_centerline_y()
                 if not (other.get_min_x() - half <= wx <= other.get_max_x() + half):
                     return None
-                return (abs(point.y - oy) - half, oy, True)
+                if point.y < oy:
+                    edge = oy - other.thickness / 2
+                else:
+                    edge = oy + other.thickness / 2
+                return (max(0, abs(point.y - edge)), edge, True)
         return None
 
     def _snap_endpoints_to_corners(

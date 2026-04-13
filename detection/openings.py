@@ -303,7 +303,6 @@ class OpeningDetectionPipeline:
                     for w in raw.windows
                 ]
 
-        all_openings.extend(yolo_doors)
         all_openings.extend(yolo_windows)
 
         # ── Step 2: Geometric gap detection ───────────────────────────
@@ -322,6 +321,19 @@ class OpeningDetectionPipeline:
             except Exception:
                 logger.warning("Geometric gap detection failed", exc_info=True)
 
+        # ── Step 2b: Resolve YOLO doors to gap bboxes ─────────────────
+        # YOLO door bboxes include the door leaf (swinging part), which
+        # offsets the centre from the actual wall gap.  When a geometric
+        # gap overlaps a YOLO door, adopt the gap's bbox for precise
+        # wall-gap positioning while keeping the DOOR type and confidence.
+        # Keep original gaps for arc detector (Step 4) before resolution
+        # removes claimed ones.
+        all_geo_gaps = list(geo_gaps)
+        if yolo_doors and geo_gaps:
+            yolo_doors, geo_gaps = _resolve_doors_to_gaps(
+                yolo_doors, geo_gaps, match_margin=25)
+
+        all_openings.extend(yolo_doors)
         all_openings.extend(geo_gaps)
 
         # ── Step 3: Algorithmic window detection ───────────────────────
@@ -350,8 +362,9 @@ class OpeningDetectionPipeline:
         if cfg.enable_door_arcs and self._arc_detector is not None:
             try:
                 # Convert raw gap detections back to gap.Opening format for arc detector
+                # Use all_geo_gaps (pre-resolution) so arcs near claimed gaps are found
                 from detection.gap import Opening as GapOpening
-                raw_gaps_for_arc = [_unified_to_raw_gap(g, i) for i, g in enumerate(geo_gaps)]
+                raw_gaps_for_arc = [_unified_to_raw_gap(g, i) for i, g in enumerate(all_geo_gaps)]
 
                 # Raw YOLO doors for arc detector
                 raw_yolo_doors = (
@@ -400,6 +413,74 @@ class OpeningDetectionPipeline:
 # ============================================================
 # INTERNAL HELPERS
 # ============================================================
+
+def _resolve_doors_to_gaps(
+    yolo_doors: List[Opening],
+    geo_gaps: List[Opening],
+    match_margin: int = 25,
+) -> Tuple[List[Opening], List[Opening]]:
+    """Replace YOLO door bboxes with matching gap bboxes for precise placement.
+
+    When a geometric gap's centre falls inside a YOLO door bbox (expanded by
+    *match_margin*), the YOLO door adopts the gap's bbox.  Each gap can be
+    claimed by at most one YOLO door (closest centre wins).
+
+    Returns (updated_yolo_doors, unclaimed_gaps).
+    """
+    import math
+
+    claimed_gap_indices: set = set()
+    updated_doors: List[Opening] = []
+
+    for door in yolo_doors:
+        db = door.bbox
+        # Expand the YOLO bbox by the margin for matching
+        ex1 = db.x1 - match_margin
+        ey1 = db.y1 - match_margin
+        ex2 = db.x2 + match_margin
+        ey2 = db.y2 + match_margin
+        dcx = db.center_x
+        dcy = db.center_y
+
+        candidates = []
+        for gi, gap in enumerate(geo_gaps):
+            if gi in claimed_gap_indices:
+                continue
+            gcx = gap.bbox.center_x
+            gcy = gap.bbox.center_y
+            if ex1 <= gcx <= ex2 and ey1 <= gcy <= ey2:
+                dist = math.hypot(gcx - dcx, gcy - dcy)
+                candidates.append((dist, gi, gap))
+
+        if candidates:
+            candidates.sort(key=lambda t: t[0])
+            _, best_gi, best_gap = candidates[0]
+            claimed_gap_indices.add(best_gi)
+            # Adopt the gap's bbox but keep the door's type and confidence
+            resolved = Opening(
+                bbox=best_gap.bbox,
+                opening_type=OpeningType.DOOR,
+                confidence=door.confidence,
+                source=door.source,
+                hinge_point=door.hinge_point,
+                swing_direction=door.swing_direction,
+                swing_clockwise=door.swing_clockwise,
+            )
+            updated_doors.append(resolved)
+            logger.debug(
+                "Resolved YOLO door to gap: (%.0f,%.0f)→(%.0f,%.0f)",
+                db.center_x, db.center_y,
+                best_gap.bbox.center_x, best_gap.bbox.center_y,
+            )
+        else:
+            # No matching gap — keep YOLO door as-is
+            updated_doors.append(door)
+
+    unclaimed_gaps = [
+        g for i, g in enumerate(geo_gaps) if i not in claimed_gap_indices
+    ]
+    return updated_doors, unclaimed_gaps
+
 
 def _segment_to_wall_rect(seg: WallSegment):
     """

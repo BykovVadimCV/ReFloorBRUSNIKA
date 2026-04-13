@@ -242,6 +242,196 @@ def debug_enclosed_regions(
 
 
 # ─────────────────────────────────────────────────────────────
+# Floor plan isolation (crop drawing area from scanned documents)
+# ─────────────────────────────────────────────────────────────
+
+def _erase_border_lines(
+    binary: np.ndarray,
+    border_fraction: float = 0.05,
+    min_line_ratio: float = 0.3,
+) -> np.ndarray:
+    """Detect and erase long straight lines near image edges.
+
+    Looks for horizontal/vertical lines within border_fraction of each edge.
+    Lines longer than min_line_ratio * dimension are considered frame borders
+    and erased (set to 0).
+    """
+    h, w = binary.shape
+    result = binary.copy()
+    bx = int(w * border_fraction)
+    by = int(h * border_fraction)
+    min_h_len = int(w * min_line_ratio)
+    min_v_len = int(h * min_line_ratio)
+
+    # Check four border strips
+    strips = [
+        (result[0:by, :], min_h_len, "h"),         # top
+        (result[h - by:, :], min_h_len, "h"),       # bottom
+        (result[:, 0:bx], min_v_len, "v"),           # left
+        (result[:, w - bx:], min_v_len, "v"),        # right
+    ]
+
+    for strip, min_len, direction in strips:
+        if strip.size == 0:
+            continue
+        lines = cv2.HoughLinesP(
+            strip, 1, np.pi / 180, threshold=50,
+            minLineLength=min_len, maxLineGap=10)
+        if lines is None:
+            continue
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(strip, (x1, y1), (x2, y2), 0, 3)
+
+    return result
+
+
+def _erase_title_block(
+    binary: np.ndarray,
+    quadrant_fraction: float = 0.40,
+    min_area_fraction: float = 0.03,
+    min_fill_ratio: float = 0.5,
+) -> np.ndarray:
+    """Detect and erase the title block (typically bottom-right, GOST standard).
+
+    Searches the bottom-right quadrant for large dense rectangular contours
+    and fills them with 0 (background).
+    """
+    h, w = binary.shape
+    result = binary.copy()
+
+    # Bottom-right region
+    qy = int(h * (1 - quadrant_fraction))
+    qx = int(w * (1 - quadrant_fraction))
+    roi = result[qy:, qx:]
+    rh, rw = roi.shape
+
+    quadrant_area = rh * rw
+    if quadrant_area == 0:
+        return result
+
+    contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < quadrant_area * min_area_fraction:
+            continue
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        rect_area = cw * ch
+        if rect_area == 0:
+            continue
+        fill = area / rect_area
+        if fill >= min_fill_ratio:
+            # Erase in the result (offset to full-image coords)
+            cv2.drawContours(result[qy:, qx:], [cnt], -1, 0, cv2.FILLED)
+
+    return result
+
+
+def _erase_stamps(
+    binary: np.ndarray,
+    min_circularity: float = 0.6,
+    min_area: int = 500,
+    max_area_fraction: float = 0.05,
+) -> np.ndarray:
+    """Detect and erase circular stamp/seal blobs."""
+    h, w = binary.shape
+    result = binary.copy()
+    max_area = int(h * w * max_area_fraction)
+
+    contours, _ = cv2.findContours(result, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area or area > max_area:
+            continue
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter == 0:
+            continue
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
+        if circularity >= min_circularity:
+            cv2.drawContours(result, [cnt], -1, 0, cv2.FILLED)
+
+    return result
+
+
+def isolate_floor_plan(
+    img_bgr: np.ndarray,
+    dpi: int = 150,
+    padding_fraction: float = 0.02,
+    min_plan_fraction: float = 0.15,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Isolate the floor plan drawing area from a scanned document.
+
+    Uses heavy morphological dilation to merge wall lines into one blob,
+    then finds the largest contour as the drawing region.
+
+    Returns (x, y, w, h) crop box in original image coordinates,
+    or None if the plan fills most of the image already.
+    """
+    h, w = img_bgr.shape[:2]
+
+    # 1. Binary threshold
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) if len(img_bgr.shape) == 3 else img_bgr.copy()
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # 2. Remove scan noise
+    binary = cv2.medianBlur(binary, 3)
+
+    # 3. Erase border lines, title block, stamps
+    binary = _erase_border_lines(binary)
+    binary = _erase_title_block(binary)
+    binary = _erase_stamps(binary)
+
+    # 4. Heavy dilation — merges wall lines into one blob
+    # Scale kernel to DPI (51×51 at 200 DPI)
+    dk = max(3, int(51 * dpi / 200) | 1)  # ensure odd
+    dilation_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (dk, dk))
+    dilated = cv2.dilate(binary, dilation_kernel, iterations=2)
+
+    # 5. Morphological closing — fill remaining internal gaps
+    ck = max(3, (dk * 2) | 1)  # ~2× dilation, ensure odd
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (ck, ck))
+    closed = cv2.morphologyEx(dilated, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+
+    # 6. Find largest contour = drawing region
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        _logger.info("isolate_floor_plan: no contours found, skipping crop")
+        return None
+
+    largest = max(contours, key=cv2.contourArea)
+    plan_area = cv2.contourArea(largest)
+    total_area = h * w
+
+    # If the plan already fills most of the image, don't crop
+    if plan_area / total_area > (1 - min_plan_fraction):
+        _logger.info("isolate_floor_plan: plan fills %.0f%% of image, skipping crop",
+                      plan_area * 100 / total_area)
+        return None
+
+    # If the plan is too small, something went wrong
+    if plan_area / total_area < min_plan_fraction:
+        _logger.warning("isolate_floor_plan: largest contour only %.0f%% of image, skipping",
+                         plan_area * 100 / total_area)
+        return None
+
+    # 7. Bounding rect + padding
+    rx, ry, rw, rh = cv2.boundingRect(largest)
+    pad_x = int(w * padding_fraction)
+    pad_y = int(h * padding_fraction)
+    x1 = max(0, rx - pad_x)
+    y1 = max(0, ry - pad_y)
+    x2 = min(w, rx + rw + pad_x)
+    y2 = min(h, ry + rh + pad_y)
+
+    _logger.info("isolate_floor_plan: crop (%d,%d)-(%d,%d) = %.0f%% of image",
+                  x1, y1, x2, y2, (x2 - x1) * (y2 - y1) * 100 / total_area)
+
+    return (x1, y1, x2 - x1, y2 - y1)
+
+
+# ─────────────────────────────────────────────────────────────
 # Unenclosed wall rectangle detection
 # ─────────────────────────────────────────────────────────────
 
