@@ -1381,22 +1381,36 @@ class SweetHome3DExporter:
             best_pair = None  # (edge_a, edge_b, sw_a, sw_b)
 
             if ow.is_horizontal:
-                # Search the LEFT narrow side: wall inner edge to the left of door_bb[0]
-                # within PROXIMITY_CM, with overlapping Y range.
+                door_cx = (door_bb[0] + door_bb[2]) / 2
+                left_seen: set = set()
+                right_seen: set = set()
                 left_candidates: List[Tuple[Wall, Tuple, float]] = []
                 right_candidates: List[Tuple[Wall, Tuple, float]] = []
                 for sw, swbb in sw_bboxes:
-                    # Y ranges must overlap
-                    if swbb[3] <= door_bb[1] or swbb[1] >= door_bb[3]:
-                        continue
-                    le = _inner_edge_h(sw, 'L')   # right-facing edge of this wall
-                    dist_l = door_bb[0] - le       # > 0 if wall is to the left
-                    if 0 <= dist_l <= PROXIMITY_CM:
-                        left_candidates.append((sw, swbb, dist_l))
-                    re = _inner_edge_h(sw, 'R')    # left-facing edge of this wall
-                    dist_r = re - door_bb[2]       # > 0 if wall is to the right
-                    if 0 <= dist_r <= PROXIMITY_CM:
-                        right_candidates.append((sw, swbb, dist_r))
+                    y_overlap = swbb[3] > door_bb[1] and swbb[1] < door_bb[3]
+                    overlaps_ext = _overlap(ext_bb, swbb)
+                    sw_cx = (swbb[0] + swbb[2]) / 2
+
+                    le = _inner_edge_h(sw, 'L')   # right-facing inner edge
+                    re = _inner_edge_h(sw, 'R')   # left-facing inner edge
+
+                    # LEFT candidate: passes overlap test OR proximity test
+                    if sw.wall_id not in left_seen:
+                        prox_l = y_overlap and 0 <= door_bb[0] - le <= PROXIMITY_CM
+                        ovlp_l = overlaps_ext and sw_cx < door_cx
+                        if prox_l or ovlp_l:
+                            dist_l = max(0.0, door_bb[0] - le)
+                            left_candidates.append((sw, swbb, dist_l))
+                            left_seen.add(sw.wall_id)
+
+                    # RIGHT candidate: passes overlap test OR proximity test
+                    if sw.wall_id not in right_seen:
+                        prox_r = y_overlap and 0 <= re - door_bb[2] <= PROXIMITY_CM
+                        ovlp_r = overlaps_ext and sw_cx >= door_cx
+                        if prox_r or ovlp_r:
+                            dist_r = max(0.0, re - door_bb[2])
+                            right_candidates.append((sw, swbb, dist_r))
+                            right_seen.add(sw.wall_id)
 
                 # Keep closest wall on each side
                 left_candidates.sort(key=lambda t: t[2])
@@ -1437,20 +1451,36 @@ class SweetHome3DExporter:
                 })
             else:
                 # Vertical door — search TOP and BOTTOM narrow sides
+                door_cy = (door_bb[1] + door_bb[3]) / 2
+                top_seen: set = set()
+                bot_seen: set = set()
                 top_candidates: List[Tuple[Wall, Tuple, float]] = []
                 bot_candidates: List[Tuple[Wall, Tuple, float]] = []
                 for sw, swbb in sw_bboxes:
-                    # X ranges must overlap
-                    if swbb[2] <= door_bb[0] or swbb[0] >= door_bb[2]:
-                        continue
-                    te = _inner_edge_v(sw, 'T')    # bottom-facing edge
-                    dist_t = door_bb[1] - te       # > 0 if wall is above
-                    if 0 <= dist_t <= PROXIMITY_CM:
-                        top_candidates.append((sw, swbb, dist_t))
-                    be = _inner_edge_v(sw, 'B')    # top-facing edge
-                    dist_b = be - door_bb[3]       # > 0 if wall is below
-                    if 0 <= dist_b <= PROXIMITY_CM:
-                        bot_candidates.append((sw, swbb, dist_b))
+                    x_overlap = swbb[2] > door_bb[0] and swbb[0] < door_bb[2]
+                    overlaps_ext = _overlap(ext_bb, swbb)
+                    sw_cy = (swbb[1] + swbb[3]) / 2
+
+                    te = _inner_edge_v(sw, 'T')    # bottom-facing inner edge
+                    be = _inner_edge_v(sw, 'B')    # top-facing inner edge
+
+                    # TOP candidate
+                    if sw.wall_id not in top_seen:
+                        prox_t = x_overlap and 0 <= door_bb[1] - te <= PROXIMITY_CM
+                        ovlp_t = overlaps_ext and sw_cy < door_cy
+                        if prox_t or ovlp_t:
+                            dist_t = max(0.0, door_bb[1] - te)
+                            top_candidates.append((sw, swbb, dist_t))
+                            top_seen.add(sw.wall_id)
+
+                    # BOTTOM candidate
+                    if sw.wall_id not in bot_seen:
+                        prox_b = x_overlap and 0 <= be - door_bb[3] <= PROXIMITY_CM
+                        ovlp_b = overlaps_ext and sw_cy >= door_cy
+                        if prox_b or ovlp_b:
+                            dist_b = max(0.0, be - door_bb[3])
+                            bot_candidates.append((sw, swbb, dist_b))
+                            bot_seen.add(sw.wall_id)
 
                 top_candidates.sort(key=lambda t: t[2])
                 bot_candidates.sort(key=lambda t: t[2])
