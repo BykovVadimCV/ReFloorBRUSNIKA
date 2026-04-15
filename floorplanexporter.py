@@ -294,10 +294,12 @@ SNAP_TOLERANCE: float = 40.0
 AXIS_SNAP_TOLERANCE: float = 15.0
 T_JUNCTION_SNAP_TOLERANCE: float = 30.0
 PARENT_WALL_SEARCH_TOLERANCE: float = 50.0
-CENTERLINE_SEARCH_RADIUS: float = 150.0
 OPENING_AXIS_SNAP_TOLERANCE: float = 30.0
 OPENING_EXTENSION_TOLERANCE: float = 30.0
-WALL_FACING_TOLERANCE: float = 40.0
+DOOR_BBOX_EXTEND_RATIO: float = 0.05
+MIN_GAP_CM: float = 5.0
+GAP_DARK_THRESHOLD: int = 100
+GAP_DARK_RATIO_LIMIT: float = 0.30
 
 # --- REMOVED: these constants are no longer used ---
 # DEFAULT_DOOR_WIDTH / DEFAULT_WINDOW_WIDTH — opening width now comes
@@ -1237,15 +1239,10 @@ class SweetHome3DExporter:
             fused_doors=fused_doors,
         )
 
-        all_walls = structural_walls + opening_walls
-        self._move_opening_walls_to_structural_centerlines(
-            opening_walls, structural_walls
+        self._snap_doors_to_wall_gaps(
+            opening_walls, openings, structural_walls, original_image
         )
-        if original_image is not None:
-            self._validate_opening_walls_with_image(
-                opening_walls, openings, original_image,
-            )
-            all_walls = structural_walls + opening_walls
+        all_walls = structural_walls + opening_walls
         if original_image is not None and debug_image_path is not None:
             door_dbg = self._draw_door_placement_debug(
                 original_image, structural_walls,
@@ -1285,287 +1282,199 @@ class SweetHome3DExporter:
             cv2.imwrite(debug_image_path, debug_img)
         return rooms
 
-    # ----- pixel-based door validation -----
-    def _validate_opening_walls_with_image(
+    # ----- bbox-overlap gap bridging for door placement -----
+    def _snap_doors_to_wall_gaps(
         self,
         opening_walls: List[Wall],
         openings: List[Opening],
-        image: 'np.ndarray',
-    ) -> None:
-        """Check both ends of each door for wall pixels. Shift laterally
-        if needed; remove the door entirely if no walls are found."""
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
-        img_h, img_w = gray.shape[:2]
-        s = self.pixels_to_cm
-        DARK = 100          # grayscale threshold
-        PROBE = 5           # pixels beyond endpoint to sample
-        R = 3               # probe patch half-size
-        MAX_SHIFT = 30      # max lateral shift in pixels
-
-        def _dark(px_x: int, px_y: int) -> bool:
-            y1, y2 = max(0, px_y - R), min(img_h, px_y + R + 1)
-            x1, x2 = max(0, px_x - R), min(img_w, px_x + R + 1)
-            if x1 >= x2 or y1 >= y2:
-                return False
-            return bool(np.any(gray[y1:y2, x1:x2] < DARK))
-
-        to_remove: set = set()
-
-        for ow in opening_walls:
-            if ow.is_horizontal:
-                lx = int(min(ow.start.x, ow.end.x) / s) - PROBE
-                rx = int(max(ow.start.x, ow.end.x) / s) + PROBE
-                cy = int(ow.get_centerline_y() / s)
-
-                if _dark(lx, cy) and _dark(rx, cy):
-                    continue
-
-                found = False
-                for d in range(1, MAX_SHIFT + 1):
-                    for try_y in (cy - d, cy + d):
-                        if 0 <= try_y < img_h and _dark(lx, try_y) and _dark(rx, try_y):
-                            ow.start.y = ow.end.y = try_y * s
-                            found = True
-                            break
-                    if found:
-                        break
-                if not found:
-                    to_remove.add(ow.wall_id)
-            else:
-                ty = int(min(ow.start.y, ow.end.y) / s) - PROBE
-                by = int(max(ow.start.y, ow.end.y) / s) + PROBE
-                cx = int(ow.get_centerline_x() / s)
-
-                if _dark(cx, ty) and _dark(cx, by):
-                    continue
-
-                found = False
-                for d in range(1, MAX_SHIFT + 1):
-                    for try_x in (cx - d, cx + d):
-                        if 0 <= try_x < img_w and _dark(try_x, ty) and _dark(try_x, by):
-                            ow.start.x = ow.end.x = try_x * s
-                            found = True
-                            break
-                    if found:
-                        break
-                if not found:
-                    to_remove.add(ow.wall_id)
-
-        if to_remove:
-            opening_walls[:] = [w for w in opening_walls if w.wall_id not in to_remove]
-            openings[:] = [o for o in openings if o.parent_wall_id not in to_remove]
-
-    # ----- opening-wall → structural-centerline snapping (unchanged) -----
-    def _move_opening_walls_to_structural_centerlines(
-        self,
-        opening_walls: List[Wall],
         structural_walls: List[Wall],
+        image: Optional[np.ndarray],
     ) -> None:
-        horiz_s = [w for w in structural_walls if w.is_horizontal]
-        vert_s = [w for w in structural_walls if not w.is_horizontal]
-        search_r = CENTERLINE_SEARCH_RADIUS
+        """Place each opening wall in the gap between two structural walls.
+
+        Algorithm per door:
+        1. Compute door bbox (including thickness), extend by 5%.
+        2. Find structural walls whose bbox overlaps the extended door bbox.
+        3. Classify overlapping walls by side (L/R for horizontal, T/B for vertical).
+        4. For each opposite pair compute the gap between inner edges.
+        5. Validate gap with a colour check (gap area should be empty space).
+        6. Pick the smallest valid gap and set opening wall endpoints to bridge it.
+        7. Remove doors with no valid wall pair.
+        """
+        gray: Optional[np.ndarray] = None
+        if image is not None:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+
+        s = self.pixels_to_cm  # cm per pixel
+
+        def _wall_bbox(w: Wall) -> Tuple[float, float, float, float]:
+            if w.is_horizontal:
+                return (w.get_min_x(),
+                        w.get_centerline_y() - w.thickness / 2,
+                        w.get_max_x(),
+                        w.get_centerline_y() + w.thickness / 2)
+            else:
+                return (w.get_centerline_x() - w.thickness / 2,
+                        w.get_min_y(),
+                        w.get_centerline_x() + w.thickness / 2,
+                        w.get_max_y())
+
+        def _overlap(a: Tuple[float, float, float, float],
+                     b: Tuple[float, float, float, float]) -> bool:
+            return a[0] < b[2] and a[2] > b[0] and a[1] < b[3] and a[3] > b[1]
+
+        def _gap_is_clear(x1_cm: float, y1_cm: float,
+                          x2_cm: float, y2_cm: float) -> bool:
+            """Sample pixels along the line from (x1,y1) to (x2,y2) in cm.
+            Return True if fewer than GAP_DARK_RATIO_LIMIT of samples are dark."""
+            if gray is None:
+                return True
+            img_h, img_w = gray.shape[:2]
+            n_samples = max(int(max(abs(x2_cm - x1_cm), abs(y2_cm - y1_cm)) / s), 5)
+            dark = 0
+            for i in range(n_samples + 1):
+                t = i / max(n_samples, 1)
+                px = int((x1_cm + (x2_cm - x1_cm) * t) / s)
+                py = int((y1_cm + (y2_cm - y1_cm) * t) / s)
+                if 0 <= px < img_w and 0 <= py < img_h:
+                    if gray[py, px] < GAP_DARK_THRESHOLD:
+                        dark += 1
+            return dark / max(n_samples + 1, 1) < GAP_DARK_RATIO_LIMIT
+
+        def _inner_edge_h(sw: Wall, side: str) -> float:
+            """Inner edge X for a wall on the LEFT or RIGHT of a horizontal door."""
+            if side == 'L':
+                return (sw.get_centerline_x() + sw.thickness / 2) if not sw.is_horizontal else sw.get_max_x()
+            else:
+                return (sw.get_centerline_x() - sw.thickness / 2) if not sw.is_horizontal else sw.get_min_x()
+
+        def _inner_edge_v(sw: Wall, side: str) -> float:
+            """Inner edge Y for a wall on the TOP or BOTTOM of a vertical door."""
+            if side == 'T':
+                return (sw.get_centerline_y() + sw.thickness / 2) if sw.is_horizontal else sw.get_max_y()
+            else:
+                return (sw.get_centerline_y() - sw.thickness / 2) if sw.is_horizontal else sw.get_min_y()
+
+        sw_bboxes = [(sw, _wall_bbox(sw)) for sw in structural_walls]
         self._door_placement_debug: List[dict] = []
+        to_remove: set = set()
 
         for ow in opening_walls:
             if ow.length < 0.1:
                 continue
             _orig = (ow.start.x, ow.start.y, ow.end.x, ow.end.y)
+
+            # 1. Door bbox including thickness
+            door_bb = _wall_bbox(ow)
+            dw = door_bb[2] - door_bb[0]
+            dh = door_bb[3] - door_bb[1]
+            dx = dw * DOOR_BBOX_EXTEND_RATIO
+            dy = dh * DOOR_BBOX_EXTEND_RATIO
+            ext_bb = (door_bb[0] - dx, door_bb[1] - dy,
+                      door_bb[2] + dx, door_bb[3] + dy)
+
+            # 2. Find overlapping structural walls
+            overlaps: List[Tuple[Wall, Tuple[float, float, float, float]]] = []
+            for sw, swbb in sw_bboxes:
+                if _overlap(ext_bb, swbb):
+                    overlaps.append((sw, swbb))
+
+            door_cx = (door_bb[0] + door_bb[2]) / 2
+            door_cy = (door_bb[1] + door_bb[3]) / 2
+
+            best_gap = float('inf')
+            best_pair = None  # (edge_a, edge_b, sw_a, sw_b)
+
             if ow.is_horizontal:
-                ow_y = ow.get_centerline_y()
-                ow_cx = (ow.get_min_x() + ow.get_max_x()) / 2
-                best_y, best_yd = None, search_r
-                for sw in horiz_s:
-                    d = abs(sw.get_centerline_y() - ow_y)
-                    if (
-                        d < best_yd
-                        and not (
-                            ow.get_max_x() < sw.get_min_x() - 20
-                            or ow.get_min_x() > sw.get_max_x() + 20
-                        )
-                    ):
-                        best_y, best_yd = sw.get_centerline_y(), d
-                if best_y is not None:
-                    ow.start.y = ow.end.y = best_y
-                best_gap, best_lx, best_rx = float('inf'), None, None
-                left_c = [
-                    (sw.get_centerline_x() + sw.thickness / 2, sw) for sw in vert_s
-                    if (
-                        sw.get_min_y() - WALL_FACING_TOLERANCE <= ow_y <= sw.get_max_y() + WALL_FACING_TOLERANCE
-                        and sw.get_centerline_x() < ow_cx
-                        and abs(sw.get_centerline_x() - ow_cx) <= search_r
-                    )
-                ]
-                left_c.extend([
-                    (sw.get_max_x(), sw) for sw in horiz_s
-                    if (
-                        abs(sw.get_centerline_y() - ow_y) <= WALL_FACING_TOLERANCE
-                        and sw.get_max_x() < ow_cx
-                        and abs(sw.get_max_x() - ow_cx) <= search_r
-                    )
-                ])
-                right_c = [
-                    (sw.get_centerline_x() - sw.thickness / 2, sw) for sw in vert_s
-                    if (
-                        sw.get_min_y() - WALL_FACING_TOLERANCE <= ow_y <= sw.get_max_y() + WALL_FACING_TOLERANCE
-                        and sw.get_centerline_x() >= ow_cx
-                        and abs(sw.get_centerline_x() - ow_cx) <= search_r
-                    )
-                ]
-                right_c.extend([
-                    (sw.get_min_x(), sw) for sw in horiz_s
-                    if (
-                        abs(sw.get_centerline_y() - ow_y) <= WALL_FACING_TOLERANCE
-                        and sw.get_min_x() >= ow_cx
-                        and abs(sw.get_min_x() - ow_cx) <= search_r
-                    )
-                ])
-                for lx, lw in left_c:
-                    for rx, rw in right_c:
-                        if not (lw.get_min_y() - WALL_FACING_TOLERANCE <= ow_y <= lw.get_max_y() + WALL_FACING_TOLERANCE):
+                # 3. Classify L/R
+                left_walls = [(sw, swbb) for sw, swbb in overlaps
+                              if (swbb[0] + swbb[2]) / 2 < door_cx]
+                right_walls = [(sw, swbb) for sw, swbb in overlaps
+                               if (swbb[0] + swbb[2]) / 2 >= door_cx]
+
+                # 4. Find best pair
+                for lsw, _ in left_walls:
+                    le = _inner_edge_h(lsw, 'L')
+                    for rsw, _ in right_walls:
+                        re = _inner_edge_h(rsw, 'R')
+                        gap = re - le
+                        if gap <= MIN_GAP_CM or gap >= best_gap:
                             continue
-                        if not (rw.get_min_y() - WALL_FACING_TOLERANCE <= ow_y <= rw.get_max_y() + WALL_FACING_TOLERANCE):
-                            continue
-                        if lw.is_horizontal and rw.is_horizontal:
-                            y_ovl = min(
-                                lw.get_centerline_y() + lw.thickness / 2,
-                                rw.get_centerline_y() + rw.thickness / 2,
-                            ) - max(
-                                lw.get_centerline_y() - lw.thickness / 2,
-                                rw.get_centerline_y() - rw.thickness / 2,
-                            )
-                            if y_ovl < -5.0:
-                                continue
-                        gap = rx - lx
-                        if gap <= 5.0 or gap >= best_gap:
-                            continue
-                        occupied = any(
-                            oow.wall_id != ow.wall_id
-                            and oow.is_horizontal
-                            and abs(oow.get_centerline_y() - ow_y) < 20.0
-                            and oow.get_min_x() < rx
-                            and oow.get_max_x() > lx
-                            for oow in opening_walls
-                        ) or any(
-                            abs(sw.get_centerline_y() - ow.get_centerline_y()) < 20.0
-                            and sw.get_min_x() <= lx + 5
-                            and sw.get_max_x() >= rx - 5
-                            for sw in horiz_s
-                        )
-                        if not occupied:
-                            best_gap, best_lx, best_rx = gap, lx, rx
-                if best_lx is not None:
-                    ow.start.x, ow.end.x = best_lx, best_rx
-                elif best_y is not None:
-                    ow.start.y = ow.end.y = (_orig[1] + _orig[3]) / 2
+                        # 5. Colour check along the gap center line
+                        cy = ow.get_centerline_y()
+                        if _gap_is_clear(le, cy, re, cy):
+                            best_gap = gap
+                            best_pair = (le, re, lsw, rsw)
+
+                if best_pair is not None:
+                    ow.start.x, ow.end.x = best_pair[0], best_pair[1]
+                    for o in openings:
+                        if o.parent_wall_id == ow.wall_id:
+                            o.width = best_gap
+                else:
+                    to_remove.add(ow.wall_id)
+
                 self._door_placement_debug.append({
-                    'h': True, 'orig': _orig,
-                    'lc': list(left_c), 'rc': list(right_c),
-                    'sel': (best_lx, best_rx) if best_lx is not None else None,
+                    'h': True,
+                    'orig_bbox': door_bb,
+                    'ext_bbox': ext_bb,
+                    'overlaps': [('L', sw, swbb) for sw, swbb in left_walls]
+                              + [('R', sw, swbb) for sw, swbb in right_walls],
+                    'selected': best_pair,
                     'final': (ow.start.x, ow.start.y, ow.end.x, ow.end.y),
+                    'removed': best_pair is None,
                 })
             else:
-                ow_x = ow.get_centerline_x()
-                ow_cy = (ow.get_min_y() + ow.get_max_y()) / 2
-                best_x, best_xd = None, search_r
-                for sw in vert_s:
-                    d = abs(sw.get_centerline_x() - ow_x)
-                    if (
-                        d < best_xd
-                        and not (
-                            ow.get_max_y() < sw.get_min_y() - 20
-                            or ow.get_min_y() > sw.get_max_y() + 20
-                        )
-                    ):
-                        best_x, best_xd = sw.get_centerline_x(), d
-                if best_x is not None:
-                    ow.start.x = ow.end.x = best_x
-                best_gap, best_ty, best_by = float('inf'), None, None
-                top_c = [
-                    (sw.get_centerline_y() + sw.thickness / 2, sw) for sw in horiz_s
-                    if (
-                        sw.get_min_x() - WALL_FACING_TOLERANCE <= ow_x <= sw.get_max_x() + WALL_FACING_TOLERANCE
-                        and sw.get_centerline_y() < ow_cy
-                        and abs(sw.get_centerline_y() - ow_cy) <= search_r
-                    )
-                ]
-                top_c.extend([
-                    (sw.get_max_y(), sw) for sw in vert_s
-                    if (
-                        abs(sw.get_centerline_x() - ow_x) <= WALL_FACING_TOLERANCE
-                        and sw.get_max_y() < ow_cy
-                        and abs(sw.get_max_y() - ow_cy) <= search_r
-                    )
-                ])
-                bot_c = [
-                    (sw.get_centerline_y() - sw.thickness / 2, sw) for sw in horiz_s
-                    if (
-                        sw.get_min_x() - WALL_FACING_TOLERANCE <= ow_x <= sw.get_max_x() + WALL_FACING_TOLERANCE
-                        and sw.get_centerline_y() >= ow_cy
-                        and abs(sw.get_centerline_y() - ow_cy) <= search_r
-                    )
-                ]
-                bot_c.extend([
-                    (sw.get_min_y(), sw) for sw in vert_s
-                    if (
-                        abs(sw.get_centerline_x() - ow_x) <= WALL_FACING_TOLERANCE
-                        and sw.get_min_y() >= ow_cy
-                        and abs(sw.get_min_y() - ow_cy) <= search_r
-                    )
-                ])
-                for ty, tw in top_c:
-                    for by_, bw in bot_c:
-                        if not (tw.get_min_x() - WALL_FACING_TOLERANCE <= ow_x <= tw.get_max_x() + WALL_FACING_TOLERANCE):
+                # Vertical door — classify T/B
+                top_walls = [(sw, swbb) for sw, swbb in overlaps
+                             if (swbb[1] + swbb[3]) / 2 < door_cy]
+                bot_walls = [(sw, swbb) for sw, swbb in overlaps
+                             if (swbb[1] + swbb[3]) / 2 >= door_cy]
+
+                for tsw, _ in top_walls:
+                    te = _inner_edge_v(tsw, 'T')
+                    for bsw, _ in bot_walls:
+                        be = _inner_edge_v(bsw, 'B')
+                        gap = be - te
+                        if gap <= MIN_GAP_CM or gap >= best_gap:
                             continue
-                        if not (bw.get_min_x() - WALL_FACING_TOLERANCE <= ow_x <= bw.get_max_x() + WALL_FACING_TOLERANCE):
-                            continue
-                        if not tw.is_horizontal and not bw.is_horizontal:
-                            x_ovl = min(
-                                tw.get_centerline_x() + tw.thickness / 2,
-                                bw.get_centerline_x() + bw.thickness / 2,
-                            ) - max(
-                                tw.get_centerline_x() - tw.thickness / 2,
-                                bw.get_centerline_x() - bw.thickness / 2,
-                            )
-                            if x_ovl < -5.0:
-                                continue
-                        gap = by_ - ty
-                        if gap <= 5.0 or gap >= best_gap:
-                            continue
-                        occupied = any(
-                            oow.wall_id != ow.wall_id
-                            and not oow.is_horizontal
-                            and abs(oow.get_centerline_x() - ow_x) < 20.0
-                            and oow.get_min_y() < by_
-                            and oow.get_max_y() > ty
-                            for oow in opening_walls
-                        ) or any(
-                            abs(sw.get_centerline_x() - ow.get_centerline_x()) < 20.0
-                            and sw.get_min_y() <= ty + 5
-                            and sw.get_max_y() >= by_ - 5
-                            for sw in vert_s
-                        )
-                        if not occupied:
-                            best_gap, best_ty, best_by = gap, ty, by_
-                if best_ty is not None:
+                        cx = ow.get_centerline_x()
+                        if _gap_is_clear(cx, te, cx, be):
+                            best_gap = gap
+                            best_pair = (te, be, tsw, bsw)
+
+                if best_pair is not None:
                     if ow.start.y < ow.end.y:
-                        ow.start.y, ow.end.y = best_ty, best_by
+                        ow.start.y, ow.end.y = best_pair[0], best_pair[1]
                     else:
-                        ow.start.y, ow.end.y = best_by, best_ty
-                elif best_x is not None:
-                    ow.start.x = ow.end.x = (_orig[0] + _orig[2]) / 2
+                        ow.start.y, ow.end.y = best_pair[1], best_pair[0]
+                    for o in openings:
+                        if o.parent_wall_id == ow.wall_id:
+                            o.width = best_gap
+                else:
+                    to_remove.add(ow.wall_id)
+
                 self._door_placement_debug.append({
-                    'h': False, 'orig': _orig,
-                    'tc': list(top_c), 'bc': list(bot_c),
-                    'sel': (best_ty, best_by) if best_ty is not None else None,
+                    'h': False,
+                    'orig_bbox': door_bb,
+                    'ext_bbox': ext_bb,
+                    'overlaps': [('T', sw, swbb) for sw, swbb in top_walls]
+                              + [('B', sw, swbb) for sw, swbb in bot_walls],
+                    'selected': best_pair,
                     'final': (ow.start.x, ow.start.y, ow.end.x, ow.end.y),
+                    'removed': best_pair is None,
                 })
+
+        if to_remove:
+            opening_walls[:] = [w for w in opening_walls if w.wall_id not in to_remove]
+            openings[:] = [o for o in openings if o.parent_wall_id not in to_remove]
 
     def _draw_door_placement_debug(
         self,
         original_image: 'np.ndarray',
         structural_walls: List[Wall],
     ) -> 'np.ndarray':
-        """Draw debug overlay showing door placement decisions."""
+        """Draw debug overlay showing bbox-overlap door placement decisions."""
         canvas = original_image.copy()
         s = self.pixels_to_cm
 
@@ -1584,87 +1493,73 @@ class SweetHome3DExporter:
 
         for entry in self._door_placement_debug:
             is_h = entry['h']
-            o = entry['orig']
             f = entry['final']
+            removed = entry.get('removed', False)
 
-            # Original position — thin red
-            cv2.line(canvas, (c(o[0]), c(o[1])), (c(o[2]), c(o[3])),
-                     (0, 0, 255), 1)
+            # Original door bbox — thin red rectangle
+            obb = entry['orig_bbox']
+            cv2.rectangle(canvas, (c(obb[0]), c(obb[1])), (c(obb[2]), c(obb[3])),
+                          (0, 0, 255), 1)
 
-            if is_h:
-                fy = c(f[1])
-                # Left candidates — orange edge lines
-                for pos, sw in entry['lc']:
-                    px = c(pos)
-                    if not sw.is_horizontal:
-                        y1, y2 = c(sw.get_min_y()), c(sw.get_max_y())
-                    else:
-                        y1 = c(sw.get_centerline_y() - sw.thickness / 2)
-                        y2 = c(sw.get_centerline_y() + sw.thickness / 2)
-                    cv2.line(canvas, (px, y1), (px, y2), (0, 165, 255), 1)
-                    cv2.putText(canvas, 'L', (px - 8, y1 - 4),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 165, 255), 1)
-                # Right candidates — cyan edge lines
-                for pos, sw in entry['rc']:
-                    px = c(pos)
-                    if not sw.is_horizontal:
-                        y1, y2 = c(sw.get_min_y()), c(sw.get_max_y())
-                    else:
-                        y1 = c(sw.get_centerline_y() - sw.thickness / 2)
-                        y2 = c(sw.get_centerline_y() + sw.thickness / 2)
-                    cv2.line(canvas, (px, y1), (px, y2), (255, 255, 0), 1)
-                    cv2.putText(canvas, 'R', (px + 2, y1 - 4),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
-                # Selected boundaries — green
-                sel = entry['sel']
-                if sel:
+            # Extended bbox — dashed red rectangle (drawn as dotted lines)
+            ebb = entry['ext_bbox']
+            ep1, ep2 = (c(ebb[0]), c(ebb[1])), (c(ebb[2]), c(ebb[3]))
+            for i in range(0, abs(ep2[0] - ep1[0]), 6):
+                cv2.line(canvas, (ep1[0] + i, ep1[1]), (min(ep1[0] + i + 3, ep2[0]), ep1[1]), (0, 0, 200), 1)
+                cv2.line(canvas, (ep1[0] + i, ep2[1]), (min(ep1[0] + i + 3, ep2[0]), ep2[1]), (0, 0, 200), 1)
+            for i in range(0, abs(ep2[1] - ep1[1]), 6):
+                cv2.line(canvas, (ep1[0], ep1[1] + i), (ep1[0], min(ep1[1] + i + 3, ep2[1])), (0, 0, 200), 1)
+                cv2.line(canvas, (ep2[0], ep1[1] + i), (ep2[0], min(ep1[1] + i + 3, ep2[1])), (0, 0, 200), 1)
+
+            # Overlapping wall bboxes — orange with side labels
+            for side, sw, swbb in entry['overlaps']:
+                sp1 = (c(swbb[0]), c(swbb[1]))
+                sp2 = (c(swbb[2]), c(swbb[3]))
+                cv2.rectangle(canvas, sp1, sp2, (0, 165, 255), 2)
+                lx = sp1[0] if side in ('L', 'T') else sp2[0] - 10
+                ly = sp1[1] - 4
+                cv2.putText(canvas, side, (lx, ly),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 165, 255), 1)
+
+            # Selected pair inner edges + gap — green
+            sel = entry.get('selected')
+            if sel is not None:
+                if is_h:
+                    fy = c(f[1])
                     cv2.line(canvas, (c(sel[0]), fy - 20), (c(sel[0]), fy + 20),
                              (0, 255, 0), 2)
                     cv2.line(canvas, (c(sel[1]), fy - 20), (c(sel[1]), fy + 20),
                              (0, 255, 0), 2)
+                    # Gap line — yellow
+                    cv2.line(canvas, (c(sel[0]), fy), (c(sel[1]), fy),
+                             (0, 255, 255), 1)
                     gap = abs(sel[1] - sel[0])
                     mid = c((sel[0] + sel[1]) / 2)
                     cv2.putText(canvas, f'{gap:.0f}cm', (mid - 15, fy - 25),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
-            else:
-                fx = c(f[0])
-                # Top candidates — orange
-                for pos, sw in entry['tc']:
-                    py = c(pos)
-                    if sw.is_horizontal:
-                        x1, x2 = c(sw.get_min_x()), c(sw.get_max_x())
-                    else:
-                        x1 = c(sw.get_centerline_x() - sw.thickness / 2)
-                        x2 = c(sw.get_centerline_x() + sw.thickness / 2)
-                    cv2.line(canvas, (x1, py), (x2, py), (0, 165, 255), 1)
-                    cv2.putText(canvas, 'T', (x2 + 2, py + 4),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 165, 255), 1)
-                # Bottom candidates — cyan
-                for pos, sw in entry['bc']:
-                    py = c(pos)
-                    if sw.is_horizontal:
-                        x1, x2 = c(sw.get_min_x()), c(sw.get_max_x())
-                    else:
-                        x1 = c(sw.get_centerline_x() - sw.thickness / 2)
-                        x2 = c(sw.get_centerline_x() + sw.thickness / 2)
-                    cv2.line(canvas, (x1, py), (x2, py), (255, 255, 0), 1)
-                    cv2.putText(canvas, 'B', (x2 + 2, py + 4),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.3, (255, 255, 0), 1)
-                # Selected boundaries — green
-                sel = entry['sel']
-                if sel:
+                else:
+                    fx = c(f[0])
                     cv2.line(canvas, (fx - 20, c(sel[0])), (fx + 20, c(sel[0])),
                              (0, 255, 0), 2)
                     cv2.line(canvas, (fx - 20, c(sel[1])), (fx + 20, c(sel[1])),
                              (0, 255, 0), 2)
+                    cv2.line(canvas, (fx, c(sel[0])), (fx, c(sel[1])),
+                             (0, 255, 255), 1)
                     gap = abs(sel[1] - sel[0])
                     mid = c((sel[0] + sel[1]) / 2)
                     cv2.putText(canvas, f'{gap:.0f}cm', (fx + 25, mid),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 0), 1)
 
-            # Final door wall — thick green
-            cv2.line(canvas, (c(f[0]), c(f[1])), (c(f[2]), c(f[3])),
-                     (0, 255, 0), 3)
+            if removed:
+                # Red X through original bbox
+                cv2.line(canvas, (c(obb[0]), c(obb[1])), (c(obb[2]), c(obb[3])),
+                         (0, 0, 255), 2)
+                cv2.line(canvas, (c(obb[2]), c(obb[1])), (c(obb[0]), c(obb[3])),
+                         (0, 0, 255), 2)
+            else:
+                # Final door wall — thick green
+                cv2.line(canvas, (c(f[0]), c(f[1])), (c(f[2]), c(f[3])),
+                         (0, 255, 0), 3)
 
         return canvas
 
