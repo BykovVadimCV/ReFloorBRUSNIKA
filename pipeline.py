@@ -1281,51 +1281,72 @@ class FloorplanPipeline:
             result.wall_mask = detection.wall_mask
             result.outline_mask = detection.outline_mask
 
-        # ── Stage 2: Opening Detection ──────────────────────────────────
+        # ── Stage 2: Opening Detection (UNIFIED: gap + U-Net with deduplication) ─────
         _notify("detecting openings")
-        logger.info("[%s] Stage 2: Opening detection", base_name)
+        logger.info("[%s] Stage 2: Opening detection (gap priority + U-Net supplement)", base_name)
 
         ocr_bboxes = self._get_ocr_bboxes(img)
 
-        _use_unet_openings = (
-            (unet_detection is not None or has_unet_openings)
-            and (unet_door_bboxes or unet_window_bboxes)
+        # ALWAYS run traditional gap/algorithmic + YOLO detection (gap doors take priority)
+        yolo_results = None
+        if self._yolo is not None:
+            try:
+                yolo_results = self._yolo.detect(img)
+                result.raw_yolo_results = yolo_results
+            except Exception as e:
+                logger.warning("YOLO detection failed: %s", e)
+
+        pixel_scale = self.config.pixels_to_m
+
+        openings, door_arcs = self._run_opening_detection(
+            img=img,
+            walls=result.walls,
+            wall_mask=result.wall_mask,
+            outline_mask=result.outline_mask,
+            wall_rectangles=raw_rectangles,
+            yolo_results=yolo_results,
+            ocr_bboxes=ocr_bboxes,
+            pixel_scale=pixel_scale,
+            base_name=base_name,
         )
-        if _use_unet_openings:
-            # U-Net path: use door/window bboxes directly from U-Net pipeline
-            # (same post-processing as detect_unet.py — no algorithmic detectors)
-            logger.info(
-                "[%s] Using U-Net openings: %d doors, %d windows",
-                base_name, len(unet_door_bboxes), len(unet_window_bboxes),
-            )
-            openings = self._unet_bboxes_to_openings(
+
+        # If U-Net doors/windows available, add non-overlapping ones (gap doors priority)
+        if unet_door_bboxes or unet_window_bboxes:
+            unet_openings = self._unet_bboxes_to_openings(
                 unet_door_bboxes, unet_window_bboxes
             )
-            door_arcs = []
-        else:
-            # Fallback path: algorithmic + YOLO detection
-            yolo_results = None
-            if self._yolo is not None:
-                try:
-                    yolo_results = self._yolo.detect(img)
-                    result.raw_yolo_results = yolo_results
-                except Exception as e:
-                    logger.warning("YOLO detection failed: %s", e)
+            # Priority openings for deduplication:
+            # - U-Net DOOR deduped against traditional GAP or DOOR
+            # - U-Net WINDOW deduped against traditional WINDOW
+            priority_for_door = [o for o in openings if o.opening_type in (OpeningType.GAP, OpeningType.DOOR)]
+            priority_for_window = [o for o in openings if o.opening_type == OpeningType.WINDOW]
 
-            pixel_scale = self.config.pixels_to_m
+            filtered_unet_openings = []
+            overlapping_count = 0
+            for uo in unet_openings:
+                if uo.opening_type == OpeningType.DOOR:
+                    priority_list = priority_for_door
+                else:  # WINDOW
+                    priority_list = priority_for_window
+                overlaps = any(
+                    self._bbox_iou(uo.bbox, po.bbox) > 0.3
+                    for po in priority_list
+                )
+                if overlaps:
+                    overlapping_count += 1
+                else:
+                    filtered_unet_openings.append(uo)
 
-            openings, door_arcs = self._run_opening_detection(
-                img=img,
-                walls=result.walls,
-                wall_mask=result.wall_mask,
-                outline_mask=result.outline_mask,
-                wall_rectangles=raw_rectangles,
-                yolo_results=yolo_results,
-                ocr_bboxes=ocr_bboxes,
-                pixel_scale=pixel_scale,
-                base_name=base_name,
-            )
+            if filtered_unet_openings:
+                openings.extend(filtered_unet_openings)
+                logger.info(
+                    "[%s] U-Net dedup: kept %d/%d U-Net openings (removed %d overlapping with gap doors)",
+                    base_name, len(filtered_unet_openings), len(unet_openings), overlapping_count
+                )
+            else:
+                logger.info("[%s] All U-Net openings were overlapping with gap doors — discarded", base_name)
 
+        # Now assign to result (door_arcs always from gap detection)
         result.openings = openings
         result.door_arcs = door_arcs
 
@@ -1625,6 +1646,23 @@ class FloorplanPipeline:
                 source="unet",
             ))
         return openings
+
+    @staticmethod
+    def _bbox_iou(bbox_a: BBox, bbox_b: BBox) -> float:
+        """Compute Intersection-over-Union (IoU) between two BBox objects.
+        Returns 0.0 if no overlap.
+        """
+        x1 = max(bbox_a.x1, bbox_b.x1)
+        y1 = max(bbox_a.y1, bbox_b.y1)
+        x2 = min(bbox_a.x2, bbox_b.x2)
+        y2 = min(bbox_a.y2, bbox_b.y2)
+        if x1 >= x2 or y1 >= y2:
+            return 0.0
+        inter = (x2 - x1) * (y2 - y1)
+        area_a = (bbox_a.x2 - bbox_a.x1) * (bbox_a.y2 - bbox_a.y1)
+        area_b = (bbox_b.x2 - bbox_b.x1) * (bbox_b.y2 - bbox_b.y1)
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
 
     def _run_wall_detection(self, img: np.ndarray) -> tuple:
         """
