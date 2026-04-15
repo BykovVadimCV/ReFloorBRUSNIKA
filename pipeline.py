@@ -1288,21 +1288,6 @@ class FloorplanPipeline:
             result.wall_mask = detection.wall_mask
             result.outline_mask = detection.outline_mask
 
-        # ── Stage 1b: Rebuild wall geometry from mask (mask is ground truth) ───
-        # Replace rectangle-extracted WallSegments with segments derived directly
-        # from the wall mask.  Morphological H/V opening splits junction blobs into
-        # individual wall runs, giving tight bboxes that exactly match the mask.
-        if result.wall_mask is not None and np.any(result.wall_mask > 0):
-            from detection.walls import wall_mask_to_segments
-            mask_segs = wall_mask_to_segments(result.wall_mask)
-            if mask_segs:
-                result.walls = mask_segs
-                logger.info(
-                    "[%s] Stage 1b: rebuilt %d wall segments from mask "
-                    "(was %d rect-based)",
-                    base_name, len(mask_segs),
-                    len(getattr(detection, 'walls', [])),
-                )
 
         # ── Stage 2: Opening Detection (UNIFIED: gap + U-Net with deduplication) ─────
         _notify("detecting openings")
