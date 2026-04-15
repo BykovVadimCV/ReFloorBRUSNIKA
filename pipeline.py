@@ -1179,41 +1179,45 @@ class FloorplanPipeline:
         if unet_detection is not None:
             unet_wall_mask, unet_door_bboxes, unet_window_bboxes = unet_detection
 
-            # ── Solid vs hollow wall check ────────────────────────────
-            # Solid walls: the original image is already dark where the
-            # U-Net predicts walls.  Hollow walls: the original image is
-            # white (gap between double outline lines) where U-Net predicts.
-            # If ≥ solid_wall_threshold of the mask pixels are non-white,
-            # the walls are solid → skip grey pipeline, use color detection.
-            WHITE_THRESH = 240  # pixel brightness considered "white"
-            gray_orig = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            mask_px = unet_wall_mask > 0
-            total_mask_px = int(np.sum(mask_px))
-            if total_mask_px > 0:
-                non_white_px = int(np.sum(gray_orig[mask_px] < WHITE_THRESH))
-                solid_ratio = non_white_px / total_mask_px
-            else:
-                solid_ratio = 0.0
-            del gray_orig
-
-            is_solid = solid_ratio >= self.config.solid_wall_threshold
-            logger.info(
-                "[%s] Wall-mask non-white ratio: %.1f%% (threshold %.0f%%) → %s",
-                base_name, solid_ratio * 100,
-                self.config.solid_wall_threshold * 100,
-                "solid" if is_solid else "hollow",
-            )
-
-            if is_solid:
+            # U-Net door/window bboxes are ALWAYS used for opening detection
+            # regardless of --enable-unet.  The wall pipeline (grey/hollow path)
+            # is only activated when --enable-unet is explicitly set.
+            if not self.config.enable_unet:
                 logger.info(
-                    "[%s] Solid-wall image — skipping grey pipeline, "
-                    "using direct color detection",
-                    base_name,
+                    "[%s] U-Net doors collected (%d doors, %d windows); "
+                    "grey-wall pipeline skipped (--enable-unet not set)",
+                    base_name, len(unet_door_bboxes), len(unet_window_bboxes),
                 )
-                # Null out unet_detection to skip grey wall pipeline,
-                # but keep door/window bboxes for opening detection.
-                has_unet_openings = bool(unet_door_bboxes or unet_window_bboxes)
-                unet_detection = None  # fall through to color path below
+                unet_detection = None  # skip grey wall pipeline, keep door bboxes
+            else:
+                # ── Solid vs hollow wall check ────────────────────────────
+                WHITE_THRESH = 240
+                gray_orig = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                mask_px = unet_wall_mask > 0
+                total_mask_px = int(np.sum(mask_px))
+                if total_mask_px > 0:
+                    non_white_px = int(np.sum(gray_orig[mask_px] < WHITE_THRESH))
+                    solid_ratio = non_white_px / total_mask_px
+                else:
+                    solid_ratio = 0.0
+                del gray_orig
+
+                is_solid = solid_ratio >= self.config.solid_wall_threshold
+                logger.info(
+                    "[%s] Wall-mask non-white ratio: %.1f%% (threshold %.0f%%) → %s",
+                    base_name, solid_ratio * 100,
+                    self.config.solid_wall_threshold * 100,
+                    "solid" if is_solid else "hollow",
+                )
+
+                if is_solid:
+                    logger.info(
+                        "[%s] Solid-wall image — skipping grey pipeline, "
+                        "using direct color detection",
+                        base_name,
+                    )
+                    has_unet_openings = bool(unet_door_bboxes or unet_window_bboxes)
+                    unet_detection = None  # fall through to color path below
 
         if unet_detection is not None:
             unet_wall_mask, unet_door_bboxes, unet_window_bboxes = unet_detection
