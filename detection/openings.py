@@ -157,13 +157,21 @@ def deduplicate_openings(
     if len(openings) <= 1:
         return openings
 
-    # Priority: DOOR=3, WINDOW=2, GAP=1
-    priority = {OpeningType.DOOR: 3, OpeningType.WINDOW: 2, OpeningType.GAP: 1}
+    # Priority order (higher = survives deduplication):
+    #   geometric/arc GAP  > YOLO/U-Net DOOR > WINDOW > unconfirmed GAP
+    # Gap-sourced detections are the most geometrically precise; they beat
+    # YOLO and U-Net doors that overlap them.
+    def _priority(o: Opening) -> float:
+        base = {OpeningType.DOOR: 2.0, OpeningType.WINDOW: 1.0, OpeningType.GAP: 3.0}
+        # U-Net doors rank below traditional YOLO/gap doors
+        if o.source == 'unet':
+            return 0.5 + o.confidence * 0.1
+        return base.get(o.opening_type, 0.0) + o.confidence * 0.1
 
     # Sort by priority desc, then confidence desc
     sorted_ops = sorted(
         openings,
-        key=lambda o: (priority.get(o.opening_type, 0), o.confidence),
+        key=_priority,
         reverse=True,
     )
 

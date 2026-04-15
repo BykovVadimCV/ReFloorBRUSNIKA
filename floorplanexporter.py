@@ -351,6 +351,10 @@ class Wall:
     wall_at_end: Optional[str] = None
     pattern: str = 'hatchUp'
     is_structural: bool = True
+    # Original detection bounding box in cm (x1, y1, x2, y2) — full rectangle as
+    # returned by the detector, before the wall is narrowed to a centreline.
+    # Used by _snap_doors_to_wall_gaps for proximity search.
+    detection_bbox: Optional[Tuple[float, float, float, float]] = None
 
     @property
     def length(self) -> float:
@@ -794,6 +798,14 @@ class OpeningProcessor:
                 end = Point(center.x, center.y + half)
                 angle = math.pi / 2
             new_wall = Wall(start=start, end=end, thickness=thickness, is_structural=False)
+            # Store the full detection bbox so _snap_doors_to_wall_gaps can use it
+            half_perp = max(thickness, width_cm) / 2
+            if is_horizontal:
+                new_wall.detection_bbox = (cx_cm - half, cy_cm - half_perp,
+                                           cx_cm + half, cy_cm + half_perp)
+            else:
+                new_wall.detection_bbox = (cx_cm - half_perp, cy_cm - half,
+                                           cx_cm + half_perp, cy_cm + half)
             pid, depth = new_wall.wall_id, thickness
 
         fused_angle = math.radians(fused_door.wall_normal_deg) if hasattr(fused_door, 'wall_normal_deg') else angle
@@ -873,6 +885,8 @@ class OpeningProcessor:
                 end = Point(center.x, center.y + half)
                 angle = math.pi / 2
             new_wall = Wall(start=start, end=end, thickness=thickness, is_structural=False)
+            # Store the full detection bbox (original rectangle in cm)
+            new_wall.detection_bbox = (x1, y1, x2, y2)
             pid, depth = new_wall.wall_id, thickness
 
         opening = Opening(
@@ -1367,15 +1381,22 @@ class SweetHome3DExporter:
                 continue
             _orig = (ow.start.x, ow.start.y, ow.end.x, ow.end.y)
 
-            # Door bbox including thickness
-            door_bb = _wall_bbox(ow)
-            # Extended bbox kept for debug visualisation only
+            # Use the full original detection bbox for wall search (as seen in
+            # the summary image).  Fall back to the narrow wall bbox only when no
+            # detection bbox was stored (e.g. when a parent wall was found).
+            if ow.detection_bbox is not None:
+                door_bb = ow.detection_bbox
+            else:
+                door_bb = _wall_bbox(ow)
             dw = door_bb[2] - door_bb[0]
             dh = door_bb[3] - door_bb[1]
             ext_bb = (door_bb[0] - dw * DOOR_BBOX_EXTEND_RATIO,
                       door_bb[1] - dh * DOOR_BBOX_EXTEND_RATIO,
                       door_bb[2] + dw * DOOR_BBOX_EXTEND_RATIO,
                       door_bb[3] + dh * DOOR_BBOX_EXTEND_RATIO)
+            # Detection center — used to place the opening wall perpendicularly
+            det_cx = (door_bb[0] + door_bb[2]) / 2
+            det_cy = (door_bb[1] + door_bb[3]) / 2
 
             best_gap = float('inf')
             best_pair = None  # (edge_a, edge_b, sw_a, sw_b)
@@ -1426,16 +1447,18 @@ class SweetHome3DExporter:
                         gap = re - le
                         if gap <= MIN_GAP_CM or gap >= best_gap:
                             continue
-                        cy = ow.get_centerline_y()
-                        if _gap_is_clear(le, cy, re, cy):
+                        if _gap_is_clear(le, det_cy, re, det_cy):
                             best_gap = gap
                             best_pair = (le, re, lsw, rsw)
 
                 if best_pair is not None:
                     ow.start.x, ow.end.x = best_pair[0], best_pair[1]
+                    # Snap perpendicular coordinate to detection bbox centre
+                    ow.start.y = ow.end.y = det_cy
                     for o in openings:
                         if o.parent_wall_id == ow.wall_id:
                             o.width = best_gap
+                            o.center = Point(det_cx, det_cy)
                 else:
                     to_remove.add(ow.wall_id)
 
@@ -1494,8 +1517,7 @@ class SweetHome3DExporter:
                         gap = be - te
                         if gap <= MIN_GAP_CM or gap >= best_gap:
                             continue
-                        cx = ow.get_centerline_x()
-                        if _gap_is_clear(cx, te, cx, be):
+                        if _gap_is_clear(det_cx, te, det_cx, be):
                             best_gap = gap
                             best_pair = (te, be, tsw, bsw)
 
@@ -1504,9 +1526,12 @@ class SweetHome3DExporter:
                         ow.start.y, ow.end.y = best_pair[0], best_pair[1]
                     else:
                         ow.start.y, ow.end.y = best_pair[1], best_pair[0]
+                    # Snap perpendicular coordinate to detection bbox centre
+                    ow.start.x = ow.end.x = det_cx
                     for o in openings:
                         if o.parent_wall_id == ow.wall_id:
                             o.width = best_gap
+                            o.center = Point(det_cx, det_cy)
                 else:
                     to_remove.add(ow.wall_id)
 

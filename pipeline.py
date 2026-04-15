@@ -1557,10 +1557,9 @@ class FloorplanPipeline:
         Returns None if U-Net is unavailable or produces an empty mask.
         U-Net inference runs in a subprocess to isolate potential crashes.
         """
-        if not self.config.enable_unet:
-            logger.info("U-Net disabled (enable_unet=False), skipping")
-            return None
-
+        # enable_unet previously gated U-Net completely; now U-Net always
+        # attempts so both detection methods are always combined.
+        # It still fails gracefully when checkpoint / deps are absent.
         ckpt = self.config.unet_checkpoint_path
         if not Path(ckpt).exists():
             logger.info("U-Net checkpoint not found at %s, skipping", ckpt)
