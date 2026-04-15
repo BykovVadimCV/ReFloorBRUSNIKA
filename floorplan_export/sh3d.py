@@ -130,6 +130,7 @@ class SH3DExporter:
         ocr_labels: Optional[List] = None,
         debug_image_path: Optional[str] = None,
         wall_mask: Optional[np.ndarray] = None,
+        enclosed_labels: Optional[np.ndarray] = None,
     ) -> List[Room]:
         """
         Export a floorplan to SH3D format.
@@ -173,6 +174,7 @@ class SH3DExporter:
                 debug_image_path=debug_image_path,
                 wall_mask=wall_mask,
                 fused_doors=fused_doors if fused_doors else None,
+                enclosed_labels=enclosed_labels,
             )
         except Exception as e:
             logger.error("SH3D export failed: %s", e, exc_info=True)

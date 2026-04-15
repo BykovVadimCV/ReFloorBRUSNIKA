@@ -1175,6 +1175,7 @@ class FloorplanPipeline:
         unet_window_bboxes: list = []
         used_unet_grey = False
         has_unet_openings = False
+        enclosed_labels = None   # filled during U-Net hollow-wall path
 
         if unet_detection is not None:
             unet_wall_mask, unet_door_bboxes, unet_window_bboxes = unet_detection
@@ -1228,6 +1229,7 @@ class FloorplanPipeline:
 
             num_labels, labels = _build_enclosed_regions(img)
             logger.info("[%s] Found %d enclosed regions", base_name, num_labels - 1)
+            enclosed_labels = labels          # pass to room detector later
 
             grey_img = build_grey_wall_image(
                 original_bgr=img,
@@ -1428,6 +1430,7 @@ class FloorplanPipeline:
             ocr_labels=ocr_labels,
             debug_image_path=debug_img_path,
             wall_mask=result.wall_mask,
+            enclosed_labels=enclosed_labels,
         )
 
         result.rooms = rooms
@@ -1473,6 +1476,7 @@ class FloorplanPipeline:
                     ocr_labels=ocr_labels,
                     debug_image_path=debug_img_path,
                     wall_mask=result.wall_mask,
+                    enclosed_labels=enclosed_labels,
                 )
                 result.rooms = rooms
                 result.sh3d_path = sh3d_path if os.path.exists(sh3d_path) else None
@@ -1835,6 +1839,7 @@ class FloorplanPipeline:
         ocr_labels: List,
         debug_image_path: str,
         wall_mask: Optional[np.ndarray],
+        enclosed_labels: Optional[np.ndarray] = None,
     ) -> List[Room]:
         """Run SH3D export and return detected rooms."""
         try:
@@ -1846,6 +1851,7 @@ class FloorplanPipeline:
                 ocr_labels=ocr_labels if ocr_labels else None,
                 debug_image_path=debug_image_path,
                 wall_mask=wall_mask,
+                enclosed_labels=enclosed_labels,
             )
         except Exception as e:
             logger.error("SH3D export failed: %s", e, exc_info=True)

@@ -911,34 +911,84 @@ class RoomDetector:
     connected components of remaining interior (non-wall, non-exterior)
     space.  Each connected component = one room polygon.
 
-    This guarantees:
-      • every enclosed space is detected,
-      • no room polygon contains walls inside it,
-      • adjacent rooms connected only by a doorway are kept separate
-        (because opening walls seal the gap in the raster).
+    After polygon extraction vertices are snapped to the nearest wall
+    face so room boundaries exactly follow wall edges rather than
+    approximating them.
     """
 
     def __init__(
         self,
-        resolution: float = 1.0,
+        resolution: float = 0.5,        # finer raster → sharper corners
         min_room_area_cm2: float = 2000.0,
         wall_dilation_px: int = 2,
-        contour_simplify_ratio: float = 0.012,
+        contour_simplify_ratio: float = 0.003,   # less aggressive simplification
+        snap_tolerance_cm: float = 18.0,          # max snap distance
     ) -> None:
-        self.resolution = resolution              # cm per raster pixel
+        self.resolution = resolution
         self.min_room_area_cm2 = min_room_area_cm2
-        self.wall_dilation_px = wall_dilation_px  # close sub-pixel gaps
+        self.wall_dilation_px = wall_dilation_px
         self.contour_simplify_ratio = contour_simplify_ratio
+        self.snap_tolerance_cm = snap_tolerance_cm
 
-    # ---- public API (same signature the exporter expects) ----
-    def detect(self, walls: List[Wall]) -> List[Room]:
+    # ---- public API ----
+    def detect(
+        self,
+        walls: List[Wall],
+        enclosed_labels: Optional[np.ndarray] = None,
+    ) -> List[Room]:
         if len(walls) < 3:
             return []
 
+        # Pre-compute wall corner geometry once for snapping
+        self._wall_geom = self._compute_wall_geom(walls)
+
         mask, origin = self._rasterize_walls(walls)
         interior = self._extract_interior(mask)
-        rooms = self._components_to_rooms(interior, origin)
+        rooms = self._components_to_rooms(interior, origin, enclosed_labels, mask)
         return rooms
+
+    # ---- wall geometry for snap ----
+    @staticmethod
+    def _compute_wall_geom(walls: List[Wall]) -> List[Tuple]:
+        """Return list of (4 corners as (x,y) tuples, 4 edge segments) per wall."""
+        geom = []
+        for w in walls:
+            dx = w.end.x - w.start.x
+            dy = w.end.y - w.start.y
+            length = math.hypot(dx, dy)
+            if length < 0.001:
+                continue
+            half_t = w.thickness / 2.0
+            nx, ny = -dy / length * half_t, dx / length * half_t
+            corners = [
+                (w.start.x + nx, w.start.y + ny),
+                (w.end.x   + nx, w.end.y   + ny),
+                (w.end.x   - nx, w.end.y   - ny),
+                (w.start.x - nx, w.start.y - ny),
+            ]
+            edges = [(corners[i], corners[(i + 1) % 4]) for i in range(4)]
+            geom.append(edges)
+        return geom
+
+    def _snap_to_walls(self, x_cm: float, y_cm: float) -> Tuple[float, float]:
+        """Project a point onto the nearest wall edge face within snap_tolerance_cm."""
+        best_dist = self.snap_tolerance_cm
+        best_x, best_y = x_cm, y_cm
+        for edges in self._wall_geom:
+            for (ax, ay), (bx, by) in edges:
+                edx, edy = bx - ax, by - ay
+                len_sq = edx * edx + edy * edy
+                if len_sq < 1e-6:
+                    continue
+                t = ((x_cm - ax) * edx + (y_cm - ay) * edy) / len_sq
+                t = max(0.0, min(1.0, t))
+                px = ax + t * edx
+                py = ay + t * edy
+                d = math.hypot(x_cm - px, y_cm - py)
+                if d < best_dist:
+                    best_dist = d
+                    best_x, best_y = px, py
+        return best_x, best_y
 
     # ---- rasterise walls as filled rectangles ----
     def _rasterize_walls(
@@ -1018,11 +1068,30 @@ class RoomDetector:
 
     # ---- connected components → Room objects ----
     def _components_to_rooms(
-        self, interior: np.ndarray, origin: Tuple[float, float]
+        self,
+        interior: np.ndarray,
+        origin: Tuple[float, float],
+        enclosed_labels: Optional[np.ndarray] = None,
+        wall_mask: Optional[np.ndarray] = None,
     ) -> List[Room]:
         min_x, min_y = origin
         res = self.resolution
         num_labels, labels = cv2.connectedComponents(interior)
+
+        # Build a pixel-scale enclosed-region validity mask from U-Net labels.
+        # enclosed_labels is in original image pixels; interior is in cm-raster
+        # pixels. We'll check overlap by projecting room component bboxes back
+        # to image space via the cm-to-pixel scale (self.pixels_to_cm stored on
+        # call site). Since we don't have pixels_to_cm here, we use a simpler
+        # approach: scale the enclosed_labels mask to match the raster size.
+        enc_resized: Optional[np.ndarray] = None
+        if enclosed_labels is not None:
+            # Any pixel with label > 0 is inside an enclosed region.
+            enc_bool = (enclosed_labels > 0).astype(np.uint8) * 255
+            h_raster, w_raster = interior.shape[:2]
+            enc_resized = cv2.resize(
+                enc_bool, (w_raster, h_raster), interpolation=cv2.INTER_NEAREST
+            )
 
         rooms: List[Room] = []
         for label_id in range(1, num_labels):
@@ -1031,6 +1100,13 @@ class RoomDetector:
             area_cm2 = area_px * (res * res)
             if area_cm2 < self.min_room_area_cm2:
                 continue
+
+            # U-Net filter: at least 20% of the room's pixels must overlap
+            # with an enclosed region detected by U-Net.
+            if enc_resized is not None:
+                overlap_px = int(np.sum((component > 0) & (enc_resized > 0)))
+                if overlap_px / max(area_px, 1) < 0.20:
+                    continue
 
             contours, _ = cv2.findContours(
                 component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
@@ -1050,6 +1126,8 @@ class RoomDetector:
             for pt in approx:
                 x_cm = pt[0][0] * res + min_x
                 y_cm = pt[0][1] * res + min_y
+                # Snap vertex to nearest wall face for precise room boundaries
+                x_cm, y_cm = self._snap_to_walls(x_cm, y_cm)
                 points.append(Point(x_cm, y_cm))
 
             rooms.append(Room(
@@ -1242,6 +1320,7 @@ class SweetHome3DExporter:
         debug_image_path: Optional[str] = None,
         wall_mask: Optional[np.ndarray] = None,
         fused_doors: Optional[List] = None,
+        enclosed_labels: Optional[np.ndarray] = None,
     ) -> List[Room]:
         structural_walls = self.wall_converter.convert(wall_rectangles)
 
@@ -1272,11 +1351,12 @@ class SweetHome3DExporter:
         # FIX: use the new flood-fill RoomDetector
         # ──────────────────────────────────────────────────────
         rooms = RoomDetector(
-            resolution=1.0,
+            resolution=0.5,
             min_room_area_cm2=2000.0,
-            wall_dilation_px=2,
-            contour_simplify_ratio=0.012,
-        ).detect(all_walls)
+            wall_dilation_px=3,
+            contour_simplify_ratio=0.003,
+            snap_tolerance_cm=18.0,
+        ).detect(all_walls, enclosed_labels=enclosed_labels)
 
         rooms = RoomOverlapRemover(
             min_area_threshold=50.0, overlap_threshold=0.50
