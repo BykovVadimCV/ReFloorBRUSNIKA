@@ -1304,55 +1304,63 @@ class FloorplanPipeline:
 
         pixel_scale = self.config.pixels_to_m
 
-        openings, door_arcs = self._run_opening_detection(
-            img=img,
-            walls=result.walls,
-            wall_mask=result.wall_mask,
-            outline_mask=result.outline_mask,
-            wall_rectangles=raw_rectangles,
-            yolo_results=yolo_results,
-            ocr_bboxes=ocr_bboxes,
-            pixel_scale=pixel_scale,
-            base_name=base_name,
-        )
-
-        # If U-Net doors/windows available, add non-overlapping ones (gap doors priority)
-        if unet_door_bboxes or unet_window_bboxes:
-            unet_openings = self._unet_bboxes_to_openings(
-                unet_door_bboxes, unet_window_bboxes
-            )
-            # Priority openings for deduplication:
-            # - U-Net DOOR deduped against traditional GAP or DOOR
-            # - U-Net WINDOW deduped against traditional WINDOW
-            priority_for_door = [o for o in openings if o.opening_type in (OpeningType.GAP, OpeningType.DOOR)]
-            priority_for_window = [o for o in openings if o.opening_type == OpeningType.WINDOW]
-
-            filtered_unet_openings = []
-            overlapping_count = 0
-            for uo in unet_openings:
-                if uo.opening_type == OpeningType.DOOR:
-                    priority_list = priority_for_door
-                else:  # WINDOW
-                    priority_list = priority_for_window
-                overlaps = any(
-                    self._bbox_iou(uo.bbox, po.bbox) > 0.3
-                    for po in priority_list
+        if used_unet_grey:
+            # ── Hollow-wall U-Net path: U-Net doors are ground truth ──────────
+            # Gap detection is unreliable on hollow-wall images (the colour
+            # detector sees the grey fill, not actual wall pixels), so skip it
+            # entirely and use only the U-Net door/window bboxes.
+            door_arcs = []
+            if unet_door_bboxes or unet_window_bboxes:
+                openings = self._unet_bboxes_to_openings(
+                    unet_door_bboxes, unet_window_bboxes
                 )
-                if overlaps:
-                    overlapping_count += 1
-                else:
-                    filtered_unet_openings.append(uo)
-
-            if filtered_unet_openings:
-                openings.extend(filtered_unet_openings)
                 logger.info(
-                    "[%s] U-Net dedup: kept %d/%d U-Net openings (removed %d overlapping with gap doors)",
-                    base_name, len(filtered_unet_openings), len(unet_openings), overlapping_count
+                    "[%s] Hollow-wall path: using %d U-Net openings exclusively "
+                    "(gap detection skipped)",
+                    base_name, len(openings),
                 )
             else:
-                logger.info("[%s] All U-Net openings were overlapping with gap doors — discarded", base_name)
+                openings = []
+                logger.info("[%s] Hollow-wall path: no U-Net openings found", base_name)
+        else:
+            # ── Solid-wall / no-U-Net path: gap + U-Net combined ─────────────
+            openings, door_arcs = self._run_opening_detection(
+                img=img,
+                walls=result.walls,
+                wall_mask=result.wall_mask,
+                outline_mask=result.outline_mask,
+                wall_rectangles=raw_rectangles,
+                yolo_results=yolo_results,
+                ocr_bboxes=ocr_bboxes,
+                pixel_scale=pixel_scale,
+                base_name=base_name,
+            )
 
-        # Now assign to result (door_arcs always from gap detection)
+            # Supplement with U-Net doors that don't overlap gap detections
+            if unet_door_bboxes or unet_window_bboxes:
+                unet_openings = self._unet_bboxes_to_openings(
+                    unet_door_bboxes, unet_window_bboxes
+                )
+                priority_for_door = [o for o in openings if o.opening_type in (OpeningType.GAP, OpeningType.DOOR)]
+                priority_for_window = [o for o in openings if o.opening_type == OpeningType.WINDOW]
+
+                filtered_unet = []
+                overlapping_count = 0
+                for uo in unet_openings:
+                    priority_list = priority_for_door if uo.opening_type == OpeningType.DOOR else priority_for_window
+                    if any(self._bbox_iou(uo.bbox, po.bbox) > 0.3 for po in priority_list):
+                        overlapping_count += 1
+                    else:
+                        filtered_unet.append(uo)
+
+                if filtered_unet:
+                    openings.extend(filtered_unet)
+                    logger.info(
+                        "[%s] U-Net supplement: added %d/%d openings "
+                        "(%d overlapped gap/door detections)",
+                        base_name, len(filtered_unet), len(unet_openings), overlapping_count,
+                    )
+
         result.openings = openings
         result.door_arcs = door_arcs
 
