@@ -503,35 +503,64 @@ _register_themes()
 class UNetSemanticClasses:
     """
     Semantic class IDs for U-Net segmentation masks.
+    5-class schema:
+    0 — background (unlabeled / room fills / furniture / annotations)
+    1 — wall
+    2 — window
+    3 — door
+    4 — footprint interior / rooms / icons / furniture
 
-    3-class schema (+ background):
-        0 — background (unlabeled / rooms / furniture)
-        1 — wall
-        2 — window
-        3 — door
+    Pixel intensity mapping:
+    Class 0 → pixel value 0
+    Class 1 → pixel value 64
+    Class 2 → pixel value 128
+    Class 3 → pixel value 192
+    Class 4 → pixel value 255
     """
     BACKGROUND = 0
-    WALL       = 1
-    WINDOW     = 2
-    DOOR       = 3
+    WALL = 1
+    WINDOW = 2
+    DOOR = 3
+    FOOTPRINT = 4
+    NUM_CLASSES = 5
 
-    NUM_CLASSES = 4
+    # Mapping from class ID to pixel intensity
+    CLASS_TO_PIXEL = {
+        0: 0,  # background
+        1: 64,  # wall
+        2: 128,  # window
+        3: 192,  # door
+        4: 255,  # footprint/rooms/furniture
+    }
+
+    # Reverse mapping for visualization
+    PIXEL_TO_CLASS = {v: k for k, v in CLASS_TO_PIXEL.items()}
 
     # Color palette for visualization (BGR)
     PALETTE = [
-        (0,   0,   0),    # 0: background
-        (0,   0, 200),    # 1: wall   (red)
-        (0, 200,   0),    # 2: window (green)
-        (200, 160,  0),   # 3: door   (blue)
+        (0, 0, 0),  # 0: background - black
+        (0, 0, 200),  # 1: wall - red
+        (0, 200, 0),  # 2: window - green
+        (200, 160, 0),  # 3: door - cyan
+        (255, 255, 255),  # 4: footprint - white
     ]
 
     @classmethod
+    def to_pixel_value(cls, class_id):
+        """Convert class ID to pixel intensity."""
+        return cls.CLASS_TO_PIXEL.get(class_id, 0)
+
+    @classmethod
     def colorize_mask(cls, mask: np.ndarray) -> np.ndarray:
-        """Convert single-channel class mask to BGR color visualization."""
+        """Convert single-channel pixel-intensity mask to BGR color visualization."""
         h, w = mask.shape[:2]
         color_img = np.zeros((h, w, 3), dtype=np.uint8)
-        for class_id, color in enumerate(cls.PALETTE):
-            color_img[mask == class_id] = color
+
+        # Map pixel values back to classes, then to colors
+        for pixel_val, class_id in cls.PIXEL_TO_CLASS.items():
+            if class_id < len(cls.PALETTE):
+                color_img[mask == pixel_val] = cls.PALETTE[class_id]
+
         return color_img
 
 
@@ -3149,7 +3178,10 @@ class SmartFloorPlanGenerator:
         img = np.full((self.size, self.size, 3), bg, dtype=np.uint8)
 
         # NEW: Create semantic segmentation mask (single-channel uint8)
-        semantic_mask = np.zeros((self.size, self.size), dtype=np.uint8)
+        # Initialize entire canvas as FOOTPRINT (pixel 255)
+        semantic_mask = np.full((self.size, self.size),
+                                UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.FOOTPRINT)),
+                                dtype=np.uint8)
 
         stroke_scale = self.rng.uniform(0.5, 2.5) if self.config.enable_augmentations else 1.0
         self.renderer = ThemeRenderer(self.theme, self.size, self.rng,
@@ -3189,7 +3221,7 @@ class SmartFloorPlanGenerator:
         self.renderer.draw_walls(img, walls)
         # Draw walls on mask
         self.renderer.draw_walls_on_mask(semantic_mask, walls,
-                                          UNetSemanticClasses.WALL)
+                                          UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.WALL))
 
         # Furniture (visual only — not written to mask)
         self.furniture_placer.place_furniture(img, rooms, walls)
@@ -3463,7 +3495,7 @@ class SmartFloorPlanGenerator:
                 cv2.line(img, (start, cy - off), (end, cy - off), wc, line_th, cv2.LINE_AA)
                 cv2.line(img, (start, cy + off), (end, cy + off), wc, line_th, cv2.LINE_AA)
             if semantic_mask is not None:
-                cv2.rectangle(semantic_mask, p1, p2, UNetSemanticClasses.WINDOW, -1)
+                cv2.rectangle(semantic_mask, p1, p2, UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.WINDOW), -1)
         else:
             # Door on interface
             if self.current_door_style == "cross":
@@ -3504,7 +3536,7 @@ class SmartFloorPlanGenerator:
                         cv2.ellipse(img, hp, (arc_radius, arc_radius),
                                     0, sa, ea, wc, 1, cv2.LINE_AA)
             if semantic_mask is not None:
-                cv2.rectangle(semantic_mask, p1, p2, UNetSemanticClasses.DOOR, -1)
+                cv2.rectangle(semantic_mask, p1, p2, UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.DOOR), -1)
 
         return self._points_to_yolo([p1, p2])
 
@@ -3571,17 +3603,17 @@ class SmartFloorPlanGenerator:
 
         # Mark on semantic mask: gap rectangle + ridge overshoot line
         if semantic_mask is not None:
-            cv2.rectangle(semantic_mask, p1, p2, UNetSemanticClasses.DOOR, -1)
+            cv2.rectangle(semantic_mask, p1, p2, UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.DOOR), -1)
             if is_vert:
                 cy = (y1 + y2) // 2
                 cv2.line(semantic_mask,
                          (x1 - overshoot, cy), (x2 + overshoot, cy),
-                         UNetSemanticClasses.DOOR, max(1, parallel_th))
+                         UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.DOOR), max(1, parallel_th))
             else:
                 cx = (x1 + x2) // 2
                 cv2.line(semantic_mask,
                          (cx, y1 - overshoot), (cx, y2 + overshoot),
-                         UNetSemanticClasses.DOOR, max(1, parallel_th))
+                         UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.DOOR), max(1, parallel_th))
 
     # ── Windows — VARIED VISUAL TYPES ─────────────────────────────────────────
     def _place_window(self, img, w: Wall, semantic_mask=None):
@@ -3678,7 +3710,7 @@ class SmartFloorPlanGenerator:
                 self.furniture_placer.add_occupied(start, y1, end, y2, "window")
                 if semantic_mask is not None:
                     cv2.rectangle(semantic_mask, (start, y1), (end, y2),
-                                  UNetSemanticClasses.WINDOW, -1)
+                                  UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.WINDOW), -1)
                 self._add_radiator(img, True, start, end, center_y, w.thickness)
                 return self._points_to_yolo([(start, y1), (end, y2)])
         else:
@@ -3725,7 +3757,7 @@ class SmartFloorPlanGenerator:
                 self.furniture_placer.add_occupied(x1, start, x2, end, "window")
                 if semantic_mask is not None:
                     cv2.rectangle(semantic_mask, (x1, start), (x2, end),
-                                  UNetSemanticClasses.WINDOW, -1)
+                                  UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.WINDOW), -1)
                 self._add_radiator(img, False, start, end, center_x, w.thickness)
                 return self._points_to_yolo([(x1, start), (x2, end)])
         return None
@@ -3943,13 +3975,13 @@ class SmartFloorPlanGenerator:
                 # Segmentation mask: gap + body polygon + arc
                 if semantic_mask is not None:
                     cv2.rectangle(semantic_mask, (gap_s, y1), (gap_e, y2),
-                                  UNetSemanticClasses.DOOR, -1)
-                    cv2.fillPoly(semantic_mask, [corners], UNetSemanticClasses.DOOR)
+                                  UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.DOOR), -1)
+                    cv2.fillPoly(semantic_mask, [corners], UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.DOOR))
                     if draw_arc:
                         mask_arc_th = max(door_th, 3)
                         cv2.ellipse(semantic_mask, hp, (arc_radius, arc_radius),
                                     0, arc_sa, arc_ea,
-                                    UNetSemanticClasses.DOOR, mask_arc_th)
+                                    UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.DOOR), mask_arc_th)
                 self.furniture_placer.add_occupied(*bbox, "door")
                 return self._points_to_yolo([(gap_s, y1), (gap_e, y2), op])
         else:
@@ -4014,13 +4046,13 @@ class SmartFloorPlanGenerator:
                 # Segmentation mask: gap + body polygon + arc
                 if semantic_mask is not None:
                     cv2.rectangle(semantic_mask, (x1, gap_s), (x2, gap_e),
-                                  UNetSemanticClasses.DOOR, -1)
-                    cv2.fillPoly(semantic_mask, [corners], UNetSemanticClasses.DOOR)
+                                  UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.DOOR), -1)
+                    cv2.fillPoly(semantic_mask, [corners], UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.DOOR))
                     if draw_arc:
                         mask_arc_th = max(door_th, 3)
                         cv2.ellipse(semantic_mask, hp, (arc_radius, arc_radius),
                                     0, arc_sa, arc_ea,
-                                    UNetSemanticClasses.DOOR, mask_arc_th)
+                                    UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.DOOR), mask_arc_th)
                 self.furniture_placer.add_occupied(*bbox, "door")
                 return self._points_to_yolo([(x1, gap_s), (x2, gap_e), op])
         return None

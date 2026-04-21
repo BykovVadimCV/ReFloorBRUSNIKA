@@ -147,8 +147,32 @@ class SH3DExporter:
         Returns:
             List of detected Room objects for visualization
         """
-        # Convert wall segments to rect dicts
-        wall_rects = [wall_segment_to_rect_dict(w) for w in walls]
+        # Separate diagonal walls from axis-aligned walls.
+        # Diagonal walls bypass the rect-dict path and are injected directly
+        # as pre-built LegacyWall objects into export_to_sh3d().
+        from floorplanexporter import Wall as _LegacyWall, Point as _LegacyPoint
+
+        axis_walls = [w for w in walls if not w.is_diagonal]
+        diag_walls  = [w for w in walls if w.is_diagonal]
+
+        # Convert axis-aligned walls to rect dicts (existing path)
+        wall_rects = [wall_segment_to_rect_dict(w) for w in axis_walls]
+
+        # Build LegacyWall objects for diagonal walls
+        ptcm = self.config.pixels_to_cm
+        extra_structural: List = []
+        for dw in diag_walls:
+            if dw.outline and len(dw.outline) >= 2:
+                (ox1, oy1), (ox2, oy2) = dw.outline[0], dw.outline[1]
+                extra_structural.append(_LegacyWall(
+                    start=_LegacyPoint(ox1 * ptcm, oy1 * ptcm),
+                    end=_LegacyPoint(ox2 * ptcm, oy2 * ptcm),
+                    thickness=max(dw.thickness * ptcm, 2.0),
+                    is_structural=True,
+                ))
+        if diag_walls:
+            logger.debug("SH3DExporter: %d diagonal walls → %d LegacyWall objects",
+                         len(diag_walls), len(extra_structural))
 
         # Separate openings by type
         doors = [o for o in openings if o.opening_type == OpeningType.DOOR]
@@ -175,6 +199,7 @@ class SH3DExporter:
                 wall_mask=wall_mask,
                 fused_doors=fused_doors if fused_doors else None,
                 enclosed_labels=enclosed_labels,
+                extra_structural_walls=extra_structural if extra_structural else None,
             )
         except Exception as e:
             logger.error("SH3D export failed: %s", e, exc_info=True)

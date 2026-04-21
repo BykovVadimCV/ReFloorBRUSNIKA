@@ -1321,8 +1321,14 @@ class SweetHome3DExporter:
         wall_mask: Optional[np.ndarray] = None,
         fused_doors: Optional[List] = None,
         enclosed_labels: Optional[np.ndarray] = None,
+        extra_structural_walls: Optional[List] = None,
     ) -> List[Room]:
         structural_walls = self.wall_converter.convert(wall_rectangles)
+
+        # Prepend pre-built Wall objects (e.g. diagonal walls) that bypass
+        # the rect-dict → Wall conversion in StructuralWallConverter.
+        if extra_structural_walls:
+            structural_walls = extra_structural_walls + structural_walls
 
         opening_walls, openings = self.opening_processor.process(
             structural_walls,

@@ -320,8 +320,10 @@ class WallSegment:
     thickness: float
     is_structural: bool = False
     is_outer: bool = False
+    is_diagonal: bool = False  # True for non-axis-aligned walls detected by LSD
 
-    # Optional outline for complex shapes
+    # Optional outline for complex shapes; for diagonal walls holds the two
+    # actual line endpoints [(x1,y1),(x2,y2)] in pixel coordinates.
     outline: Optional[List[Tuple[int, int]]] = None
 
     @property
