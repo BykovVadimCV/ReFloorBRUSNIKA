@@ -1269,16 +1269,15 @@ class FloorplanPipeline:
         unet_window_bboxes: list = []
         used_unet_grey = False
         has_unet_openings = False
-        enclosed_labels = None   # filled during U-Net wall path
+        enclosed_labels = None   # filled during U-Net hollow-wall path
         detection = None         # set by whichever wall-detection path runs
-        _ran_unet_path = False   # True once the grey+residual path completes
 
         if unet_detection is not None:
             unet_wall_mask, unet_door_bboxes, unet_window_bboxes = unet_detection
 
             # U-Net door/window bboxes are ALWAYS used for opening detection
-            # regardless of --enable-unet.  The wall pipeline is only activated
-            # when --enable-unet is explicitly set.
+            # regardless of --enable-unet.  The wall pipeline (grey/hollow path)
+            # is only activated when --enable-unet is explicitly set.
             if not self.config.enable_unet:
                 logger.info(
                     "[%s] U-Net doors collected (%d doors, %d windows); "
@@ -1287,35 +1286,48 @@ class FloorplanPipeline:
                 )
                 unet_detection = None  # skip grey wall pipeline, keep door bboxes
             else:
-                has_unet_openings = bool(unet_door_bboxes or unet_window_bboxes)
+                # ── Global solid vs hollow check ──────────────────────────
+                # Sample pixels inside the U-Net wall mask to decide whether
+                # the image has solid-colour walls (use colour detector) or
+                # hollow/outline walls (use grey-fill pipeline).
+                WHITE_THRESH = 240
+                gray_orig = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                mask_px = unet_wall_mask > 0
+                total_mask_px = int(np.sum(mask_px))
+                if total_mask_px > 0:
+                    non_white_px = int(np.sum(gray_orig[mask_px] < WHITE_THRESH))
+                    solid_ratio = non_white_px / total_mask_px
+                else:
+                    solid_ratio = 0.0
+                del gray_orig
+
+                is_solid = solid_ratio >= self.config.solid_wall_threshold
+                logger.info(
+                    "[%s] Wall-mask non-white ratio: %.1f%% (threshold %.0f%%) → %s",
+                    base_name, solid_ratio * 100,
+                    self.config.solid_wall_threshold * 100,
+                    "solid" if is_solid else "hollow",
+                )
+
+                if is_solid:
+                    logger.info(
+                        "[%s] Solid-wall image — skipping grey pipeline, "
+                        "using direct colour detection",
+                        base_name,
+                    )
+                    has_unet_openings = bool(unet_door_bboxes or unet_window_bboxes)
+                    unet_detection = None  # fall through to colour path below
 
         if unet_detection is not None:
             unet_wall_mask, unet_door_bboxes, unet_window_bboxes = unet_detection
 
-            # ── Stage 1 (U-Net path): grey fill → colour on residual ─────
-            #
-            # The grey-fill pipeline (enclosed-region analysis + U-Net vote)
-            # definitionally captures all hollow walls: it paints the enclosed
-            # space inside wall outlines grey, then the colour detector finds
-            # those grey rectangles.  Whatever solid-colour walls are left in
-            # the original image are invisible to the grey detector — but they
-            # appear clearly after erasing the grey-detected regions.
-            #
-            # Pipeline:
-            #   1. Build grey fill image  → grey walls
-            #   2. Dilate grey wall mask (one wall thickness) and erase from
-            #      img_clean so colour detector sees a clean solid-only signal
-            #   3. Run colour detector on erased image  → colour walls
-            #   4. Merge (IoU-deduplicate colour walls against grey walls)
-            #   5. used_unet_grey = True iff colour path found nothing
-            #      (purely hollow image → U-Net doors only in Stage 2)
+            # ── Stage 1 (hollow path): enclosed regions → grey image ─────
             _notify("detecting walls (U-Net hybrid)")
-            logger.info("[%s] Stage 1: U-Net hybrid wall detection (grey + colour residual)",
-                        base_name)
+            logger.info("[%s] Stage 1: U-Net hybrid wall detection", base_name)
 
             num_labels, labels = _build_enclosed_regions(img)
             logger.info("[%s] Found %d enclosed regions", base_name, num_labels - 1)
-            enclosed_labels = labels
+            enclosed_labels = labels          # pass to room detector later
 
             grey_img = build_grey_wall_image(
                 original_bgr=img,
@@ -1325,6 +1337,8 @@ class FloorplanPipeline:
                 coverage_threshold=0.50,
             )
 
+            # Add unenclosed wall rects (walls the U-Net sees but
+            # enclosed-region analysis missed due to outline gaps)
             unenclosed_rects = find_unenclosed_wall_rects(
                 img, unet_wall_mask,
                 min_area=200, merge_gap=15, min_merged_area=1000)
@@ -1345,75 +1359,22 @@ class FloorplanPipeline:
                 output_path=debug_path,
             )
 
+            del img_clean  # free ~75MB
+
             GREY_WALL_RGB = (160, 160, 160)
-            grey_detection = self.wall_detector.detect_with_color(grey_img, GREY_WALL_RGB)
-            grey_raw = list(self.wall_detector._last_rectangles or [])
+            detection = self.wall_detector.detect_with_color(grey_img, GREY_WALL_RGB)
+            raw_rectangles = self.wall_detector._last_rectangles
             del grey_img
 
-            # Erase grey-detected wall pixels from img_clean so the colour
-            # detector only sees solid-colour regions.  Dilate by one typical
-            # wall thickness to prevent thin coloured slivers where solid walls
-            # abut hollow walls.
-            grey_wm = grey_detection.wall_mask
-            erased_img = img_clean.copy()
-            if grey_wm is not None and np.any(grey_wm > 0):
-                dilation_px = max(15, int(self.config.min_wall_thickness_px * 3))
-                ker = cv2.getStructuringElement(
-                    cv2.MORPH_RECT, (dilation_px, dilation_px))
-                dilated_grey = cv2.dilate(grey_wm, ker)
-                erased_img[dilated_grey > 0] = 255  # set grey-wall pixels to white
-            del img_clean
+            used_unet_grey = True
+            logger.info("[%s] U-Net hybrid: %d walls from grey image",
+                        base_name, len(detection.walls))
 
-            color_detection, color_raw = self._run_wall_detection(erased_img)
-            del erased_img
-            color_raw = list(color_raw or [])
+            result.walls = detection.walls
+            result.wall_mask = detection.wall_mask
+            result.outline_mask = detection.outline_mask
 
-            # Deduplicate: drop colour walls that heavily overlap a grey wall
-            def _wall_iou(a: WallSegment, b: WallSegment) -> float:
-                ax1, ay1, ax2, ay2 = a.bbox.x1, a.bbox.y1, a.bbox.x2, a.bbox.y2
-                bx1, by1, bx2, by2 = b.bbox.x1, b.bbox.y1, b.bbox.x2, b.bbox.y2
-                iw = max(0.0, min(ax2, bx2) - max(ax1, bx1))
-                ih = max(0.0, min(ay2, by2) - max(ay1, by1))
-                inter = iw * ih
-                union = (ax2-ax1)*(ay2-ay1) + (bx2-bx1)*(by2-by1) - inter
-                return inter / union if union > 0 else 0.0
-
-            grey_walls = grey_detection.walls
-            color_walls_deduped = [
-                cw for cw in color_detection.walls
-                if not any(_wall_iou(cw, gw) > 0.30 for gw in grey_walls)
-            ]
-
-            merged_walls = grey_walls + color_walls_deduped
-
-            h_i, w_i = img.shape[:2]
-            _zero = np.zeros((h_i, w_i), dtype=np.uint8)
-            gw_m = grey_detection.wall_mask    if grey_detection.wall_mask    is not None else _zero
-            cw_m = color_detection.wall_mask   if color_detection.wall_mask   is not None else _zero
-            go_m = grey_detection.outline_mask if grey_detection.outline_mask is not None else _zero
-            co_m = color_detection.outline_mask if color_detection.outline_mask is not None else _zero
-
-            result.walls        = merged_walls
-            result.wall_mask    = cv2.bitwise_or(gw_m, cw_m)
-            result.outline_mask = cv2.bitwise_or(go_m, co_m)
-            raw_rectangles      = grey_raw + color_raw
-            detection           = grey_detection
-
-            # Purely hollow image → no colour walls found → skip gap detection
-            # in Stage 2 and rely on U-Net doors only (gap detector is
-            # unreliable on hollow outlines).  Mixed or solid → use the
-            # combined gap+U-Net opening path.
-            used_unet_grey = len(color_walls_deduped) == 0
-
-            logger.info(
-                "[%s] U-Net hybrid: %d grey walls + %d colour walls = %d merged "
-                "(opening path: %s)",
-                base_name, len(grey_walls), len(color_walls_deduped), len(merged_walls),
-                "U-Net only" if used_unet_grey else "gap+U-Net",
-            )
-            _ran_unet_path = True
-
-        if not _ran_unet_path:
+        if not used_unet_grey:
             # ── Stage 1 (fallback): colour-based wall detection ──────────
             _notify("detecting walls")
             logger.info("[%s] Stage 1: Colour-based wall detection", base_name)
