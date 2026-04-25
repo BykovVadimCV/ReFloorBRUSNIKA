@@ -378,21 +378,32 @@ def _cluster_segments(segs: List[dict], cluster_tol: float,
 
 
 def _find_deskew_angle(clusters: List[dict],
-                       perp_tol: float = PERP_TOL_DEG) -> Optional[float]:
+                       perp_tol: float = PERP_TOL_DEG,
+                       min_angle_deg: float = 3.0) -> Optional[float]:
     """
     Find the correction angle that aligns the two most dominant clusters with
-    H/V axes.  Returns None when the dominant pair is not ~perpendicular.
+    H/V axes.  Returns None when:
+      - fewer than 2 clusters
+      - dominant cluster is already axis-aligned  (image already deskewed)
+      - the two dominant clusters are not ~perpendicular
+      - the computed correction is smaller than min_angle_deg
     """
     if len(clusters) < 2:
         return None
-    ranked          = sorted(clusters, key=lambda c: c['total_length'], reverse=True)
-    primary_angle   = ranked[0]['cluster_angle']
+    ranked  = sorted(clusters, key=lambda c: c['total_length'], reverse=True)
+    primary = ranked[0]
+
+    # If the dominant cluster is already H/V, the image is aligned — no correction.
+    if not primary['is_diagonal']:
+        return None
+
     secondary_angle = ranked[1]['cluster_angle']
-    apart = _angle_dist(primary_angle, secondary_angle)
+    apart = _angle_dist(primary['cluster_angle'], secondary_angle)
     if abs(apart - 90.0) > perp_tol:
         return None
-    dev = primary_angle % 90.0
-    return -dev if dev <= 45.0 else (90.0 - dev)
+    dev = primary['cluster_angle'] % 90.0
+    correction = -dev if dev <= 45.0 else (90.0 - dev)
+    return correction if abs(correction) >= min_angle_deg else None
 
 
 def _deskew(img: np.ndarray,
@@ -755,21 +766,48 @@ def detect_diagonal_walls(
         deskew_angle if deskew_angle is not None else 0.0,
     )
 
-    # ── Fallback: no dominant perpendicular pair ──────────────────────────────
+    # ── Fallback: image already aligned, or no dominant perpendicular pair ──────
+    # This fires when (a) deskew_angle is None (no perpendicular pair detected),
+    # OR (b) the dominant cluster is already axis-aligned (image was pre-deskewed
+    # by Stage 1c before this call).  In both cases we just find the diagonal
+    # segments that are genuinely present in the current image and process them
+    # via sub-region rotation for clean wall boundaries.
     if deskew_angle is None:
         results: List[WallSegment] = []
-        for seg in segs:
-            if not seg['is_diagonal']:
+        for cluster in clusters:
+            if not cluster['is_diagonal']:
                 continue
-            bbox = (min(seg['x1'], seg['x2']), min(seg['y1'], seg['y2']),
-                    max(seg['x1'], seg['x2']), max(seg['y1'], seg['y2']))
-            if _overlaps_existing(bbox, existing_walls):
-                continue
-            x1r, y1r, x2r, y2r = _refine_endpoints(
-                seg['x1'], seg['y1'], seg['x2'], seg['y2'], existing_walls)
-            results.append(_make_wall_segment(x1r, y1r, x2r, y2r, seg['width']))
-        logger.info("[diagonal] Fallback: %d diagonal walls (no perpendicular pair)",
-                    len(results))
+            if cluster['total_length'] >= DIAG_CLUSTER_MIN_LEN:
+                # Large cluster: rotate sub-region so diagonal → 0°, detect H/V there
+                sub_walls = _process_diagonal_cluster(
+                    img, cluster, SUBREGION_PADDING, axis_tolerance_deg)
+                for sw in sub_walls:
+                    bbox = (min(sw['p1'][0], sw['p2'][0]),
+                            min(sw['p1'][1], sw['p2'][1]),
+                            max(sw['p1'][0], sw['p2'][0]),
+                            max(sw['p1'][1], sw['p2'][1]))
+                    if _overlaps_existing(bbox, existing_walls):
+                        continue
+                    ox1r, oy1r, ox2r, oy2r = _refine_endpoints(
+                        sw['p1'][0], sw['p1'][1],
+                        sw['p2'][0], sw['p2'][1], existing_walls)
+                    results.append(_make_wall_segment(
+                        ox1r, oy1r, ox2r, oy2r, sw['thickness']))
+            else:
+                # Small cluster: return the raw LSD segments directly
+                for seg in cluster['members']:
+                    bbox = (min(seg['x1'], seg['x2']), min(seg['y1'], seg['y2']),
+                            max(seg['x1'], seg['x2']), max(seg['y1'], seg['y2']))
+                    if _overlaps_existing(bbox, existing_walls):
+                        continue
+                    ox1r, oy1r, ox2r, oy2r = _refine_endpoints(
+                        seg['x1'], seg['y1'], seg['x2'], seg['y2'], existing_walls)
+                    results.append(_make_wall_segment(
+                        ox1r, oy1r, ox2r, oy2r, seg['width']))
+        logger.info(
+            "[diagonal] Fallback: %d diagonal walls (%d clusters processed)",
+            len(results), sum(1 for c in clusters if c['is_diagonal']),
+        )
         return results
 
     # ── Phase 2: deskewed image ───────────────────────────────────────────────
