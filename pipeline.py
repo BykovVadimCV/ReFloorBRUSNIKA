@@ -1385,12 +1385,78 @@ class FloorplanPipeline:
             result.wall_mask = detection.wall_mask
             result.outline_mask = detection.outline_mask
 
-        # ── Stage 1c: Diagonal wall detection ────────────────────────────
+        # ── Stage 1c: Diagonal deskew + wall re-detection ────────────────
         # LSD is unreliable on synthetic grey-fill images (hollow-wall path),
         # so we only run this on the normal solid-colour pipeline.
         if not used_unet_grey:
             try:
-                from detection.diagonal import detect_diagonal_walls
+                from detection.diagonal import (
+                    compute_deskew,
+                    detect_diagonal_walls,
+                    transform_ocr_labels,
+                )
+
+                deskew_angle, deskew_M, img_deskewed = compute_deskew(
+                    img=img,
+                    wall_mask=result.wall_mask,
+                )
+
+                if deskew_angle is not None:
+                    # ── Physical deskew: save → re-read → replace working image ──
+                    deskew_path = os.path.join(
+                        output_dir, f"{base_name}_deskewed.png")
+                    cv2.imwrite(deskew_path, img_deskewed)
+                    logger.info("[%s] Stage 1c: deskewed %.3f deg → %s",
+                                base_name, deskew_angle, deskew_path)
+
+                    img_deskewed = cv2.imread(deskew_path)
+                    if img_deskewed is None:
+                        raise RuntimeError(
+                            f"Failed to re-read deskewed image: {deskew_path}")
+
+                    # Transform OCR labels collected in the pre-stage to
+                    # deskewed coordinate space (no second OCR call needed)
+                    if ocr_text_labels_early:
+                        ocr_text_labels_early = transform_ocr_labels(
+                            ocr_text_labels_early, deskew_M)
+                        logger.info(
+                            "[%s] Stage 1c: transformed %d OCR labels to "
+                            "deskewed coords",
+                            base_name, len(ocr_text_labels_early))
+
+                    # Replace the working image for all subsequent stages
+                    img = img_deskewed
+
+                    # Build a clean (text-erased) version of the deskewed image
+                    # for wall detection — mirrors the pre-stage erasure logic
+                    img_clean_desk = img.copy()
+                    H_d, W_d = img_clean_desk.shape[:2]
+                    _pad = 3
+                    for _item in (ocr_text_labels_early or []):
+                        if len(_item) >= 5:
+                            _x1 = max(0,   int(_item[1]) - _pad)
+                            _y1 = max(0,   int(_item[2]) - _pad)
+                            _x2 = min(W_d, int(_item[3]) + _pad)
+                            _y2 = min(H_d, int(_item[4]) + _pad)
+                            cv2.rectangle(img_clean_desk,
+                                          (_x1, _y1), (_x2, _y2),
+                                          (255, 255, 255), -1)
+
+                    # Re-run Stage 1 on the deskewed image — former diagonal
+                    # walls are now H/V and will be detected normally
+                    _notify("re-detecting walls on deskewed image")
+                    logger.info("[%s] Stage 1c: re-running wall detection on "
+                                "deskewed image", base_name)
+                    detection_desk, _ = self._run_wall_detection(img_clean_desk)
+                    del img_clean_desk
+                    result.walls        = detection_desk.walls
+                    result.wall_mask    = detection_desk.wall_mask
+                    result.outline_mask = detection_desk.outline_mask
+                    logger.info("[%s] Stage 1c: %d walls on deskewed image",
+                                base_name, len(result.walls))
+
+                # Detect any diagonal walls remaining on the (possibly deskewed)
+                # image — catches walls at angles other than the primary one
                 diag_walls = detect_diagonal_walls(
                     img=img,
                     config=self.config,
@@ -1400,16 +1466,19 @@ class FloorplanPipeline:
                 if diag_walls:
                     result.walls = result.walls + diag_walls
                     logger.info(
-                        "[%s] Stage 1c: added %d diagonal walls",
+                        "[%s] Stage 1c: added %d residual diagonal walls",
                         base_name, len(diag_walls),
                     )
                 else:
-                    logger.debug("[%s] Stage 1c: no diagonal walls found", base_name)
+                    logger.debug("[%s] Stage 1c: no residual diagonal walls",
+                                 base_name)
+
             except Exception as _diag_exc:
                 logger.warning(
-                    "[%s] Diagonal wall detection failed (non-fatal): %s",
+                    "[%s] Stage 1c failed (non-fatal): %s",
                     base_name, _diag_exc,
                 )
+                logger.debug("Stage 1c traceback:", exc_info=True)
 
         # ── Stage 2: Opening Detection (UNIFIED: gap + U-Net with deduplication) ─────
         _notify("detecting openings")

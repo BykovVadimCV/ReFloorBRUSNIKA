@@ -590,7 +590,95 @@ def _make_wall_segment(x1: float, y1: float,
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Public API — deskew helpers
+# ---------------------------------------------------------------------------
+
+def compute_deskew(
+    img: np.ndarray,
+    wall_mask: Optional[np.ndarray] = None,
+    min_length_px: float = MIN_LENGTH_PX,
+    axis_tolerance_deg: float = AXIS_TOLERANCE_DEG,
+    min_angle_deg: float = 3.0,
+) -> Tuple[Optional[float], Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Run Phase 1 analysis and return the deskew correction.
+
+    Uses LSD clustering to find the dominant perpendicular axis pair and
+    computes the angle needed to align them with H/V.
+
+    Returns
+    -------
+    (angle_deg, M_2x3, img_deskewed)
+        angle_deg    : correction angle in degrees (CCW positive)
+        M_2x3        : 2×3 affine matrix used for the rotation
+        img_deskewed : rotated BGR image
+    If no significant correction is needed, all three values are None.
+    """
+    gray       = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    H, W       = img.shape[:2]
+    image_area = float(H * W)
+
+    wall_mask_bin: Optional[np.ndarray] = (
+        (wall_mask > 0).astype(np.uint8) if wall_mask is not None else None
+    )
+
+    # LSD + frame-border filter
+    segs = _run_lsd(gray, min_length_px, axis_tolerance_deg)
+    segs = [
+        s for s in segs
+        if (max(s['x1'], s['x2']) - min(s['x1'], s['x2'])) *
+           (max(s['y1'], s['y2']) - min(s['y1'], s['y2']))
+           <= MAX_AREA_FRACTION * image_area
+    ]
+
+    # Wall-mask filter (skip colour fallback — we just need a deskew angle)
+    if wall_mask_bin is not None:
+        segs = _filter_by_mask(segs, wall_mask_bin)
+
+    # OCR text filter
+    text_boxes = _detect_ocr_boxes(img)
+    if text_boxes:
+        segs = _filter_by_text(segs, _build_text_mask(H, W, text_boxes))
+
+    # Cluster → dominant perpendicular pair → correction angle
+    clusters = _cluster_segments(segs, CLUSTER_TOL_DEG, axis_tolerance_deg)
+    angle    = _find_deskew_angle(clusters)
+
+    if angle is None or abs(angle) < min_angle_deg:
+        logger.debug("[diagonal] compute_deskew: no significant correction (%.2f deg)",
+                     angle if angle is not None else 0.0)
+        return None, None, None
+
+    img_desk, M, _ = _deskew(img, angle)
+    logger.info("[diagonal] compute_deskew: angle=%.3f deg", angle)
+    return angle, M, img_desk
+
+
+def transform_ocr_labels(
+    labels: List[Tuple],
+    M: np.ndarray,
+) -> List[Tuple]:
+    """
+    Transform pipeline OCR labels through an affine matrix.
+
+    Pipeline OCR label format: (text, x1, y1, x2, y2).
+    All four bbox corners are transformed; result is their AABB.
+    Labels with fewer than 5 elements are passed through unchanged.
+    """
+    result = []
+    for item in labels:
+        if len(item) >= 5:
+            # repack to (x1, y1, x2, y2, text) — format expected by _transform_boxes
+            box = (int(item[1]), int(item[2]), int(item[3]), int(item[4])) + tuple(item[5:])
+            tc  = _transform_boxes([box], M)[0]   # (nx1, ny1, nx2, ny2, text, ...)
+            result.append((item[0], tc[0], tc[1], tc[2], tc[3]) + tc[4:])
+        else:
+            result.append(item)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Public API — wall detection
 # ---------------------------------------------------------------------------
 
 def detect_diagonal_walls(
