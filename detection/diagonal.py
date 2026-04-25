@@ -610,12 +610,21 @@ def compute_deskew(
     min_length_px: float = MIN_LENGTH_PX,
     axis_tolerance_deg: float = AXIS_TOLERANCE_DEG,
     min_angle_deg: float = 3.0,
+    text_boxes: Optional[List[Tuple]] = None,
 ) -> Tuple[Optional[float], Optional[np.ndarray], Optional[np.ndarray]]:
     """
     Run Phase 1 analysis and return the deskew correction.
 
     Uses LSD clustering to find the dominant perpendicular axis pair and
     computes the angle needed to align them with H/V.
+
+    Parameters
+    ----------
+    text_boxes : optional list of (x1, y1, x2, y2, ...) in image coords
+        Pre-computed text bounding boxes used to filter out OCR-noise
+        segments.  When provided, docTR is NOT invoked here (saves one
+        full OCR pass when the caller already has labels).  Items may
+        also be (text, x1, y1, x2, y2) — both formats are accepted.
 
     Returns
     -------
@@ -646,10 +655,27 @@ def compute_deskew(
     if wall_mask_bin is not None:
         segs = _filter_by_mask(segs, wall_mask_bin)
 
-    # OCR text filter
-    text_boxes = _detect_ocr_boxes(img)
-    if text_boxes:
-        segs = _filter_by_text(segs, _build_text_mask(H, W, text_boxes))
+    # OCR text filter — use caller-supplied boxes if any, else run docTR
+    if text_boxes is not None:
+        norm_boxes: List[Tuple] = []
+        for item in text_boxes:
+            if len(item) < 4:
+                continue
+            # Accept both (x1,y1,x2,y2,...) and (text,x1,y1,x2,y2,...)
+            if isinstance(item[0], (int, float)) or (
+                hasattr(item[0], '__int__') and not isinstance(item[0], str)
+            ):
+                norm_boxes.append((int(item[0]), int(item[1]),
+                                   int(item[2]), int(item[3])))
+            elif len(item) >= 5:
+                norm_boxes.append((int(item[1]), int(item[2]),
+                                   int(item[3]), int(item[4])))
+        if norm_boxes:
+            segs = _filter_by_text(segs, _build_text_mask(H, W, norm_boxes))
+    else:
+        ocr_boxes = _detect_ocr_boxes(img)
+        if ocr_boxes:
+            segs = _filter_by_text(segs, _build_text_mask(H, W, ocr_boxes))
 
     # Cluster → dominant perpendicular pair → correction angle
     clusters = _cluster_segments(segs, CLUSTER_TOL_DEG, axis_tolerance_deg)

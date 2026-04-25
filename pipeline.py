@@ -242,12 +242,21 @@ def _calibrate_scale_from_wall_lengths(
     rotated_labels: List[Tuple],
     max_dist: float = 80.0,
     debug_dir: Optional[str] = None,
+    rotated_labels_in_image_coords: bool = False,
 ) -> Optional[float]:
     """Match rotated wall-length labels to walls and compute pixels_to_cm.
 
     Receives pre-collected OCR labels from both orientations (collected
     in the pre-stage before wall detection).  Filters to NEW numerical
     labels only, un-rotates coordinates, and matches to walls.
+
+    Parameters
+    ----------
+    rotated_labels_in_image_coords : bool
+        When True, ``rotated_labels`` bboxes are already in current image
+        coords (caller has un-rotated them) — use bbox centre directly.
+        When False (legacy), bboxes are in 90° CW rotated-image coords —
+        un-rotate using image height ``h``.
     """
     h, w = img.shape[:2]
 
@@ -274,13 +283,18 @@ def _calibrate_scale_from_wall_lengths(
         if round(val, 2) in existing_nums:
             continue
 
-        # Un-rotate: CW-rotated coords (rx, ry) -> original (ox, oy)
-        # CW rotation: original (ox, oy) -> rotated (h-1-oy, ox)
-        # Inverse:     rotated (rx, ry) -> original (ry, h-1-rx)
-        rcx = (rx1 + rx2) / 2.0
-        rcy = (ry1 + ry2) / 2.0
-        ox = rcy
-        oy = h - 1 - rcx
+        if rotated_labels_in_image_coords:
+            # Already in image coords — bbox centre is the label position
+            ox = (rx1 + rx2) / 2.0
+            oy = (ry1 + ry2) / 2.0
+        else:
+            # Un-rotate: CW-rotated coords (rx, ry) -> original (ox, oy)
+            # CW rotation: original (ox, oy) -> rotated (h-1-oy, ox)
+            # Inverse:     rotated (rx, ry) -> original (ry, h-1-rx)
+            rcx = (rx1 + rx2) / 2.0
+            rcy = (ry1 + ry2) / 2.0
+            ox = rcy
+            oy = h - 1 - rcx
         new_labels.append((val, ox, oy))
 
     if not new_labels:
@@ -1205,79 +1219,40 @@ class FloorplanPipeline:
         # ── Pre-stage 0b: Deskew — snap lines to X/Y axis ─────────────
         img = _deskew_image(img)
 
-        # ── Pre-stage 0c: Large diagonal deskew ──────────────────────
-        # Uses LSD clustering to detect dominant perpendicular axis pairs
-        # and corrects angles larger than ~3° (scanner-tilt was already
-        # handled above).  This replaces img so that EVERY subsequent
-        # stage — OCR erasure, UNet, wall detection, opening detection,
-        # scale calibration and export — operates on the aligned image.
-        try:
-            from detection.diagonal import compute_deskew as _compute_deskew
-            _diag_angle, _diag_M, _img_diag = _compute_deskew(img)
-            if _diag_angle is not None:
-                _deskew_out = os.path.join(
-                    output_dir, f"{base_name}_deskewed.png")
-                cv2.imwrite(_deskew_out, _img_diag)
-                logger.info(
-                    "[%s] Pre-stage 0c: diagonal deskew %.3f deg → %s",
-                    base_name, _diag_angle, _deskew_out,
-                )
-                _img_reread = cv2.imread(_deskew_out)
-                if _img_reread is not None:
-                    img = _img_reread
-                    logger.info(
-                        "[%s] Pre-stage 0c: working image replaced "
-                        "(%dx%d px)",
-                        base_name, img.shape[1], img.shape[0],
-                    )
-                else:
-                    logger.warning(
-                        "[%s] Pre-stage 0c: could not re-read deskewed "
-                        "image, continuing with original",
-                        base_name,
-                    )
-        except Exception as _deskew_exc:
-            logger.warning(
-                "[%s] Pre-stage 0c diagonal deskew failed (non-fatal): %s",
-                base_name, _deskew_exc,
-            )
-            logger.debug("Pre-stage 0c traceback:", exc_info=True)
-
-        # ── Pre-stage: OCR text erasure before wall detection ─────────
-        # Run OCR in both orientations, collect ALL text bboxes, then
-        # erase them from the image so text doesn't pollute wall detection.
+        # ── Pre-stage 0c: OCR + diagonal deskew ──────────────────────
+        # 1) Read OCR labels (normal + 90° CW) on the current image.
+        # 2) Compute deskew angle via LSD clustering.
+        # 3) If a tilt is found:
+        #      - back the original input file up to <input_dir>/originals/
+        #      - overwrite the input file with the deskewed image
+        #      - replace `img` with the deskewed version
+        #      - transform OCR labels through M into deskewed coords
+        #    Otherwise: run a regular pipeline with no diagonal.py
+        #    intervention.  In either case the OCR labels collected here
+        #    are reused for text erasure and downstream stages — no
+        #    second OCR pass.
         _notify("OCR text collection")
-        logger.info("[%s] Pre-stage: OCR text collection & erasure", base_name)
+        logger.info(
+            "[%s] Pre-stage 0c: OCR text collection (both orientations)",
+            base_name,
+        )
 
-        # Normal orientation OCR
-        ocr_text_labels_early = self._get_ocr_text_labels(img)
+        # Normal-orientation OCR on the current (pre-deskew) image
+        ocr_text_labels_early = self._get_ocr_text_labels(img) or []
 
-        # Rotated (CW) OCR — detect vertical wall-length labels
-        # Build img_clean (single copy) — erase normal-OCR bboxes, then
-        # rotate for vertical label OCR, then erase rotated bboxes too.
-        # This replaces two separate img.copy() calls with one.
+        # Rotated 90° CW OCR — picks up vertical wall-length labels.
+        # Un-rotate the bboxes so all OCR labels are in current-image
+        # coords; this lets us transform them through M just once below.
         h_img, w_img = img.shape[:2]
-        img_clean = img.copy()
-        pad = 3
-        for item in (ocr_text_labels_early or []):
-            if len(item) < 5:
-                continue
-            rx1, ry1 = int(item[1]), int(item[2])
-            rx2, ry2 = int(item[3]), int(item[4])
-            cv2.rectangle(img_clean,
-                          (max(0, rx1 - pad), max(0, ry1 - pad)),
-                          (min(w_img, rx2 + pad), min(h_img, ry2 + pad)),
-                          (255, 255, 255), -1)
-        # Rotate the already-erased image for vertical label detection
-        rotated_img = cv2.rotate(img_clean, cv2.ROTATE_90_CLOCKWISE)
-        rotated_ocr_labels = self._get_ocr_text_labels(rotated_img)
-        del rotated_img   # free ~75MB
+        rotated_img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+        _rotated_raw = self._get_ocr_text_labels(rotated_img) or []
+        del rotated_img  # ~75 MB
 
-        # Un-rotate rotated bbox coords back to original image space
-        rotated_bboxes_orig = []  # (x1, y1, x2, y2) in original coords
-        for item in (rotated_ocr_labels or []):
+        rotated_ocr_labels: List[Tuple] = []
+        for item in _rotated_raw:
             if len(item) < 5:
                 continue
+            text = item[0]
             rx1, ry1 = int(item[1]), int(item[2])
             rx2, ry2 = int(item[3]), int(item[4])
             # CW inverse: rotated (rx, ry) -> original (ry, h-1-rx)
@@ -1285,19 +1260,115 @@ class FloorplanPipeline:
             oy1 = h_img - 1 - max(rx1, rx2)
             ox2 = max(ry1, ry2)
             oy2 = h_img - 1 - min(rx1, rx2)
-            rotated_bboxes_orig.append((ox1, oy1, ox2, oy2))
+            rotated_ocr_labels.append((text, ox1, oy1, ox2, oy2))
 
-        # Erase rotated text regions on img_clean too
-        for (ox1, oy1, ox2, oy2) in rotated_bboxes_orig:
-            cv2.rectangle(img_clean,
-                          (max(0, ox1 - pad), max(0, oy1 - pad)),
-                          (min(w_img, ox2 + pad), min(h_img, oy2 + pad)),
-                          (255, 255, 255), -1)
+        logger.info(
+            "[%s] OCR collected: %d normal + %d rotated labels",
+            base_name,
+            len(ocr_text_labels_early),
+            len(rotated_ocr_labels),
+        )
 
-        n_erased = len([i for i in (ocr_text_labels_early or []) if len(i) >= 5])
-        n_erased += len(rotated_bboxes_orig)
-        logger.info("[%s] Erased %d text regions before wall detection",
-                    base_name, n_erased)
+        # Deskew: LSD clustering, reusing the OCR labels we already have.
+        try:
+            from detection.diagonal import (
+                compute_deskew as _compute_deskew,
+                transform_ocr_labels as _transform_ocr_labels,
+            )
+            # Pass both label sets as text boxes so the LSD text-filter
+            # ignores noise from labels printed in either orientation.
+            _all_text_for_deskew = list(ocr_text_labels_early) + list(rotated_ocr_labels)
+            _diag_angle, _diag_M, _img_diag = _compute_deskew(
+                img, text_boxes=_all_text_for_deskew or None,
+            )
+
+            if (_diag_angle is not None and _diag_M is not None
+                    and _img_diag is not None):
+                # Backup original to <input_dir>/originals/<filename>
+                input_dir = os.path.dirname(image_path) or "."
+                backup_dir = os.path.join(input_dir, "originals")
+                try:
+                    os.makedirs(backup_dir, exist_ok=True)
+                    backup_path = os.path.join(
+                        backup_dir, os.path.basename(image_path))
+                    import shutil
+                    shutil.copy2(image_path, backup_path)
+                    logger.info(
+                        "[%s] Original backed up: %s",
+                        base_name, backup_path,
+                    )
+                except Exception as _bx:
+                    logger.warning(
+                        "[%s] Could not back up original (%s) — "
+                        "continuing without backup", base_name, _bx,
+                    )
+
+                # Overwrite the input file on disk with the deskewed image
+                cv2.imwrite(image_path, _img_diag)
+                logger.info(
+                    "[%s] Pre-stage 0c: deskewed by %.3f deg → "
+                    "overwrote %s",
+                    base_name, _diag_angle, image_path,
+                )
+
+                # Re-read so working `img` matches what's on disk
+                _img_reread = cv2.imread(image_path)
+                img = _img_reread if _img_reread is not None else _img_diag
+                h_img, w_img = img.shape[:2]
+
+                # Transform both OCR label sets into deskewed coords
+                ocr_text_labels_early = _transform_ocr_labels(
+                    ocr_text_labels_early, _diag_M)
+                rotated_ocr_labels = _transform_ocr_labels(
+                    rotated_ocr_labels, _diag_M)
+
+                logger.info(
+                    "[%s] Pre-stage 0c: OCR labels transformed into "
+                    "deskewed coords (%dx%d px)",
+                    base_name, w_img, h_img,
+                )
+            else:
+                logger.info(
+                    "[%s] Pre-stage 0c: no significant tilt detected "
+                    "— regular pipeline", base_name,
+                )
+        except Exception as _deskew_exc:
+            logger.warning(
+                "[%s] Pre-stage 0c diagonal deskew failed "
+                "(non-fatal): %s", base_name, _deskew_exc,
+            )
+            logger.debug("Pre-stage 0c traceback:", exc_info=True)
+
+        # ── Pre-stage: text erasure (uses the OCR labels above) ───────
+        # Erase every collected text region from a copy of `img` so
+        # that text doesn't pollute wall detection.  No re-OCR.
+        logger.info(
+            "[%s] Pre-stage: text erasure (using pre-collected labels)",
+            base_name,
+        )
+        img_clean = img.copy()
+        pad = 3
+        for _src in (ocr_text_labels_early, rotated_ocr_labels):
+            for item in _src:
+                if len(item) < 5:
+                    continue
+                rx1, ry1 = int(item[1]), int(item[2])
+                rx2, ry2 = int(item[3]), int(item[4])
+                cv2.rectangle(
+                    img_clean,
+                    (max(0, rx1 - pad), max(0, ry1 - pad)),
+                    (min(w_img, rx2 + pad), min(h_img, ry2 + pad)),
+                    (255, 255, 255), -1,
+                )
+
+        n_erased = (
+            len([i for i in ocr_text_labels_early if len(i) >= 5])
+            + len([i for i in rotated_ocr_labels if len(i) >= 5])
+        )
+        logger.info(
+            "[%s] Erased %d text regions before wall detection",
+            base_name, n_erased,
+        )
 
         # ── Stage 0: Try U-Net → wall mask + door/window bboxes ─────────
         _notify("U-Net detection")
@@ -1458,7 +1529,17 @@ class FloorplanPipeline:
         _notify("detecting openings")
         logger.info("[%s] Stage 2: Opening detection (gap priority + U-Net supplement)", base_name)
 
-        ocr_bboxes = self._get_ocr_bboxes(img)
+        # Build ocr_bboxes from the labels collected pre-deskew
+        # (no second OCR pass).  Format: list of (x1, y1, x2, y2).
+        ocr_bboxes = []
+        for _src in (ocr_text_labels_early, rotated_ocr_labels):
+            for item in _src:
+                if len(item) < 5:
+                    continue
+                ocr_bboxes.append((
+                    int(item[1]), int(item[2]),
+                    int(item[3]), int(item[4]),
+                ))
 
         # ALWAYS run traditional gap/algorithmic + YOLO detection (gap doors take priority)
         yolo_results = None
@@ -1577,6 +1658,7 @@ class FloorplanPipeline:
             normal_labels=ocr_text_labels,
             rotated_labels=rotated_ocr_labels,
             debug_dir=output_dir,
+            rotated_labels_in_image_coords=True,
         )
         if wl_ptcm is not None and 0.1 < wl_ptcm < 20.0:
             logger.info("[%s] Wall-length calibration: pixels_to_cm %.4f -> %.4f",

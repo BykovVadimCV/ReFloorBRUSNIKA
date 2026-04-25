@@ -865,10 +865,12 @@ class AlgorithmicDoorArcDetector:
                 final_roi[ry1:ry2, rx1:rx2] = 255
                 has_any_roi = True
 
-            # Graceful fallback: if no ROIs at all, use entire image
+            # No YOLO doors or gaps → nothing to scan; leave final_roi all-zero
+            # so that subsequent stages find zero contours and return immediately.
+            # (Previously this fell back to scanning the full image, which caused
+            # OOM on large architectural drawings with thousands of contours.)
             if not has_any_roi:
-                logger.warning("No YOLO doors or gaps provided – scanning full image")
-                final_roi[:] = 255
+                logger.debug("No YOLO doors or gaps provided – skipping arc scan")
 
         # Apply ROI mask
         clean_bw = cv2.bitwise_and(binary, final_roi)
