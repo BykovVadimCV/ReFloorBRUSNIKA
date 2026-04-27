@@ -18,7 +18,9 @@ What this module does, in order, on the input image:
 6. LSD on the text-erased image, filtered to segments whose oriented
    quad sufficiently overlaps the wall mask.
 7. Greedy length-weighted angle clustering on those segments.
-8. Pick the longest two perpendicular clusters → deskew correction.
+8. Pick correction angle from axis-aligned clusters (weighted mean
+   deviation from nearest H/V axis); fall back to diagonal-cluster
+   geometry if no axis-aligned clusters exist.
 9. Rotate image, U-Net masks, and OCR labels through the same affine
    matrix M.
 10. Re-cluster on the deskewed image and find clusters that are STILL
@@ -232,8 +234,7 @@ def _transform_pts(M: np.ndarray, pts: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Cropping & small-skew (vendored copies of pipeline.py helpers, so this
-# module can preprocess without importing pipeline.py)
+# Cropping & small-skew
 # ---------------------------------------------------------------------------
 
 def _crop_to_floorplan(img: np.ndarray,
@@ -286,8 +287,7 @@ def _small_skew_correct(img: np.ndarray, max_angle: float = 5.0) -> np.ndarray:
     angles: List[float] = []
     for x1, y1, x2, y2 in lines[:, 0]:
         a = math.degrees(math.atan2(y2 - y1, x2 - x1))
-        a = ((a + 90.0) % 180.0) - 90.0   # fold to (-90, 90]
-        # only horizontal-ish lines for skew estimation
+        a = ((a + 90.0) % 180.0) - 90.0
         if abs(a) <= max_angle:
             angles.append(a)
     if len(angles) < 5:
@@ -395,6 +395,35 @@ def _cluster_segments(segs: List[Dict],
     return sorted(out, key=lambda c: c['cluster_angle'])
 
 
+def _correction_angle_from_axis_clusters(
+    clusters: List[Dict],
+    axis_tol: float = AXIS_TOL_DEG,
+) -> Optional[float]:
+    """
+    Compute a length-weighted mean correction angle from axis-aligned clusters.
+
+    For each axis-aligned cluster, measures its signed deviation from the
+    nearest cardinal axis (0° / 90°) and weights it by total_length.
+    Returns the angle (degrees) to rotate the image so those walls become
+    perfectly H/V, or None if no axis-aligned clusters exist.
+    """
+    axis_clusters = [c for c in clusters if not c['is_diagonal']]
+    if not axis_clusters:
+        return None
+
+    total_weight = 0.0
+    weighted_dev = 0.0
+    for c in axis_clusters:
+        angle  = c['cluster_angle']
+        weight = c['total_length']
+        mod = angle % 90.0
+        dev = mod - 90.0 if mod > 45.0 else mod
+        weighted_dev += dev * weight
+        total_weight += weight
+
+    return weighted_dev / total_weight if total_weight > 0.0 else None
+
+
 def _find_deskew_angle(clusters: List[Dict],
                        perp_tol: float = PERP_TOL_DEG,
                        min_angle: float = MIN_DESKEW_DEG) -> Optional[float]:
@@ -478,15 +507,6 @@ def _paint_diagonal_clusters(
     Paint each diagonal cluster's wall / window / door region as a filled
     grey quadrilateral on `img`, in place.
 
-    Approach (per cluster):
-      1. AABB of all member segment endpoints, padded.
-      2. Crop pred_mask at that bbox.
-      3. Rotate the crop by -cluster_angle (so the cluster runs ~horizontal).
-      4. For wall/window/door classes, find connected components on the
-         rotated mask; for each, take its axis-aligned bbox in the rotated
-         frame, inverse-rotate the four corners, translate to image
-         coords, and fill the resulting quadrilateral with grey.
-
     Returns the number of quads painted.
     """
     if pred_mask is None or img is None or not clusters:
@@ -502,7 +522,6 @@ def _paint_diagonal_clusters(
         if not members:
             continue
 
-        # 1. AABB of all member endpoints, padded
         xs: List[float] = []
         ys: List[float] = []
         for s in members:
@@ -515,14 +534,9 @@ def _paint_diagonal_clusters(
         if bx2 - bx1 < 4 or by2 - by1 < 4:
             continue
 
-        # 2. Crop pred_mask at bbox
         crop = pred_mask[by1:by2, bx1:bx2]
         ch, cw = crop.shape[:2]
 
-        # 3. Rotate so cluster_angle → 0°.
-        # cluster_angle is in [0, 180); we want to rotate the crop CCW by
-        # `-cluster_angle` (i.e., warpAffine uses CCW positive). The wall
-        # then runs roughly along the x-axis in the rotated frame.
         rot_angle = float(cluster['cluster_angle'])
         cx, cy = cw / 2.0, ch / 2.0
         Mr = cv2.getRotationMatrix2D((cx, cy), rot_angle, 1.0)
@@ -537,7 +551,6 @@ def _paint_diagonal_clusters(
                               borderMode=cv2.BORDER_CONSTANT, borderValue=0)
         Mr_inv = cv2.invertAffineTransform(Mr)
 
-        # 4. Connected components per class, paint each axis-aligned bbox
         for cls in DIAG_CLASSES:
             class_mask = (rot == cls).astype(np.uint8)
             if class_mask.sum() == 0:
@@ -668,12 +681,21 @@ def preprocess_floorplan(
     logger.info("[diagonal:%s] LSD: %d wall-aligned segs in %d clusters",
                 base, len(segs), len(clusters))
 
-    # 8. Deskew angle
-    deskew = _find_deskew_angle(clusters)
+    # 8. Deskew angle — prefer axis-cluster deviation (precise and stable);
+    #    fall back to diagonal-cluster geometry only when no axis-aligned
+    #    clusters exist at all.
+    deskew = _correction_angle_from_axis_clusters(clusters)
+    angle_source = "axis clusters"
+    if deskew is None:
+        deskew = _find_deskew_angle(clusters)
+        angle_source = "diagonal clusters (fallback)"
+
+    if deskew is not None:
+        logger.info("[diagonal:%s] correction %.3f deg (from %s)",
+                    base, deskew, angle_source)
 
     if deskew is None:
-        # No tilt — the image is already aligned. Still need to scan for
-        # residual diagonals (bay windows, cut corners) to paint grey.
+        # No tilt detected — still scan for residual diagonals to paint.
         out_img = img.copy()
         n_painted = _paint_diagonal_clusters(out_img, pred_mask, clusters,
                                               grey=grey)
@@ -689,7 +711,7 @@ def preprocess_floorplan(
             "image_shape":        (out_img.shape[0], out_img.shape[1]),
         }
 
-    # 9. Deskew everything through M
+    # 9. Rotate everything through M
     img_desk, M, new_size = _rotate(img, deskew,
                                      border_value=(255, 255, 255),
                                      interp=cv2.INTER_LINEAR)
@@ -698,21 +720,22 @@ def preprocess_floorplan(
     normal_labels  = _transform_labels(normal_labels,  M)
     rotated_labels = _transform_labels(rotated_labels, M)
 
-    # 10. Find residual diagonals on the deskewed image
+    # 10. Find residual diagonals on the rotated image
     img_desk_clean = _erase_text(img_desk, [normal_labels, rotated_labels])
     gray_desk = cv2.cvtColor(img_desk_clean, cv2.COLOR_BGR2GRAY)
     segs_d = _run_lsd(gray_desk)
     segs_d = _filter_segments_by_mask(segs_d, wall_desk)
     clusters_d = _cluster_segments(segs_d)
 
-    # 11. Paint residual diagonals on the deskewed image
+    # 11. Paint residual diagonals on the rotated image
     n_painted = _paint_diagonal_clusters(img_desk, pred_desk, clusters_d,
                                           grey=grey)
 
     # 12. Save
     cv2.imwrite(out_path, img_desk)
-    logger.info("[diagonal:%s] deskewed by %.3f deg, %d diagonal patches painted → %s",
-                base, deskew, n_painted, out_path)
+    logger.info("[diagonal:%s] deskewed by %.3f deg (from %s), "
+                "%d diagonal patches painted → %s",
+                base, deskew, angle_source, n_painted, out_path)
 
     return {
         "deskewed_path":      out_path,
@@ -725,8 +748,7 @@ def preprocess_floorplan(
 
 
 # ---------------------------------------------------------------------------
-# Backward-compat shims (still imported by pipeline.py during the
-# transition).  The new code path is preprocess_floorplan().
+# Backward-compat shims
 # ---------------------------------------------------------------------------
 
 def compute_deskew(*args, **kwargs):   # pragma: no cover
