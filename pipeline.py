@@ -1205,143 +1205,71 @@ class FloorplanPipeline:
 
         result = PipelineResult()
 
-        # Load image
-        img = cv2.imread(image_path)
-        if img is None:
-            raise ValueError(f"Cannot load image: {image_path}")
-
-        # ── Pre-stage 0a: Auto-crop to floorplan extent ───────────────
-        # Finds the largest connected ink structure and trims whitespace /
-        # legend / title areas around it.  Runs before deskew so the
-        # rotation estimate is computed on the clean floorplan region only.
-        img = _crop_to_floorplan(img)
-
-        # ── Pre-stage 0b: Deskew — snap lines to X/Y axis ─────────────
-        img = _deskew_image(img)
-
-        # ── Pre-stage 0c: OCR + diagonal deskew ──────────────────────
-        # 1) Read OCR labels (normal + 90° CW) on the current image.
-        # 2) Compute deskew angle via LSD clustering.
-        # 3) If a tilt is found:
-        #      - back the original input file up to <input_dir>/originals/
-        #      - overwrite the input file with the deskewed image
-        #      - replace `img` with the deskewed version
-        #      - transform OCR labels through M into deskewed coords
-        #    Otherwise: run a regular pipeline with no diagonal.py
-        #    intervention.  In either case the OCR labels collected here
-        #    are reused for text erasure and downstream stages — no
-        #    second OCR pass.
-        _notify("OCR text collection")
-        logger.info(
-            "[%s] Pre-stage 0c: OCR text collection (both orientations)",
-            base_name,
-        )
-
-        # Normal-orientation OCR on the current (pre-deskew) image
-        ocr_text_labels_early = self._get_ocr_text_labels(img) or []
-
-        # Rotated 90° CW OCR — picks up vertical wall-length labels.
-        # Un-rotate the bboxes so all OCR labels are in current-image
-        # coords; this lets us transform them through M just once below.
-        h_img, w_img = img.shape[:2]
-        rotated_img = cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
-        _rotated_raw = self._get_ocr_text_labels(rotated_img) or []
-        del rotated_img  # ~75 MB
-
-        rotated_ocr_labels: List[Tuple] = []
-        for item in _rotated_raw:
-            if len(item) < 5:
-                continue
-            text = item[0]
-            rx1, ry1 = int(item[1]), int(item[2])
-            rx2, ry2 = int(item[3]), int(item[4])
-            # CW inverse: rotated (rx, ry) -> original (ry, h-1-rx)
-            ox1 = min(ry1, ry2)
-            oy1 = h_img - 1 - max(rx1, rx2)
-            ox2 = max(ry1, ry2)
-            oy2 = h_img - 1 - min(rx1, rx2)
-            rotated_ocr_labels.append((text, ox1, oy1, ox2, oy2))
-
-        logger.info(
-            "[%s] OCR collected: %d normal + %d rotated labels",
-            base_name,
-            len(ocr_text_labels_early),
-            len(rotated_ocr_labels),
-        )
-
-        # Deskew: LSD clustering, reusing the OCR labels we already have.
+        # ── Pre-stage 0: diagonal pre-processor ───────────────────────
+        # detection.diagonal.preprocess_floorplan is the single front
+        # door for everything that used to be Pre-stages 0a/0b/0c plus
+        # the text-erasure pre-stage:
+        #   • crop to the floorplan extent
+        #   • correct small scanner skew (≤5°)
+        #   • run docTR OCR (normal + 90° CW) and stash labels
+        #   • run U-Net once and use its wall mask to filter LSD
+        #   • cluster LSD angles → find the dominant axis pair
+        #   • if a tilt is found, deskew the image AND the OCR labels
+        #     through one shared affine matrix
+        #   • for any walls / windows / doors that are STILL diagonal on
+        #     the deskewed image, paint them as clean grey filled quads
+        #     so the rest of this pipeline only sees axis-aligned ink
+        #   • write the result to <input_dir>/deskewed/<basename>
+        #
+        # The pipeline below treats that file as its input image; it no
+        # longer runs OCR itself and no longer needs a Stage 1c diagonal
+        # detector — those concerns are baked into the pre-processed
+        # image.
+        _notify("diagonal pre-processor (OCR + U-Net + deskew + paint)")
         try:
-            from detection.diagonal import (
-                compute_deskew as _compute_deskew,
-                transform_ocr_labels as _transform_ocr_labels,
-            )
-            # Pass both label sets as text boxes so the LSD text-filter
-            # ignores noise from labels printed in either orientation.
-            _all_text_for_deskew = list(ocr_text_labels_early) + list(rotated_ocr_labels)
-            _diag_angle, _diag_M, _img_diag = _compute_deskew(
-                img, text_boxes=_all_text_for_deskew or None,
+            from detection.diagonal import preprocess_floorplan
+        except Exception as _imp_exc:
+            raise RuntimeError(
+                "detection.diagonal.preprocess_floorplan unavailable: "
+                f"{_imp_exc}"
             )
 
-            if (_diag_angle is not None and _diag_M is not None
-                    and _img_diag is not None):
-                # Backup original to <input_dir>/originals/<filename>
-                input_dir = os.path.dirname(image_path) or "."
-                backup_dir = os.path.join(input_dir, "originals")
-                try:
-                    os.makedirs(backup_dir, exist_ok=True)
-                    backup_path = os.path.join(
-                        backup_dir, os.path.basename(image_path))
-                    import shutil
-                    shutil.copy2(image_path, backup_path)
-                    logger.info(
-                        "[%s] Original backed up: %s",
-                        base_name, backup_path,
-                    )
-                except Exception as _bx:
-                    logger.warning(
-                        "[%s] Could not back up original (%s) — "
-                        "continuing without backup", base_name, _bx,
-                    )
+        unet_ckpt = getattr(self.config, 'unet_ckpt_path',
+                             'weights/epoch_040.pth')
+        diag_out_dir = os.path.join(
+            os.path.dirname(image_path) or ".", "deskewed")
+        diag = preprocess_floorplan(
+            image_path=image_path,
+            unet_ckpt_path=unet_ckpt,
+            output_dir=diag_out_dir,
+        )
 
-                # Overwrite the input file on disk with the deskewed image
-                cv2.imwrite(image_path, _img_diag)
-                logger.info(
-                    "[%s] Pre-stage 0c: deskewed by %.3f deg → "
-                    "overwrote %s",
-                    base_name, _diag_angle, image_path,
-                )
+        deskewed_path = diag["deskewed_path"]
+        ocr_text_labels_early = list(diag.get("normal_labels")  or [])
+        rotated_ocr_labels    = list(diag.get("rotated_labels") or [])
+        deskew_angle          = diag.get("deskew_angle")
+        n_diag_painted        = int(diag.get("n_diagonal_painted") or 0)
 
-                # Re-read so working `img` matches what's on disk
-                _img_reread = cv2.imread(image_path)
-                img = _img_reread if _img_reread is not None else _img_diag
-                h_img, w_img = img.shape[:2]
+        logger.info(
+            "[%s] Pre-stage 0: deskewed_path=%s deskew=%s "
+            "diagonals_painted=%d normal_labels=%d rotated_labels=%d",
+            base_name, deskewed_path,
+            f"{deskew_angle:.3f}deg" if deskew_angle is not None else "none",
+            n_diag_painted,
+            len(ocr_text_labels_early), len(rotated_ocr_labels),
+        )
 
-                # Transform both OCR label sets into deskewed coords
-                ocr_text_labels_early = _transform_ocr_labels(
-                    ocr_text_labels_early, _diag_M)
-                rotated_ocr_labels = _transform_ocr_labels(
-                    rotated_ocr_labels, _diag_M)
-
-                logger.info(
-                    "[%s] Pre-stage 0c: OCR labels transformed into "
-                    "deskewed coords (%dx%d px)",
-                    base_name, w_img, h_img,
-                )
-            else:
-                logger.info(
-                    "[%s] Pre-stage 0c: no significant tilt detected "
-                    "— regular pipeline", base_name,
-                )
-        except Exception as _deskew_exc:
-            logger.warning(
-                "[%s] Pre-stage 0c diagonal deskew failed "
-                "(non-fatal): %s", base_name, _deskew_exc,
-            )
-            logger.debug("Pre-stage 0c traceback:", exc_info=True)
+        # All downstream stages operate on the pre-processed image.
+        img = cv2.imread(deskewed_path)
+        if img is None:
+            raise ValueError(
+                f"Cannot load pre-processed image: {deskewed_path}")
+        h_img, w_img = img.shape[:2]
 
         # ── Pre-stage: text erasure (uses the OCR labels above) ───────
-        # Erase every collected text region from a copy of `img` so
-        # that text doesn't pollute wall detection.  No re-OCR.
+        # Erase every text region from a copy of `img` so that text
+        # doesn't pollute wall detection.  No OCR pass — labels come
+        # straight from the pre-processor.
         logger.info(
             "[%s] Pre-stage: text erasure (using pre-collected labels)",
             base_name,
@@ -1494,36 +1422,11 @@ class FloorplanPipeline:
             result.wall_mask = detection.wall_mask
             result.outline_mask = detection.outline_mask
 
-        # ── Stage 1c: Residual diagonal wall detection ───────────────────
-        # The image is already deskewed by Pre-stage 0c, so dominant H/V walls
-        # were captured by Stage 1.  This stage finds any remaining truly-diagonal
-        # segments (e.g. cut corners, bay-window walls at non-primary angles)
-        # via sub-region rotation.  LSD is unreliable on synthetic grey-fill
-        # images from the hollow-wall path, so we skip it there.
-        if not used_unet_grey:
-            try:
-                from detection.diagonal import detect_diagonal_walls
-                diag_walls = detect_diagonal_walls(
-                    img=img,
-                    config=self.config,
-                    existing_walls=result.walls,
-                    wall_mask=result.wall_mask,
-                )
-                if diag_walls:
-                    result.walls = result.walls + diag_walls
-                    logger.info(
-                        "[%s] Stage 1c: added %d diagonal walls",
-                        base_name, len(diag_walls),
-                    )
-                else:
-                    logger.debug("[%s] Stage 1c: no diagonal walls found",
-                                 base_name)
-            except Exception as _diag_exc:
-                logger.warning(
-                    "[%s] Stage 1c diagonal detection failed (non-fatal): %s",
-                    base_name, _diag_exc,
-                )
-                logger.debug("Stage 1c traceback:", exc_info=True)
+        # Stage 1c (residual diagonal wall detection) is no longer needed:
+        # detection.diagonal.preprocess_floorplan paints any non-axis-aligned
+        # walls / windows / doors as filled grey quads on the deskewed image
+        # before Stage 1 runs, so the colour / U-Net wall detector picks them
+        # up as ordinary axis-aligned walls.
 
         # ── Stage 2: Opening Detection (UNIFIED: gap + U-Net with deduplication) ─────
         _notify("detecting openings")

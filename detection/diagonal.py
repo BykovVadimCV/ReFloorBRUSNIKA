@@ -1,48 +1,57 @@
 """
-Diagonal wall detection for the ReFloorBRUSNIKA pipeline.
+Diagonal pre-processor for the ReFloorBRUSNIKA pipeline.
 
-Full deskew-based pipeline
---------------------------
+Single public entry point: ``preprocess_floorplan(image_path, ...)``.
 
-Phase 1 — analyse the original image
-  1. LSD → filter by minimum length and frame-border area
-  2. Wall-mask filter  (UNet combined mask, if provided)
-  3. OCR text filter   (docTR, optional — silently skipped if unavailable)
-  4. Angle clustering → find dominant perpendicular pair → deskew angle
+What this module does, in order, on the input image:
 
-Phase 2 — deskewed image  (when a perpendicular pair is found)
-  5. Deskew image + wall mask through the same affine transform M
-  6. Transform OCR boxes through M  (no second inference or OCR call)
-  7. LSD on deskewed image → wall-mask filter → text-mask filter
-  8. Keep only axis-aligned (H/V) segments: these were diagonal in the
-     original image and became horizontal/vertical after deskewing
-  9. Cluster the deskewed segments; for any remaining diagonal clusters
-     run sub-region processing: crop → rotate so diagonal → 0° → LSD
-     → keep H/V → rotate back to deskewed-image coords
- 10. Inverse-transform all accepted endpoints back to original-image coords
- 11. Snap endpoints to the nearest face of an existing axis-aligned wall
- 12. Return as WallSegment(is_diagonal=True)
+1. Crop to the largest connected ink structure (drops legend / margins).
+2. Correct small scanner skew (≤5°) so subsequent stages see a roughly
+   axis-aligned image.
+3. docTR OCR in normal orientation, then again on a 90° CW rotation
+   (to pick up vertical wall-length labels).  Both label sets are
+   stored in current-image coordinates.
+4. Erase every text region from a working copy of the image so that
+   text doesn't pollute U-Net or LSD.
+5. U-Net inference → pred_mask (0 bg, 1 wall, 2 window, 3 door) and
+   binary wall mask.
+6. LSD on the text-erased image, filtered to segments whose oriented
+   quad sufficiently overlaps the wall mask.
+7. Greedy length-weighted angle clustering on those segments.
+8. Pick the longest two perpendicular clusters → deskew correction.
+9. Rotate image, U-Net masks, and OCR labels through the same affine
+   matrix M.
+10. Re-cluster on the deskewed image and find clusters that are STILL
+    diagonal (axis deviation ≥ AXIS_TOL_DEG).
+11. For each residual diagonal cluster, paint a clean grey filled quad
+    on the deskewed image: crop the cluster's pred_mask region with
+    padding → rotate so the cluster angle becomes 0° → take the
+    axis-aligned bbox of each connected component (any of wall /
+    window / door) → inverse-rotate the bbox corners back to deskewed
+    coords → fillPoly with grey.  This way the existing axis-aligned
+    pipeline downstream sees the diagonal walls (and diagonal windows /
+    doors, which are merged into "wall") as ordinary rectangular ink.
+12. Save the final deskewed-and-painted image to
+    ``<input_dir>/deskewed/<basename>`` (creating the directory).
+13. Return the deskewed path and OCR labels in deskewed coordinates.
 
-Fallback — when no perpendicular pair is detected
-  Return raw diagonal LSD segments from Phase 1 with endpoint snapping.
-
-Only called by pipeline.py Stage 1c when the solid-colour wall path is
-active (used_unet_grey=False); LSD is unreliable on synthetic grey-fill
-images produced by the hollow-wall U-Net path.
+The pipeline driver (pipeline.py) calls this once per input image and
+treats the returned path as the canonical input for everything that
+follows.  No second OCR or U-Net run is needed downstream for OCR or
+text-erasure purposes — those products are handed off directly.
 """
 
 from __future__ import annotations
 
 import logging
 import math
-from typing import List, Optional, Tuple
-from uuid import uuid4
+import os
+import shutil
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-
-from core.config import PipelineConfig
-from core.models import BBox, WallSegment
 
 logger = logging.getLogger(__name__)
 
@@ -50,46 +59,132 @@ logger = logging.getLogger(__name__)
 # Tunable constants
 # ---------------------------------------------------------------------------
 
-AXIS_TOLERANCE_DEG: float = 20.0      # reject if within this many ° of H or V
-MIN_LENGTH_PX: float = 40.0           # reject short segments
-CLUSTER_TOL_DEG: float = 5.0          # merge clusters within this angular distance
-PERP_TOL_DEG: float = 20.0            # tolerance for detecting perpendicular pair
-MIN_WALL_MASK_COVERAGE: float = 0.35  # min quad-overlap fraction with wall mask
-FILL_HALF_W: float = 14.0             # half-width of segment quad for mask checks
-OCR_OVERLAP_REJECT: float = 0.30      # reject segment if ≥ this fraction overlaps text
-OCR_CONFIDENCE: float = 0.30          # min docTR word confidence to trust
-OCR_PADDING_PX: int = 14              # pixel padding added around each OCR word box
-MAX_COLOR_DISTANCE: float = 55.0      # Euclidean BGR distance threshold (colour fallback)
-MAX_AREA_FRACTION: float = 0.08       # reject if AABB > 8 % of image (frame borders)
-BBOX_OVERLAP_REJECT: float = 0.60     # skip if AABB overlaps existing wall by ≥ 60 %
-THICKNESS_MIN: float = 3.0
-THICKNESS_MAX: float = 60.0
-ENDPOINT_EXTEND_PX: float = 8.0       # always push endpoint outward by at least this far
-ENDPOINT_SNAP_RADIUS: float = 30.0    # max ray distance to snap to a wall face
-SUBREGION_PADDING: int = 60           # padding around diagonal cluster bounding box
-SUBREGION_MIN_LEN: float = 20.0       # min LSD segment length inside sub-region crops
-DIAG_CLUSTER_MIN_LEN: float = 100.0   # skip tiny residual diagonal clusters in phase 2
+GREY_BGR: Tuple[int, int, int] = (180, 180, 180)   # painted-diagonal colour
+
+LSD_MIN_LEN_PX: float       = 30.0
+AXIS_TOL_DEG: float         = 15.0      # |dev from H/V| ≥ this ⇒ diagonal
+CLUSTER_TOL_DEG: float      = 5.0       # angular merge threshold
+PERP_TOL_DEG: float         = 20.0      # deviation from 90° apart
+MIN_DESKEW_DEG: float       = 3.0       # below this ⇒ no deskew
+
+WALL_QUAD_HALF_W: float     = 14.0      # half-width of segment quad for mask test
+WALL_MASK_MIN_OVERLAP: float = 0.25     # fraction of quad on wall_mask to keep
+
+DIAG_PATCH_PAD_PX: int      = 30
+DIAG_MIN_COMPONENT_AREA: int = 60
+
+OCR_CONFIDENCE: float       = 0.30
+OCR_PADDING_PX: int         = 14
+
+UNET_DEFAULT_CKPT: str      = "weights/epoch_040.pth"
+UNET_DEFAULT_SIZE: int      = 1024
+
 
 # ---------------------------------------------------------------------------
-# OCR model cache  (loaded once per process)
+# OCR — docTR
 # ---------------------------------------------------------------------------
 
-_ocr_model = None   # None = not yet tried; False = tried but failed
+_ocr_model: Any = None   # None = not tried; False = tried, unavailable
 
 
 def _get_ocr_model():
-    """Return a cached docTR predictor, or None if unavailable."""
     global _ocr_model
     if _ocr_model is None:
         try:
             from doctr.models import ocr_predictor
             logger.info("[diagonal] Loading docTR OCR model ...")
             _ocr_model = ocr_predictor(pretrained=True)
-            logger.info("[diagonal] docTR model ready")
+            logger.info("[diagonal] docTR ready")
         except Exception as exc:
-            logger.info("[diagonal] docTR unavailable (%s) — text filter disabled", exc)
+            logger.info("[diagonal] docTR unavailable (%s)", exc)
             _ocr_model = False
     return _ocr_model if _ocr_model else None
+
+
+def _ocr_image(img_bgr: np.ndarray) -> List[Tuple]:
+    """
+    docTR on img_bgr.
+    Returns: List[(text, x1, y1, x2, y2)] in image coordinates.
+    """
+    model = _get_ocr_model()
+    if model is None:
+        return []
+    try:
+        from doctr.io import DocumentFile
+    except ImportError:
+        return []
+    H, W = img_bgr.shape[:2]
+    ok, buf = cv2.imencode('.png', img_bgr)
+    if not ok:
+        return []
+    try:
+        doc = DocumentFile.from_images([buf.tobytes()])
+        res = model(doc)
+    except Exception as exc:
+        logger.warning("[diagonal] OCR inference failed: %s", exc)
+        return []
+
+    out: List[Tuple] = []
+    for page in res.pages:
+        for block in page.blocks:
+            for line in block.lines:
+                for word in line.words:
+                    if (hasattr(word, 'confidence')
+                            and word.confidence < OCR_CONFIDENCE):
+                        continue
+                    (x0, y0), (x1, y1) = word.geometry
+                    px1 = max(0, int(x0 * W) - OCR_PADDING_PX)
+                    py1 = max(0, int(y0 * H) - OCR_PADDING_PX)
+                    px2 = min(W, int(x1 * W) + OCR_PADDING_PX)
+                    py2 = min(H, int(y1 * H) + OCR_PADDING_PX)
+                    out.append((str(word.value), px1, py1, px2, py2))
+    return out
+
+
+def _ocr_both_orientations(img_bgr: np.ndarray) -> Tuple[List[Tuple], List[Tuple]]:
+    """
+    Run docTR in normal orientation and on a 90° CW rotation; return both
+    label lists in CURRENT-IMAGE coordinates (the rotated set has been
+    un-rotated back).
+    """
+    H, W = img_bgr.shape[:2]
+    normal = _ocr_image(img_bgr)
+
+    rotated = cv2.rotate(img_bgr, cv2.ROTATE_90_CLOCKWISE)
+    raw_rot = _ocr_image(rotated)
+    del rotated
+
+    rot_unrotated: List[Tuple] = []
+    for item in raw_rot:
+        if len(item) < 5:
+            continue
+        text, rx1, ry1, rx2, ry2 = item
+        # CW inverse: rotated (rx, ry) -> original (ry, H-1-rx)
+        ox1 = min(int(ry1), int(ry2))
+        oy1 = H - 1 - max(int(rx1), int(rx2))
+        ox2 = max(int(ry1), int(ry2))
+        oy2 = H - 1 - min(int(rx1), int(rx2))
+        rot_unrotated.append((text, ox1, oy1, ox2, oy2))
+    return normal, rot_unrotated
+
+
+def _erase_text(img_bgr: np.ndarray,
+                label_lists: List[List[Tuple]],
+                pad: int = 3) -> np.ndarray:
+    """Return a copy of img_bgr with every text bbox filled white."""
+    out = img_bgr.copy()
+    H, W = out.shape[:2]
+    for src in label_lists:
+        for item in src or []:
+            if len(item) < 5:
+                continue
+            x1 = max(0, int(item[1]) - pad)
+            y1 = max(0, int(item[2]) - pad)
+            x2 = min(W, int(item[3]) + pad)
+            y2 = min(H, int(item[4]) + pad)
+            if x2 > x1 and y2 > y1:
+                cv2.rectangle(out, (x1, y1), (x2, y2), (255, 255, 255), -1)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -97,31 +192,26 @@ def _get_ocr_model():
 # ---------------------------------------------------------------------------
 
 def _angle_deg(x1: float, y1: float, x2: float, y2: float) -> float:
-    """Segment angle in [0, 180)."""
     return math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180.0
 
 
 def _angle_dist(a: float, b: float) -> float:
-    """Circular angular distance mod 180°."""
     d = abs(a - b) % 180.0
     return min(d, 180.0 - d)
 
 
 def _deviation_from_axis(angle: float) -> float:
-    """Minimum angular distance from H (0°) or V (90°)."""
     return min(angle % 90.0, 90.0 - angle % 90.0)
 
 
-def _weighted_mean_angle(members: list) -> float:
-    """Length-weighted circular mean angle (handles 0°/180° wrap-around)."""
-    sx = sum(s['length'] * math.cos(math.radians(2.0 * s['angle_deg'])) for s in members)
-    sy = sum(s['length'] * math.sin(math.radians(2.0 * s['angle_deg'])) for s in members)
+def _weighted_mean_angle(members: List[Dict]) -> float:
+    sx = sum(m['length'] * math.cos(math.radians(2.0 * m['angle_deg'])) for m in members)
+    sy = sum(m['length'] * math.sin(math.radians(2.0 * m['angle_deg'])) for m in members)
     return (math.degrees(math.atan2(sy, sx)) % 360.0) / 2.0 % 180.0
 
 
 def _segment_quad(x1: float, y1: float, x2: float, y2: float,
                   half_w: float) -> Optional[np.ndarray]:
-    """4-corner int32 rotated-rectangle polygon for a thick line segment."""
     L = math.hypot(x2 - x1, y2 - y1)
     if L < 0.5:
         return None
@@ -135,776 +225,522 @@ def _segment_quad(x1: float, y1: float, x2: float, y2: float,
     ], dtype=np.int32)
 
 
-def _transform_pt(M: np.ndarray, x: float, y: float) -> Tuple[float, float]:
-    """Apply a 2×3 affine matrix to a single point."""
-    v = M @ np.array([x, y, 1.0])
-    return float(v[0]), float(v[1])
+def _transform_pts(M: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    """Apply 2×3 affine to (N,2) array of points, return (N,2)."""
+    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 1, 2)
+    return cv2.transform(pts, M).reshape(-1, 2)
 
 
 # ---------------------------------------------------------------------------
-# Colour / overlap helpers  (kept for fallback colour-distance filter)
+# Cropping & small-skew (vendored copies of pipeline.py helpers, so this
+# module can preprocess without importing pipeline.py)
 # ---------------------------------------------------------------------------
 
-def _sample_color_along_line(img: np.ndarray,
-                             x1: float, y1: float,
-                             x2: float, y2: float,
-                             n: int = 15) -> Tuple[float, float, float]:
-    t = np.linspace(0.0, 1.0, n)
-    xs = np.clip((x1 + t * (x2 - x1)).astype(int), 0, img.shape[1] - 1)
-    ys = np.clip((y1 + t * (y2 - y1)).astype(int), 0, img.shape[0] - 1)
-    mean = img[ys, xs].astype(float).mean(axis=0)
-    return float(mean[0]), float(mean[1]), float(mean[2])
+def _crop_to_floorplan(img: np.ndarray,
+                       fg_thresh: int = 230,
+                       min_fill: float = 0.03,
+                       margin: int = 12) -> np.ndarray:
+    """Crop to the largest dark-ink connected component."""
+    if img is None or img.size == 0:
+        return img
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    _, fg = cv2.threshold(gray, fg_thresh, 255, cv2.THRESH_BINARY_INV)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE,
+                          cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+    n, _, stats, _ = cv2.connectedComponentsWithStats(fg, 8)
+    if n <= 1:
+        return img
+    H, W = img.shape[:2]
+    best_idx = 0
+    best_area = 0
+    for i in range(1, n):
+        a = stats[i, cv2.CC_STAT_AREA]
+        if a > best_area:
+            best_area = a
+            best_idx = i
+    if best_area < min_fill * H * W:
+        return img
+    x = stats[best_idx, cv2.CC_STAT_LEFT]
+    y = stats[best_idx, cv2.CC_STAT_TOP]
+    w = stats[best_idx, cv2.CC_STAT_WIDTH]
+    h = stats[best_idx, cv2.CC_STAT_HEIGHT]
+    if w >= W * 0.98 and h >= H * 0.98:
+        return img
+    x1 = max(0, x - margin)
+    y1 = max(0, y - margin)
+    x2 = min(W, x + w + margin)
+    y2 = min(H, y + h + margin)
+    return img[y1:y2, x1:x2].copy()
 
 
-def _color_distance(a: Tuple, b: Tuple) -> float:
-    return float(math.sqrt(sum((float(x) - float(y)) ** 2 for x, y in zip(a, b))))
-
-
-def _overlaps_existing(bbox: Tuple[float, float, float, float],
-                       walls: List[WallSegment],
-                       threshold: float = BBOX_OVERLAP_REJECT) -> bool:
-    ax1, ay1, ax2, ay2 = bbox
-    area_a = (ax2 - ax1) * (ay2 - ay1)
-    if area_a <= 0:
-        return False
-    for w in walls:
-        bx1, by1, bx2, by2 = w.bbox.x1, w.bbox.y1, w.bbox.x2, w.bbox.y2
-        inter_w = max(0.0, min(ax2, bx2) - max(ax1, bx1))
-        inter_h = max(0.0, min(ay2, by2) - max(ay1, by1))
-        if inter_w * inter_h / area_a >= threshold:
-            return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# OCR helpers
-# ---------------------------------------------------------------------------
-
-def _detect_ocr_boxes(img_bgr: np.ndarray) -> List[Tuple]:
-    """
-    Run docTR on img_bgr; return padded word boxes as (x1, y1, x2, y2, text).
-    Returns [] when docTR is unavailable or finds nothing.
-    """
-    model = _get_ocr_model()
-    if model is None:
-        return []
-    try:
-        from doctr.io import DocumentFile
-    except ImportError:
-        return []
-
-    H, W = img_bgr.shape[:2]
-    ok, buf = cv2.imencode('.png', img_bgr)
-    if not ok:
-        return []
-    try:
-        doc = DocumentFile.from_images([buf.tobytes()])
-        res = model(doc)
-    except Exception as exc:
-        logger.warning("[diagonal] OCR inference error: %s", exc)
-        return []
-
-    boxes: List[Tuple] = []
-    for page in res.pages:
-        for block in page.blocks:
-            for line in block.lines:
-                for word in line.words:
-                    if hasattr(word, 'confidence') and word.confidence < OCR_CONFIDENCE:
-                        continue
-                    (x0, y0), (x1, y1) = word.geometry
-                    px1 = max(0, int(x0 * W) - OCR_PADDING_PX)
-                    py1 = max(0, int(y0 * H) - OCR_PADDING_PX)
-                    px2 = min(W, int(x1 * W) + OCR_PADDING_PX)
-                    py2 = min(H, int(y1 * H) + OCR_PADDING_PX)
-                    boxes.append((px1, py1, px2, py2, word.value))
-    return boxes
-
-
-def _build_text_mask(H: int, W: int, boxes: List[Tuple]) -> np.ndarray:
-    """Rasterise padded text boxes into a binary mask (1 = inside text region)."""
-    mask = np.zeros((H, W), dtype=np.uint8)
-    for box in boxes:
-        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-        mask[max(0, y1):min(H, y2), max(0, x1):min(W, x2)] = 1
-    return mask
-
-
-def _transform_boxes(boxes: List[Tuple], M: np.ndarray) -> List[Tuple]:
-    """Transform (x1,y1,x2,y2,...) boxes through a 2×3 affine M; result is AABB."""
-    result = []
-    for box in boxes:
-        x1, y1, x2, y2 = box[0], box[1], box[2], box[3]
-        rest = box[4:]
-        corners = np.array(
-            [[x1, y1, 1], [x2, y1, 1], [x2, y2, 1], [x1, y2, 1]],
-            dtype=float).T          # (3, 4)
-        tc = (M @ corners).T        # (4, 2)
-        nx1 = int(tc[:, 0].min()); ny1 = int(tc[:, 1].min())
-        nx2 = int(tc[:, 0].max()); ny2 = int(tc[:, 1].max())
-        result.append((nx1, ny1, nx2, ny2) + rest)
-    return result
+def _small_skew_correct(img: np.ndarray, max_angle: float = 5.0) -> np.ndarray:
+    """Hough-based small skew correction. Returns img unchanged if |θ|<0.3°."""
+    if img is None or img.size == 0:
+        return img
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
+    edges = cv2.Canny(gray, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 120,
+                             minLineLength=80, maxLineGap=12)
+    if lines is None or len(lines) == 0:
+        return img
+    angles: List[float] = []
+    for x1, y1, x2, y2 in lines[:, 0]:
+        a = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        a = ((a + 90.0) % 180.0) - 90.0   # fold to (-90, 90]
+        # only horizontal-ish lines for skew estimation
+        if abs(a) <= max_angle:
+            angles.append(a)
+    if len(angles) < 5:
+        return img
+    angle = float(np.median(angles))
+    if abs(angle) < 0.3:
+        return img
+    return _rotate(img, angle, border_value=(255, 255, 255), interp=cv2.INTER_LINEAR)[0]
 
 
 # ---------------------------------------------------------------------------
-# LSD  +  segment-level mask filters
+# LSD + filtering + clustering
 # ---------------------------------------------------------------------------
 
-def _run_lsd(gray: np.ndarray, min_length: float,
-             axis_tolerance: float) -> List[dict]:
-    """
-    Run LSD on a greyscale image; return all segments above min_length as
-    dicts with keys: x1 y1 x2 y2 length angle_deg deviation_deg width is_diagonal.
-    """
+def _run_lsd(gray: np.ndarray, min_len: float = LSD_MIN_LEN_PX,
+             axis_tol: float = AXIS_TOL_DEG) -> List[Dict]:
     try:
         lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
     except AttributeError:
-        lsd = cv2.createLineSegmentDetector()
+        try:
+            lsd = cv2.createLineSegmentDetector()
+        except Exception as exc:
+            logger.warning("[diagonal] LSD unavailable: %s", exc)
+            return []
     try:
         raw = lsd.detect(gray)
     except Exception as exc:
-        logger.warning("[diagonal] LSD failed: %s", exc)
+        logger.warning("[diagonal] LSD detect failed: %s", exc)
         return []
     if raw is None or raw[0] is None or len(raw[0]) == 0:
         return []
-
-    lines_raw, widths_raw = raw[0], raw[1]
-    segs: List[dict] = []
-    for i, line in enumerate(lines_raw):
+    lines, widths = raw[0], raw[1]
+    out: List[Dict] = []
+    for i, line in enumerate(lines):
         x1, y1, x2, y2 = line[0]
-        length = math.hypot(x2 - x1, y2 - y1)
-        if length < min_length:
+        L = math.hypot(x2 - x1, y2 - y1)
+        if L < min_len:
             continue
-        angle = _angle_deg(x1, y1, x2, y2)
-        dev   = _deviation_from_axis(angle)
-        width = (float(widths_raw[i][0])
-                 if widths_raw is not None and i < len(widths_raw) else 1.0)
-        segs.append(dict(
-            x1=x1, y1=y1, x2=x2, y2=y2,
-            length=length, angle_deg=angle,
-            deviation_deg=dev, width=width,
-            is_diagonal=(dev >= axis_tolerance),
+        a = _angle_deg(x1, y1, x2, y2)
+        dev = _deviation_from_axis(a)
+        w = (float(widths[i][0])
+             if widths is not None and i < len(widths) else 1.0)
+        out.append(dict(
+            x1=float(x1), y1=float(y1), x2=float(x2), y2=float(y2),
+            length=L, angle_deg=a, deviation_deg=dev,
+            width=w, is_diagonal=(dev >= axis_tol),
         ))
-    return segs
+    return out
 
 
-def _filter_by_mask(segs: List[dict], mask: np.ndarray,
-                    fill_half_w: float = FILL_HALF_W,
-                    min_coverage: float = MIN_WALL_MASK_COVERAGE) -> List[dict]:
-    """Keep segments whose filled quad overlaps the mask by >= min_coverage."""
+def _filter_segments_by_mask(segs: List[Dict], mask: np.ndarray,
+                              half_w: float = WALL_QUAD_HALF_W,
+                              min_overlap: float = WALL_MASK_MIN_OVERLAP
+                              ) -> List[Dict]:
+    if not segs or mask is None:
+        return segs
     H, W = mask.shape[:2]
-    qm   = np.zeros((H, W), dtype=np.uint8)
-    kept: List[dict] = []
-    for seg in segs:
-        hw   = max(fill_half_w, seg.get('width', 1.0))
-        quad = _segment_quad(seg['x1'], seg['y1'], seg['x2'], seg['y2'], hw)
+    bin_mask = (mask > 0).astype(np.uint8)
+    quad_buf = np.zeros((H, W), dtype=np.uint8)
+    kept: List[Dict] = []
+    for s in segs:
+        hw = max(half_w, s.get('width', 1.0))
+        quad = _segment_quad(s['x1'], s['y1'], s['x2'], s['y2'], hw)
         if quad is None:
-            kept.append(seg)
-            continue
-        qm[:] = 0
-        cv2.fillPoly(qm, [quad], 1)
-        total = int(qm.sum())
+            kept.append(s); continue
+        quad_buf[:] = 0
+        cv2.fillPoly(quad_buf, [quad], 1)
+        total = int(quad_buf.sum())
         if total == 0:
-            kept.append(seg)
-            continue
-        overlap = int(np.sum((qm > 0) & (mask > 0)))
-        if overlap / total >= min_coverage:
-            kept.append(seg)
+            kept.append(s); continue
+        overlap = int(np.sum((quad_buf > 0) & (bin_mask > 0)))
+        if overlap / total >= min_overlap:
+            kept.append(s)
     return kept
 
 
-def _filter_by_text(segs: List[dict], text_mask: np.ndarray,
-                    fill_half_w: float = FILL_HALF_W,
-                    max_overlap: float = OCR_OVERLAP_REJECT) -> List[dict]:
-    """Reject segments whose filled quad overlaps the text mask by >= max_overlap."""
-    H, W = text_mask.shape[:2]
-    qm   = np.zeros((H, W), dtype=np.uint8)
-    kept: List[dict] = []
-    for seg in segs:
-        hw   = max(fill_half_w, seg.get('width', 1.0))
-        quad = _segment_quad(seg['x1'], seg['y1'], seg['x2'], seg['y2'], hw)
-        if quad is None:
-            kept.append(seg)
-            continue
-        qm[:] = 0
-        cv2.fillPoly(qm, [quad], 1)
-        total = int(qm.sum())
-        if total == 0:
-            kept.append(seg)
-            continue
-        overlap = int(np.sum((qm > 0) & (text_mask > 0)))
-        if overlap / total < max_overlap:
-            kept.append(seg)
-    return kept
-
-
-# ---------------------------------------------------------------------------
-# Clustering  +  deskew
-# ---------------------------------------------------------------------------
-
-def _cluster_segments(segs: List[dict], cluster_tol: float,
-                      axis_tolerance: float) -> List[dict]:
-    """
-    Greedy angle-clustering of segments.  Uses length-weighted circular mean
-    with doubled-angle trick to handle 0°/180° wrap-around cleanly.
-    """
+def _cluster_segments(segs: List[Dict],
+                      cluster_tol: float = CLUSTER_TOL_DEG,
+                      axis_tol: float = AXIS_TOL_DEG) -> List[Dict]:
     if not segs:
         return []
     ordered = sorted(segs, key=lambda s: s['angle_deg'])
-    groups  = [[ordered[0]]]
-    for seg in ordered[1:]:
-        if _angle_dist(seg['angle_deg'],
+    groups: List[List[Dict]] = [[ordered[0]]]
+    for s in ordered[1:]:
+        if _angle_dist(s['angle_deg'],
                        _weighted_mean_angle(groups[-1])) <= cluster_tol:
-            groups[-1].append(seg)
+            groups[-1].append(s)
         else:
-            groups.append([seg])
-    # Merge first and last group if they wrap around 180°
+            groups.append([s])
     if len(groups) >= 2:
         if _angle_dist(_weighted_mean_angle(groups[0]),
                        _weighted_mean_angle(groups[-1])) <= cluster_tol:
             groups[0] = groups[-1] + groups[0]
             groups.pop()
-
-    result = []
+    out = []
     for members in groups:
-        mean_a = _weighted_mean_angle(members)
-        result.append(dict(
-            members      = members,
-            cluster_angle= mean_a,
-            cluster_size = len(members),
-            total_length = sum(s['length'] for s in members),
-            is_diagonal  = (_deviation_from_axis(mean_a) >= axis_tolerance),
+        ma = _weighted_mean_angle(members)
+        out.append(dict(
+            members=members,
+            cluster_angle=ma,
+            cluster_size=len(members),
+            total_length=sum(s['length'] for s in members),
+            is_diagonal=(_deviation_from_axis(ma) >= axis_tol),
         ))
-    return sorted(result, key=lambda c: c['cluster_angle'])
+    return sorted(out, key=lambda c: c['cluster_angle'])
 
 
-def _find_deskew_angle(clusters: List[dict],
+def _find_deskew_angle(clusters: List[Dict],
                        perp_tol: float = PERP_TOL_DEG,
-                       min_angle_deg: float = 3.0) -> Optional[float]:
-    """
-    Find the correction angle that aligns the two most dominant clusters with
-    H/V axes.  Returns None when:
-      - fewer than 2 clusters
-      - dominant cluster is already axis-aligned  (image already deskewed)
-      - the two dominant clusters are not ~perpendicular
-      - the computed correction is smaller than min_angle_deg
-    """
+                       min_angle: float = MIN_DESKEW_DEG) -> Optional[float]:
     if len(clusters) < 2:
         return None
-    ranked  = sorted(clusters, key=lambda c: c['total_length'], reverse=True)
+    ranked = sorted(clusters, key=lambda c: c['total_length'], reverse=True)
     primary = ranked[0]
-
-    # If the dominant cluster is already H/V, the image is aligned — no correction.
     if not primary['is_diagonal']:
         return None
-
-    secondary_angle = ranked[1]['cluster_angle']
-    apart = _angle_dist(primary['cluster_angle'], secondary_angle)
-    if abs(apart - 90.0) > perp_tol:
+    secondary = ranked[1]
+    if abs(_angle_dist(primary['cluster_angle'],
+                        secondary['cluster_angle']) - 90.0) > perp_tol:
         return None
     dev = primary['cluster_angle'] % 90.0
     correction = -dev if dev <= 45.0 else (90.0 - dev)
-    return correction if abs(correction) >= min_angle_deg else None
+    return correction if abs(correction) >= min_angle else None
 
 
-def _deskew(img: np.ndarray,
-            angle_deg: float) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
-    """
-    Rotate image CCW by angle_deg with canvas expansion and white fill.
-    Returns (rotated_img, M_2x3, (new_width, new_height)).
-    """
-    h, w   = img.shape[:2]
+# ---------------------------------------------------------------------------
+# Affine rotation helpers
+# ---------------------------------------------------------------------------
+
+def _rotate(img: np.ndarray, angle_deg: float,
+            border_value=(255, 255, 255),
+            interp: int = cv2.INTER_LINEAR
+            ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+    """Rotate CCW by angle_deg, expand canvas. Returns (rotated, M, (W,H))."""
+    h, w = img.shape[:2]
     cx, cy = w / 2.0, h / 2.0
-    M      = cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
-    cos_a  = abs(math.cos(math.radians(angle_deg)))
-    sin_a  = abs(math.sin(math.radians(angle_deg)))
-    new_w  = int(math.ceil(h * sin_a + w * cos_a))
-    new_h  = int(math.ceil(h * cos_a + w * sin_a))
+    M = cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
+    cos_a = abs(math.cos(math.radians(angle_deg)))
+    sin_a = abs(math.sin(math.radians(angle_deg)))
+    new_w = int(math.ceil(h * sin_a + w * cos_a))
+    new_h = int(math.ceil(h * cos_a + w * sin_a))
     M[0, 2] += (new_w - w) / 2.0
     M[1, 2] += (new_h - h) / 2.0
     rotated = cv2.warpAffine(img, M, (new_w, new_h),
-                             flags=cv2.INTER_LINEAR,
+                             flags=interp,
                              borderMode=cv2.BORDER_CONSTANT,
-                             borderValue=(255, 255, 255))
+                             borderValue=border_value)
     return rotated, M, (new_w, new_h)
 
 
 def _rotate_mask(mask: np.ndarray, M: np.ndarray,
-                 new_size: Tuple[int, int]) -> np.ndarray:
-    """Apply the same affine to a class-id or binary mask (INTER_NEAREST)."""
-    return cv2.warpAffine(mask, M, new_size,
-                          flags=cv2.INTER_NEAREST,
-                          borderMode=cv2.BORDER_CONSTANT,
-                          borderValue=0)
+                  size: Tuple[int, int]) -> np.ndarray:
+    return cv2.warpAffine(mask, M, size,
+                           flags=cv2.INTER_NEAREST,
+                           borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def _transform_labels(labels: List[Tuple], M: np.ndarray) -> List[Tuple]:
+    """Pass (text, x1, y1, x2, y2) labels through an affine matrix.
+    Result bbox is the AABB of the four transformed corners."""
+    out: List[Tuple] = []
+    for item in labels or []:
+        if len(item) < 5:
+            out.append(item); continue
+        text = item[0]
+        x1, y1, x2, y2 = float(item[1]), float(item[2]), float(item[3]), float(item[4])
+        corners = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32)
+        new = _transform_pts(M, corners)
+        nx1, ny1 = float(new[:, 0].min()), float(new[:, 1].min())
+        nx2, ny2 = float(new[:, 0].max()), float(new[:, 1].max())
+        out.append((text, int(nx1), int(ny1), int(nx2), int(ny2)))
+    return out
 
 
 # ---------------------------------------------------------------------------
-# Endpoint snapping  (ray-cast to nearest axis-aligned wall face)
+# Diagonal painting
 # ---------------------------------------------------------------------------
 
-def _snap_endpoint_to_wall_face(
-    px: float, py: float,
-    dx: float, dy: float,
-    existing_walls: List[WallSegment],
-    extend_px: float = ENDPOINT_EXTEND_PX,
-    snap_radius: float = ENDPOINT_SNAP_RADIUS,
-) -> Tuple[float, float]:
+def _paint_diagonal_clusters(
+    img: np.ndarray,
+    pred_mask: np.ndarray,
+    clusters: List[Dict],
+    grey: Tuple[int, int, int] = GREY_BGR,
+    padding: int = DIAG_PATCH_PAD_PX,
+    min_area: int = DIAG_MIN_COMPONENT_AREA,
+) -> int:
     """
-    Push (px, py) outward along (dx, dy) until it touches a wall face, or
-    by extend_px if no face is found within snap_radius.
+    Paint each diagonal cluster's wall / window / door region as a filled
+    grey quadrilateral on `img`, in place.
+
+    Approach (per cluster):
+      1. AABB of all member segment endpoints, padded.
+      2. Crop pred_mask at that bbox.
+      3. Rotate the crop by -cluster_angle (so the cluster runs ~horizontal).
+      4. For wall/window/door classes, find connected components on the
+         rotated mask; for each, take its axis-aligned bbox in the rotated
+         frame, inverse-rotate the four corners, translate to image
+         coords, and fill the resulting quadrilateral with grey.
+
+    Returns the number of quads painted.
     """
-    best_t = extend_px  # always extend by at least this much
-    for wall in existing_walls:
-        if wall.is_diagonal:
+    if pred_mask is None or img is None or not clusters:
+        return 0
+    H, W = img.shape[:2]
+    n_painted = 0
+    DIAG_CLASSES = (1, 2, 3)   # 1 wall, 2 window, 3 door — all become grey
+
+    for cluster in clusters:
+        if not cluster.get('is_diagonal', False):
             continue
-        bx1, by1 = wall.bbox.x1, wall.bbox.y1
-        bx2, by2 = wall.bbox.x2, wall.bbox.y2
-        # Quick distance cull
-        wcx, wcy  = (bx1 + bx2) / 2, (by1 + by2) / 2
-        half_diag = math.hypot(bx2 - bx1, by2 - by1) / 2
-        if math.hypot(px - wcx, py - wcy) > snap_radius + half_diag:
+        members = cluster.get('members') or []
+        if not members:
             continue
-        ww, wh = bx2 - bx1, by2 - by1
-        half_t = max(getattr(wall, 'thickness', 0) / 2, 2.0)
-        if ww >= wh:                         # horizontal wall: top/bottom faces
-            if abs(dy) > 1e-6:
-                for face_y in (by1, by2):
-                    t = (face_y - py) / dy
-                    if 0.0 < t <= snap_radius:
-                        ix = px + t * dx
-                        if bx1 - half_t <= ix <= bx2 + half_t:
-                            best_t = min(best_t, t)
-        else:                                # vertical wall: left/right faces
-            if abs(dx) > 1e-6:
-                for face_x in (bx1, bx2):
-                    t = (face_x - px) / dx
-                    if 0.0 < t <= snap_radius:
-                        iy = py + t * dy
-                        if by1 - half_t <= iy <= by2 + half_t:
-                            best_t = min(best_t, t)
-    return px + best_t * dx, py + best_t * dy
 
+        # 1. AABB of all member endpoints, padded
+        xs: List[float] = []
+        ys: List[float] = []
+        for s in members:
+            xs.extend([s['x1'], s['x2']])
+            ys.extend([s['y1'], s['y2']])
+        bx1 = max(0, int(min(xs)) - padding)
+        by1 = max(0, int(min(ys)) - padding)
+        bx2 = min(W, int(max(xs)) + padding)
+        by2 = min(H, int(max(ys)) + padding)
+        if bx2 - bx1 < 4 or by2 - by1 < 4:
+            continue
 
-def _refine_endpoints(
-    x1: float, y1: float,
-    x2: float, y2: float,
-    existing_walls: List[WallSegment],
-) -> Tuple[float, float, float, float]:
-    """Extend both endpoints outward and snap each to the nearest wall face."""
-    length = math.hypot(x2 - x1, y2 - y1)
-    if length < 1.0:
-        return x1, y1, x2, y2
-    udx, udy = (x2 - x1) / length, (y2 - y1) / length
-    nx1, ny1 = _snap_endpoint_to_wall_face(x1, y1, -udx, -udy, existing_walls)
-    nx2, ny2 = _snap_endpoint_to_wall_face(x2, y2, +udx, +udy, existing_walls)
-    return nx1, ny1, nx2, ny2
+        # 2. Crop pred_mask at bbox
+        crop = pred_mask[by1:by2, bx1:bx2]
+        ch, cw = crop.shape[:2]
+
+        # 3. Rotate so cluster_angle → 0°.
+        # cluster_angle is in [0, 180); we want to rotate the crop CCW by
+        # `-cluster_angle` (i.e., warpAffine uses CCW positive). The wall
+        # then runs roughly along the x-axis in the rotated frame.
+        rot_angle = float(cluster['cluster_angle'])
+        cx, cy = cw / 2.0, ch / 2.0
+        Mr = cv2.getRotationMatrix2D((cx, cy), rot_angle, 1.0)
+        cos_a = abs(math.cos(math.radians(rot_angle)))
+        sin_a = abs(math.sin(math.radians(rot_angle)))
+        new_w = int(math.ceil(ch * sin_a + cw * cos_a))
+        new_h = int(math.ceil(ch * cos_a + cw * sin_a))
+        Mr[0, 2] += (new_w - cw) / 2.0
+        Mr[1, 2] += (new_h - ch) / 2.0
+        rot = cv2.warpAffine(crop, Mr, (new_w, new_h),
+                              flags=cv2.INTER_NEAREST,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        Mr_inv = cv2.invertAffineTransform(Mr)
+
+        # 4. Connected components per class, paint each axis-aligned bbox
+        for cls in DIAG_CLASSES:
+            class_mask = (rot == cls).astype(np.uint8)
+            if class_mask.sum() == 0:
+                continue
+            n_cc, _lbls, stats, _ = cv2.connectedComponentsWithStats(class_mask, 8)
+            for i in range(1, n_cc):
+                area = int(stats[i, cv2.CC_STAT_AREA])
+                if area < min_area:
+                    continue
+                rx = int(stats[i, cv2.CC_STAT_LEFT])
+                ry = int(stats[i, cv2.CC_STAT_TOP])
+                rw = int(stats[i, cv2.CC_STAT_WIDTH])
+                rh = int(stats[i, cv2.CC_STAT_HEIGHT])
+
+                corners_rot = np.array([
+                    [rx,      ry     ],
+                    [rx + rw, ry     ],
+                    [rx + rw, ry + rh],
+                    [rx,      ry + rh],
+                ], dtype=np.float32)
+                corners_crop = _transform_pts(Mr_inv, corners_rot)
+                corners_img  = corners_crop + np.array([bx1, by1], dtype=np.float32)
+
+                cv2.fillPoly(img, [corners_img.astype(np.int32)], grey)
+                n_painted += 1
+    return n_painted
 
 
 # ---------------------------------------------------------------------------
-# Sub-region diagonal processing
+# U-Net wrapper
 # ---------------------------------------------------------------------------
 
-def _process_diagonal_cluster(
-    img_bgr: np.ndarray,
-    cluster: dict,
-    padding: int = SUBREGION_PADDING,
-    axis_tolerance: float = AXIS_TOLERANCE_DEG,
-) -> List[dict]:
-    """
-    Crop the cluster bounding box, rotate so the cluster direction → 0°, run
-    LSD to find H/V segments inside, then rotate results back to the input
-    image's coordinate system.
-
-    Returns list of dicts {p1:(x,y), p2:(x,y), thickness:float} in input-image
-    pixel coordinates (not original-image coords — callers must apply M_inv).
-    """
-    H_img, W_img = img_bgr.shape[:2]
-    angle   = cluster['cluster_angle']
-    members = cluster['members']
-
-    xs = [v for s in members for v in (s['x1'], s['x2'])]
-    ys = [v for s in members for v in (s['y1'], s['y2'])]
-    if not xs:
-        return []
-
-    bx1 = max(0,     int(min(xs)) - padding)
-    by1 = max(0,     int(min(ys)) - padding)
-    bx2 = min(W_img, int(max(xs)) + padding)
-    by2 = min(H_img, int(max(ys)) + padding)
-    patch = img_bgr[by1:by2, bx1:bx2].copy()
-    ph, pw = patch.shape[:2]
-    if ph < 10 or pw < 10:
-        return []
-
-    # Forward rotation: bring cluster direction to 0° (horizontal)
-    rot   = -angle
-    cx, cy = pw / 2.0, ph / 2.0
-    Mf    = cv2.getRotationMatrix2D((cx, cy), rot, 1.0)
-    cos_a = abs(math.cos(math.radians(rot)))
-    sin_a = abs(math.sin(math.radians(rot)))
-    nw    = int(math.ceil(ph * sin_a + pw * cos_a))
-    nh    = int(math.ceil(ph * cos_a + pw * sin_a))
-    Mf[0, 2] += (nw - pw) / 2.0
-    Mf[1, 2] += (nh - ph) / 2.0
-    rotated = cv2.warpAffine(patch, Mf, (nw, nh),
-                             flags=cv2.INTER_LINEAR,
-                             borderMode=cv2.BORDER_CONSTANT,
-                             borderValue=(255, 255, 255))
-
-    # LSD on rotated patch — keep only H/V segments
-    gray_rot = cv2.cvtColor(rotated, cv2.COLOR_BGR2GRAY)
+def _run_unet(img_bgr: np.ndarray, ckpt_path: str,
+               img_size: int = UNET_DEFAULT_SIZE
+               ) -> Optional[Dict[str, Any]]:
+    """Run the project U-Net on a BGR image. Returns its native dict, or None."""
     try:
-        lsd = cv2.createLineSegmentDetector(cv2.LSD_REFINE_STD)
-    except AttributeError:
-        lsd = cv2.createLineSegmentDetector()
-    raw = lsd.detect(gray_rot)
-    if raw is None or raw[0] is None:
-        return []
-
-    Mi     = cv2.invertAffineTransform(Mf)
-    result = []
-    for i, line in enumerate(raw[0]):
-        x1r, y1r, x2r, y2r = line[0]
-        if math.hypot(x2r - x1r, y2r - y1r) < SUBREGION_MIN_LEN:
-            continue
-        if _deviation_from_axis(_angle_deg(x1r, y1r, x2r, y2r)) > axis_tolerance:
-            continue
-        w = float(raw[1][i][0]) if raw[1] is not None and i < len(raw[1]) else 2.0
-        # Inverse-rotate back to patch coords, then shift to input-image coords
-        p1r = Mi @ np.array([x1r, y1r, 1.0])
-        p2r = Mi @ np.array([x2r, y2r, 1.0])
-        result.append(dict(
-            p1=(float(p1r[0]) + bx1, float(p1r[1]) + by1),
-            p2=(float(p2r[0]) + bx1, float(p2r[1]) + by1),
-            thickness=max(2.0, w),
-        ))
-    return result
+        from detect_unet import run_unet_pipeline
+    except Exception as exc:
+        logger.info("[diagonal] U-Net module unavailable: %s", exc)
+        return None
+    if not os.path.exists(ckpt_path):
+        logger.info("[diagonal] U-Net checkpoint not found: %s", ckpt_path)
+        return None
+    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    try:
+        return run_unet_pipeline(rgb, ckpt_path, img_size=img_size)
+    except Exception as exc:
+        logger.warning("[diagonal] U-Net inference failed: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
-# WallSegment builder
+# Public entry point
 # ---------------------------------------------------------------------------
 
-def _make_wall_segment(x1: float, y1: float,
-                       x2: float, y2: float,
-                       thickness: float) -> WallSegment:
-    bx1, by1 = min(x1, x2), min(y1, y2)
-    bx2, by2 = max(x1, x2), max(y1, y2)
-    return WallSegment(
-        id=f"diag-{uuid4()}",
-        bbox=BBox(x1=bx1, y1=by1, x2=bx2, y2=by2),
-        thickness=max(THICKNESS_MIN, min(THICKNESS_MAX, thickness)),
-        is_structural=True,
-        is_diagonal=True,
-        outline=[(int(round(x1)), int(round(y1))),
-                 (int(round(x2)), int(round(y2)))],
-    )
+def preprocess_floorplan(
+    image_path: str,
+    unet_ckpt_path: str = UNET_DEFAULT_CKPT,
+    output_dir: Optional[str] = None,
+    grey: Tuple[int, int, int] = GREY_BGR,
+) -> Dict[str, Any]:
+    """
+    Run the full pre-processing pipeline on the floorplan at *image_path*.
+
+    Output: writes a deskewed / text-erased / diagonal-painted PNG to
+    ``<output_dir>/<basename>`` (defaults to ``<input_dir>/deskewed/``)
+    and returns:
+
+        {
+          "deskewed_path": str,        # absolute path of the saved file
+          "normal_labels": [(text,x1,y1,x2,y2), ...],   # in deskewed coords
+          "rotated_labels": [(text,x1,y1,x2,y2), ...],  # in deskewed coords
+          "deskew_angle":  Optional[float],  # CCW degrees, or None
+          "n_diagonal_painted": int,
+          "image_shape":   (H, W),
+        }
+
+    Even when no deskew is needed the output file is still written so that
+    pipeline.py can always source from one location.
+    """
+    image_path = os.path.abspath(image_path)
+    if output_dir is None:
+        output_dir = os.path.join(os.path.dirname(image_path), "deskewed")
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.abspath(os.path.join(output_dir, os.path.basename(image_path)))
+
+    img = cv2.imread(image_path)
+    if img is None:
+        raise FileNotFoundError(f"Cannot read image: {image_path}")
+    base = Path(image_path).stem
+
+    # 1. Crop, 2. small-skew
+    img = _crop_to_floorplan(img)
+    img = _small_skew_correct(img)
+
+    # 3. OCR (both orientations)
+    normal_labels, rotated_labels = _ocr_both_orientations(img)
+    logger.info("[diagonal:%s] OCR collected: %d normal + %d rotated",
+                base, len(normal_labels), len(rotated_labels))
+
+    # 4. Erase text → working image
+    img_clean = _erase_text(img, [normal_labels, rotated_labels])
+
+    # 5. U-Net on text-erased image
+    unet = _run_unet(img_clean, unet_ckpt_path)
+    if unet is None or 'wall_mask' not in unet or 'pred_mask' not in unet:
+        logger.warning("[diagonal:%s] U-Net unavailable — saving image as-is",
+                       base)
+        cv2.imwrite(out_path, img)
+        return {
+            "deskewed_path":      out_path,
+            "normal_labels":      normal_labels,
+            "rotated_labels":     rotated_labels,
+            "deskew_angle":       None,
+            "n_diagonal_painted": 0,
+            "image_shape":        (img.shape[0], img.shape[1]),
+        }
+
+    wall_mask = unet['wall_mask']
+    pred_mask = unet['pred_mask']
+
+    # 6 + 7. LSD on text-erased gray, filter, cluster
+    gray = cv2.cvtColor(img_clean, cv2.COLOR_BGR2GRAY)
+    segs = _run_lsd(gray)
+    segs = _filter_segments_by_mask(segs, wall_mask)
+    clusters = _cluster_segments(segs)
+    logger.info("[diagonal:%s] LSD: %d wall-aligned segs in %d clusters",
+                base, len(segs), len(clusters))
+
+    # 8. Deskew angle
+    deskew = _find_deskew_angle(clusters)
+
+    if deskew is None:
+        # No tilt — the image is already aligned. Still need to scan for
+        # residual diagonals (bay windows, cut corners) to paint grey.
+        out_img = img.copy()
+        n_painted = _paint_diagonal_clusters(out_img, pred_mask, clusters,
+                                              grey=grey)
+        cv2.imwrite(out_path, out_img)
+        logger.info("[diagonal:%s] no deskew needed; %d diagonal patches painted",
+                    base, n_painted)
+        return {
+            "deskewed_path":      out_path,
+            "normal_labels":      normal_labels,
+            "rotated_labels":     rotated_labels,
+            "deskew_angle":       None,
+            "n_diagonal_painted": n_painted,
+            "image_shape":        (out_img.shape[0], out_img.shape[1]),
+        }
+
+    # 9. Deskew everything through M
+    img_desk, M, new_size = _rotate(img, deskew,
+                                     border_value=(255, 255, 255),
+                                     interp=cv2.INTER_LINEAR)
+    pred_desk = _rotate_mask(pred_mask, M, new_size)
+    wall_desk = _rotate_mask(wall_mask, M, new_size)
+    normal_labels  = _transform_labels(normal_labels,  M)
+    rotated_labels = _transform_labels(rotated_labels, M)
+
+    # 10. Find residual diagonals on the deskewed image
+    img_desk_clean = _erase_text(img_desk, [normal_labels, rotated_labels])
+    gray_desk = cv2.cvtColor(img_desk_clean, cv2.COLOR_BGR2GRAY)
+    segs_d = _run_lsd(gray_desk)
+    segs_d = _filter_segments_by_mask(segs_d, wall_desk)
+    clusters_d = _cluster_segments(segs_d)
+
+    # 11. Paint residual diagonals on the deskewed image
+    n_painted = _paint_diagonal_clusters(img_desk, pred_desk, clusters_d,
+                                          grey=grey)
+
+    # 12. Save
+    cv2.imwrite(out_path, img_desk)
+    logger.info("[diagonal:%s] deskewed by %.3f deg, %d diagonal patches painted → %s",
+                base, deskew, n_painted, out_path)
+
+    return {
+        "deskewed_path":      out_path,
+        "normal_labels":      normal_labels,
+        "rotated_labels":     rotated_labels,
+        "deskew_angle":       deskew,
+        "n_diagonal_painted": n_painted,
+        "image_shape":        (img_desk.shape[0], img_desk.shape[1]),
+    }
 
 
 # ---------------------------------------------------------------------------
-# Public API — deskew helpers
+# Backward-compat shims (still imported by pipeline.py during the
+# transition).  The new code path is preprocess_floorplan().
 # ---------------------------------------------------------------------------
 
-def compute_deskew(
-    img: np.ndarray,
-    wall_mask: Optional[np.ndarray] = None,
-    min_length_px: float = MIN_LENGTH_PX,
-    axis_tolerance_deg: float = AXIS_TOLERANCE_DEG,
-    min_angle_deg: float = 3.0,
-    text_boxes: Optional[List[Tuple]] = None,
-) -> Tuple[Optional[float], Optional[np.ndarray], Optional[np.ndarray]]:
-    """
-    Run Phase 1 analysis and return the deskew correction.
-
-    Uses LSD clustering to find the dominant perpendicular axis pair and
-    computes the angle needed to align them with H/V.
-
-    Parameters
-    ----------
-    text_boxes : optional list of (x1, y1, x2, y2, ...) in image coords
-        Pre-computed text bounding boxes used to filter out OCR-noise
-        segments.  When provided, docTR is NOT invoked here (saves one
-        full OCR pass when the caller already has labels).  Items may
-        also be (text, x1, y1, x2, y2) — both formats are accepted.
-
-    Returns
-    -------
-    (angle_deg, M_2x3, img_deskewed)
-        angle_deg    : correction angle in degrees (CCW positive)
-        M_2x3        : 2×3 affine matrix used for the rotation
-        img_deskewed : rotated BGR image
-    If no significant correction is needed, all three values are None.
-    """
-    gray       = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    H, W       = img.shape[:2]
-    image_area = float(H * W)
-
-    wall_mask_bin: Optional[np.ndarray] = (
-        (wall_mask > 0).astype(np.uint8) if wall_mask is not None else None
-    )
-
-    # LSD + frame-border filter
-    segs = _run_lsd(gray, min_length_px, axis_tolerance_deg)
-    segs = [
-        s for s in segs
-        if (max(s['x1'], s['x2']) - min(s['x1'], s['x2'])) *
-           (max(s['y1'], s['y2']) - min(s['y1'], s['y2']))
-           <= MAX_AREA_FRACTION * image_area
-    ]
-
-    # Wall-mask filter (skip colour fallback — we just need a deskew angle)
-    if wall_mask_bin is not None:
-        segs = _filter_by_mask(segs, wall_mask_bin)
-
-    # OCR text filter — use caller-supplied boxes if any, else run docTR
-    if text_boxes is not None:
-        norm_boxes: List[Tuple] = []
-        for item in text_boxes:
-            if len(item) < 4:
-                continue
-            # Accept both (x1,y1,x2,y2,...) and (text,x1,y1,x2,y2,...)
-            if isinstance(item[0], (int, float)) or (
-                hasattr(item[0], '__int__') and not isinstance(item[0], str)
-            ):
-                norm_boxes.append((int(item[0]), int(item[1]),
-                                   int(item[2]), int(item[3])))
-            elif len(item) >= 5:
-                norm_boxes.append((int(item[1]), int(item[2]),
-                                   int(item[3]), int(item[4])))
-        if norm_boxes:
-            segs = _filter_by_text(segs, _build_text_mask(H, W, norm_boxes))
-    else:
-        ocr_boxes = _detect_ocr_boxes(img)
-        if ocr_boxes:
-            segs = _filter_by_text(segs, _build_text_mask(H, W, ocr_boxes))
-
-    # Cluster → dominant perpendicular pair → correction angle
-    clusters = _cluster_segments(segs, CLUSTER_TOL_DEG, axis_tolerance_deg)
-    angle    = _find_deskew_angle(clusters)
-
-    if angle is None or abs(angle) < min_angle_deg:
-        logger.debug("[diagonal] compute_deskew: no significant correction (%.2f deg)",
-                     angle if angle is not None else 0.0)
-        return None, None, None
-
-    img_desk, M, _ = _deskew(img, angle)
-    logger.info("[diagonal] compute_deskew: angle=%.3f deg", angle)
-    return angle, M, img_desk
+def compute_deskew(*args, **kwargs):   # pragma: no cover
+    raise NotImplementedError(
+        "compute_deskew has been replaced by preprocess_floorplan(); "
+        "update pipeline.py to call preprocess_floorplan() instead.")
 
 
-def transform_ocr_labels(
-    labels: List[Tuple],
-    M: np.ndarray,
-) -> List[Tuple]:
-    """
-    Transform pipeline OCR labels through an affine matrix.
-
-    Pipeline OCR label format: (text, x1, y1, x2, y2).
-    All four bbox corners are transformed; result is their AABB.
-    Labels with fewer than 5 elements are passed through unchanged.
-    """
-    result = []
-    for item in labels:
-        if len(item) >= 5:
-            # repack to (x1, y1, x2, y2, text) — format expected by _transform_boxes
-            box = (int(item[1]), int(item[2]), int(item[3]), int(item[4])) + tuple(item[5:])
-            tc  = _transform_boxes([box], M)[0]   # (nx1, ny1, nx2, ny2, text, ...)
-            result.append((item[0], tc[0], tc[1], tc[2], tc[3]) + tc[4:])
-        else:
-            result.append(item)
-    return result
+def transform_ocr_labels(labels, M):
+    """Public wrapper retained for callers that already have an M matrix."""
+    return _transform_labels(labels, M)
 
 
-# ---------------------------------------------------------------------------
-# Public API — wall detection
-# ---------------------------------------------------------------------------
-
-def detect_diagonal_walls(
-    img: np.ndarray,
-    config: PipelineConfig,
-    existing_walls: List[WallSegment],
-    wall_mask: Optional[np.ndarray] = None,
-    axis_tolerance_deg: float = AXIS_TOLERANCE_DEG,
-    min_length_px: float = MIN_LENGTH_PX,
-) -> List[WallSegment]:
-    """
-    Detect non-axis-aligned (diagonal) wall segments using a deskew-based
-    pipeline.  See module docstring for the full algorithm.
-
-    Args:
-        img:            Original BGR image (after pre-processing / crop).
-        config:         Pipeline configuration (wall colour, scale, etc.).
-        existing_walls: Axis-aligned walls already found in Stage 1.
-        wall_mask:      Optional binary UNet wall mask (any positive value = wall).
-        axis_tolerance_deg: Degrees from H/V within which a segment is axis-aligned.
-        min_length_px:  Minimum accepted LSD segment length.
-
-    Returns:
-        List of WallSegment with is_diagonal=True, in original-image coordinates.
-    """
-    gray        = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    H, W        = img.shape[:2]
-    image_area  = float(H * W)
-
-    # Normalise wall mask to 0/1 uint8 regardless of input range
-    wall_mask_bin: Optional[np.ndarray] = None
-    if wall_mask is not None:
-        wall_mask_bin = (wall_mask > 0).astype(np.uint8)
-
-    # ── Phase 1: analyse original image ──────────────────────────────────────
-
-    segs = _run_lsd(gray, min_length_px, axis_tolerance_deg)
-
-    # Drop frame-border segments (huge bounding box → probably image edge artefact)
-    segs = [
-        s for s in segs
-        if (max(s['x1'], s['x2']) - min(s['x1'], s['x2'])) *
-           (max(s['y1'], s['y2']) - min(s['y1'], s['y2']))
-           <= MAX_AREA_FRACTION * image_area
-    ]
-
-    # Wall-content filter
-    if wall_mask_bin is not None:
-        segs = _filter_by_mask(segs, wall_mask_bin)
-    elif not config.auto_wall_color:
-        # Colour-distance fallback when no mask and wall colour is explicit
-        wall_bgr = config.wall_color_bgr
-        segs = [
-            s for s in segs
-            if _color_distance(
-                _sample_color_along_line(img, s['x1'], s['y1'], s['x2'], s['y2']),
-                wall_bgr,
-            ) <= MAX_COLOR_DISTANCE
-        ]
-
-    # OCR text filter — silently skipped if docTR is not installed
-    text_boxes = _detect_ocr_boxes(img)
-    if text_boxes:
-        logger.info("[diagonal] Phase 1 OCR: %d word regions found", len(text_boxes))
-        segs = _filter_by_text(segs, _build_text_mask(H, W, text_boxes))
-
-    # Cluster all segments and look for a dominant perpendicular pair
-    clusters     = _cluster_segments(segs, CLUSTER_TOL_DEG, axis_tolerance_deg)
-    deskew_angle = _find_deskew_angle(clusters)
-
-    logger.info(
-        "[diagonal] Phase 1: %d segs, %d clusters, deskew=%.2f deg",
-        len(segs), len(clusters),
-        deskew_angle if deskew_angle is not None else 0.0,
-    )
-
-    # ── Fallback: image already aligned, or no dominant perpendicular pair ──────
-    # This fires when (a) deskew_angle is None (no perpendicular pair detected),
-    # OR (b) the dominant cluster is already axis-aligned (image was pre-deskewed
-    # by Stage 1c before this call).  In both cases we just find the diagonal
-    # segments that are genuinely present in the current image and process them
-    # via sub-region rotation for clean wall boundaries.
-    if deskew_angle is None:
-        results: List[WallSegment] = []
-        for cluster in clusters:
-            if not cluster['is_diagonal']:
-                continue
-            if cluster['total_length'] >= DIAG_CLUSTER_MIN_LEN:
-                # Large cluster: rotate sub-region so diagonal → 0°, detect H/V there
-                sub_walls = _process_diagonal_cluster(
-                    img, cluster, SUBREGION_PADDING, axis_tolerance_deg)
-                for sw in sub_walls:
-                    bbox = (min(sw['p1'][0], sw['p2'][0]),
-                            min(sw['p1'][1], sw['p2'][1]),
-                            max(sw['p1'][0], sw['p2'][0]),
-                            max(sw['p1'][1], sw['p2'][1]))
-                    if _overlaps_existing(bbox, existing_walls):
-                        continue
-                    ox1r, oy1r, ox2r, oy2r = _refine_endpoints(
-                        sw['p1'][0], sw['p1'][1],
-                        sw['p2'][0], sw['p2'][1], existing_walls)
-                    results.append(_make_wall_segment(
-                        ox1r, oy1r, ox2r, oy2r, sw['thickness']))
-            else:
-                # Small cluster: return the raw LSD segments directly
-                for seg in cluster['members']:
-                    bbox = (min(seg['x1'], seg['x2']), min(seg['y1'], seg['y2']),
-                            max(seg['x1'], seg['x2']), max(seg['y1'], seg['y2']))
-                    if _overlaps_existing(bbox, existing_walls):
-                        continue
-                    ox1r, oy1r, ox2r, oy2r = _refine_endpoints(
-                        seg['x1'], seg['y1'], seg['x2'], seg['y2'], existing_walls)
-                    results.append(_make_wall_segment(
-                        ox1r, oy1r, ox2r, oy2r, seg['width']))
-        logger.info(
-            "[diagonal] Fallback: %d diagonal walls (%d clusters processed)",
-            len(results), sum(1 for c in clusters if c['is_diagonal']),
-        )
-        return results
-
-    # ── Phase 2: deskewed image ───────────────────────────────────────────────
-
-    img_desk, M, new_size = _deskew(img, deskew_angle)
-    W_desk, H_desk        = new_size   # OpenCV convention: (width, height)
-
-    # Rotate wall mask with INTER_NEAREST to preserve 0/1 values
-    wall_mask_desk: Optional[np.ndarray] = (
-        _rotate_mask(wall_mask_bin, M, new_size) if wall_mask_bin is not None else None
-    )
-
-    # Transform OCR boxes into deskewed coordinate space (no second OCR call)
-    text_boxes_desk = _transform_boxes(text_boxes, M) if text_boxes else []
-    text_mask_desk: Optional[np.ndarray] = (
-        _build_text_mask(H_desk, W_desk, text_boxes_desk) if text_boxes_desk else None
-    )
-
-    # LSD on deskewed image
-    gray_desk = cv2.cvtColor(img_desk, cv2.COLOR_BGR2GRAY)
-    segs_desk = _run_lsd(gray_desk, min_length_px, axis_tolerance_deg)
-
-    if wall_mask_desk is not None:
-        segs_desk = _filter_by_mask(segs_desk, wall_mask_desk)
-    if text_mask_desk is not None:
-        segs_desk = _filter_by_text(segs_desk, text_mask_desk)
-
-    # H/V segments in deskewed space = walls that were diagonal in original image
-    segs_hv = [s for s in segs_desk if not s['is_diagonal']]
-
-    logger.info(
-        "[diagonal] Phase 2: %d segs on deskewed image, %d are H/V (former diagonals)",
-        len(segs_desk), len(segs_hv),
-    )
-
-    # Inverse affine: deskewed coords → original-image coords
-    M_inv   = cv2.invertAffineTransform(M)
-    results = []
-
-    # ── Primary: H/V segments → back to original coords ──────────────────────
-    for seg in segs_hv:
-        ox1, oy1 = _transform_pt(M_inv, seg['x1'], seg['y1'])
-        ox2, oy2 = _transform_pt(M_inv, seg['x2'], seg['y2'])
-        bbox = (min(ox1, ox2), min(oy1, oy2), max(ox1, ox2), max(oy1, oy2))
-        if _overlaps_existing(bbox, existing_walls):
-            continue
-        ox1r, oy1r, ox2r, oy2r = _refine_endpoints(ox1, oy1, ox2, oy2, existing_walls)
-        results.append(_make_wall_segment(ox1r, oy1r, ox2r, oy2r, seg['width']))
-
-    # ── Secondary: remaining diagonal clusters in deskewed space ─────────────
-    # These are walls at angles other than the primary diagonal direction
-    # (e.g. a 30° wall in an image whose dominant diagonal was 45°).
-    clusters_desk = _cluster_segments(segs_desk, CLUSTER_TOL_DEG, axis_tolerance_deg)
-    for cluster in clusters_desk:
-        if not cluster['is_diagonal']:
-            continue
-        if cluster['total_length'] < DIAG_CLUSTER_MIN_LEN:
-            continue  # skip tiny residual noise clusters
-        sub_walls = _process_diagonal_cluster(
-            img_desk, cluster, SUBREGION_PADDING, axis_tolerance_deg)
-        for sw in sub_walls:
-            # Transform from deskewed-image coords back to original-image coords
-            p1x, p1y = _transform_pt(M_inv, sw['p1'][0], sw['p1'][1])
-            p2x, p2y = _transform_pt(M_inv, sw['p2'][0], sw['p2'][1])
-            bbox = (min(p1x, p2x), min(p1y, p2y), max(p1x, p2x), max(p1y, p2y))
-            if _overlaps_existing(bbox, existing_walls):
-                continue
-            ox1r, oy1r, ox2r, oy2r = _refine_endpoints(p1x, p1y, p2x, p2y,
-                                                         existing_walls)
-            results.append(_make_wall_segment(ox1r, oy1r, ox2r, oy2r,
-                                              sw['thickness']))
-
-    logger.info("[diagonal] Phase 2 total: %d diagonal walls returned", len(results))
-    return results
+def detect_diagonal_walls(*args, **kwargs):   # pragma: no cover
+    """Removed — diagonal walls are now baked into the deskewed image as
+    grey filled rectangles by ``preprocess_floorplan``."""
+    return []
