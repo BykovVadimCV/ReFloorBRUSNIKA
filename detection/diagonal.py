@@ -438,7 +438,7 @@ def _find_deskew_angle(clusters: List[Dict],
                         secondary['cluster_angle']) - 90.0) > perp_tol:
         return None
     dev = primary['cluster_angle'] % 90.0
-    correction = -dev if dev <= 45.0 else (90.0 - dev)
+    correction = dev if dev <= 45.0 else (dev - 90.0)
     return correction if abs(correction) >= min_angle else None
 
 
