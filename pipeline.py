@@ -1205,26 +1205,29 @@ class FloorplanPipeline:
 
         result = PipelineResult()
 
-        # ── Pre-stage 0: diagonal pre-processor ───────────────────────
-        # detection.diagonal.preprocess_floorplan is the single front
-        # door for everything that used to be Pre-stages 0a/0b/0c plus
-        # the text-erasure pre-stage:
-        #   • crop to the floorplan extent
-        #   • correct small scanner skew (≤5°)
-        #   • run docTR OCR (normal + 90° CW) and stash labels
-        #   • run U-Net once and use its wall mask to filter LSD
-        #   • cluster LSD angles → find the dominant axis pair
-        #   • if a tilt is found, deskew the image AND the OCR labels
-        #     through one shared affine matrix
-        #   • for any walls / windows / doors that are STILL diagonal on
-        #     the deskewed image, paint them as clean grey filled quads
-        #     so the rest of this pipeline only sees axis-aligned ink
-        #   • write the result to <input_dir>/deskewed/<basename>
-        #
-        # The pipeline below treats that file as its input image; it no
-        # longer runs OCR itself and no longer needs a Stage 1c diagonal
-        # detector — those concerns are baked into the pre-processed
-        # image.
+        # ── Pre-stage 0a: crop to floorplan extent ────────────────────
+        # This is the ONLY step that runs before the diagonal pre-processor.
+        # It trims legend / margins so that subsequent U-Net and LSD stages
+        # work on a clean, tightly-bounded floorplan.
+        _notify("crop to floorplan")
+        _raw_img = cv2.imread(image_path)
+        if _raw_img is None:
+            raise ValueError(f"Cannot read input image: {image_path}")
+        _cropped_img = _crop_to_floorplan(_raw_img)
+        if _cropped_img.shape != _raw_img.shape:
+            logger.info(
+                "[%s] Pre-stage 0a: cropped %dx%d → %dx%d",
+                base_name,
+                _raw_img.shape[1], _raw_img.shape[0],
+                _cropped_img.shape[1], _cropped_img.shape[0],
+            )
+        del _raw_img
+
+        # ── Pre-stage 0b: diagonal pre-processor ──────────────────────
+        # Receives the already-cropped image so it does not need to crop
+        # again.  Handles small-skew correction, OCR, U-Net, LSD
+        # clustering, deskewing, and painting diagonal walls grey.
+        # Writes the result to <input_dir>/deskewed/<basename>.
         _notify("diagonal pre-processor (OCR + U-Net + deskew + paint)")
         try:
             from detection.diagonal import preprocess_floorplan
@@ -1242,7 +1245,9 @@ class FloorplanPipeline:
             image_path=image_path,
             unet_ckpt_path=unet_ckpt,
             output_dir=diag_out_dir,
+            _preloaded_img=_cropped_img,
         )
+        del _cropped_img
 
         deskewed_path = diag["deskewed_path"]
         ocr_text_labels_early = list(diag.get("normal_labels")  or [])
@@ -1423,7 +1428,7 @@ class FloorplanPipeline:
             result.outline_mask = detection.outline_mask
 
         # Stage 1c (residual diagonal wall detection) is no longer needed:
-        # detection.diagonal.preprocess_floorplan paints any non-axis-aligned
+        # Pre-stage 0b (preprocess_floorplan) paints any non-axis-aligned
         # walls / windows / doors as filled grey quads on the deskewed image
         # before Stage 1 runs, so the colour / U-Net wall detector picks them
         # up as ordinary axis-aligned walls.

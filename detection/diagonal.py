@@ -612,6 +612,8 @@ def preprocess_floorplan(
     unet_ckpt_path: str = UNET_DEFAULT_CKPT,
     output_dir: Optional[str] = None,
     grey: Tuple[int, int, int] = GREY_BGR,
+    *,
+    _preloaded_img: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Run the full pre-processing pipeline on the floorplan at *image_path*.
@@ -638,13 +640,18 @@ def preprocess_floorplan(
     os.makedirs(output_dir, exist_ok=True)
     out_path = os.path.abspath(os.path.join(output_dir, os.path.basename(image_path)))
 
-    img = cv2.imread(image_path)
-    if img is None:
-        raise FileNotFoundError(f"Cannot read image: {image_path}")
+    if _preloaded_img is not None:
+        img = _preloaded_img.copy()
+    else:
+        img = cv2.imread(image_path)
+        if img is None:
+            raise FileNotFoundError(f"Cannot read image: {image_path}")
     base = Path(image_path).stem
 
-    # 1. Crop, 2. small-skew
-    img = _crop_to_floorplan(img)
+    # 1. Small-skew correction (crop is the caller's responsibility when
+    #    _preloaded_img is supplied; if called standalone it is still the
+    #    caller's choice — test_diag.py crops explicitly before calling the
+    #    individual helper functions).
     img = _small_skew_correct(img)
 
     # 3. OCR (both orientations)
