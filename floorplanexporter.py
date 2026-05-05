@@ -920,7 +920,7 @@ class RoomDetector:
         self,
         resolution: float = 0.5,        # finer raster → sharper corners
         min_room_area_cm2: float = 2000.0,
-        wall_dilation_px: int = 2,
+        wall_dilation_px: int = 4,
         contour_simplify_ratio: float = 0.003,   # less aggressive simplification
         snap_tolerance_cm: float = 18.0,          # max snap distance
     ) -> None:
@@ -1057,12 +1057,22 @@ class RoomDetector:
     # ---- flood-fill exterior, then interior = rooms ----
     def _extract_interior(self, mask: np.ndarray) -> np.ndarray:
         h, w = mask.shape
-        flood = mask.copy()
-        # cv2.floodFill needs a mask that is h+2 × w+2
+        # Aggressively close micro-gaps before flood-fill so that small breaks
+        # in wall rasters don't leak exterior into room interiors.
+        # Two passes: a small close (single-pixel gaps) then a larger one
+        # (2-pixel gaps at junction corners) with the original subtracted back
+        # so we don't over-shrink rooms.
+        k3 = np.ones((3, 3), dtype=np.uint8)
+        k5 = np.ones((5, 5), dtype=np.uint8)
+        sealed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k3, iterations=1)
+        sealed = cv2.morphologyEx(sealed, cv2.MORPH_CLOSE, k5, iterations=2)
+        # Union with original so no wall pixels are lost
+        sealed = cv2.bitwise_or(sealed, mask)
+
+        flood = sealed.copy()
         ff_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-        # Fill from (0, 0) — guaranteed to be exterior because of padding
         cv2.floodFill(flood, ff_mask, (0, 0), 128)
-        # flood now: 255 = wall, 128 = exterior, 0 = interior
+        # flood: 255 = wall, 128 = exterior, 0 = interior
         interior = (flood == 0).astype(np.uint8) * 255
         return interior
 

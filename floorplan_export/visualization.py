@@ -441,6 +441,82 @@ def build_windows_overlay(
     return overlay
 
 
+def build_rooms_openings_overlay(
+    img: np.ndarray,
+    rooms: List[Any],
+    openings: List[Any],
+    door_arcs: List[Any] = None,
+    pixels_to_cm: float = 2.54,
+) -> np.ndarray:
+    """Draw rooms as filled polygons with doors and windows overlaid."""
+    from core.models import OpeningType as UOpeningType, Point as UPoint
+
+    overlay = img.copy()
+    fill_layer = np.zeros_like(img)
+
+    fills = VisualizationTheme.ROOM_FILLS
+    borders = VisualizationTheme.ROOM_BORDERS
+
+    for i, room in enumerate(rooms or []):
+        color_hex = fills[i % len(fills)]
+        border_hex = borders[i % len(borders)]
+        # Convert hex to BGR
+        r, g, b = int(color_hex[1:3], 16), int(color_hex[3:5], 16), int(color_hex[5:7], 16)
+        fill_bgr = (b, g, r)
+        br, bg, bb = int(border_hex[1:3], 16), int(border_hex[3:5], 16), int(border_hex[5:7], 16)
+        border_bgr = (bb, bg, br)
+
+        pts_px = [
+            (int(p.x / pixels_to_cm), int(p.y / pixels_to_cm))
+            for p in room.points
+        ]
+        if len(pts_px) < 3:
+            continue
+        arr = np.array(pts_px, dtype=np.int32)
+        cv2.fillPoly(fill_layer, [arr], fill_bgr)
+        cv2.polylines(overlay, [arr], True, border_bgr, 2)
+
+        # Room label at centroid
+        cx = int(sum(p[0] for p in pts_px) / len(pts_px))
+        cy = int(sum(p[1] for p in pts_px) / len(pts_px))
+        label = getattr(room, 'name', f'Room {i+1}')
+        cv2.putText(overlay, label, (cx - 20, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, border_bgr, 1, cv2.LINE_AA)
+
+    # Blend room fills
+    fill_mask = np.any(fill_layer > 0, axis=2)
+    overlay[fill_mask] = cv2.addWeighted(
+        overlay, 0.35, fill_layer, 0.65, 0,
+    )[fill_mask]
+
+    # Draw openings on top
+    for op in (openings or []):
+        x1, y1, x2, y2 = op.bbox.to_int_tuple()
+        if op.opening_type == UOpeningType.DOOR:
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), VisualizationTheme.DOOR_BORDER_CV2, 2)
+        elif op.opening_type == UOpeningType.WINDOW:
+            sub = overlay[y1:y2, x1:x2]
+            if sub.size:
+                tint = np.full_like(sub, VisualizationTheme.WINDOW_TINT_CV2)
+                cv2.addWeighted(sub, 0.55, tint, 0.45, 0, sub)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), VisualizationTheme.WINDOW_BORDER_CV2, 2)
+
+    # Draw door arcs
+    if door_arcs:
+        try:
+            from detection.doordetector import AlgorithmicDoorArcDetector
+            for arc in door_arcs:
+                AlgorithmicDoorArcDetector.draw_arc_on_image(
+                    overlay, arc,
+                    color=VisualizationTheme.DOOR_BORDER_CV2,
+                    thickness=2, draw_hinge=True, draw_label=False,
+                )
+        except Exception:
+            pass
+
+    return overlay
+
+
 # ============================================================
 # SUMMARY RENDERER (2×3 GRID)
 # ============================================================
@@ -529,23 +605,20 @@ class FloorplanVisualizer:
         _axes_clean(ax, 'Original')
         _watermark(ax)
 
-        # Panel 2: Wall BBoxes
+        # Panel 2: U-Net Mask (raw)
         ax = fig.add_subplot(gs[0, 1])
-        wall_bbox_img = build_wall_bbox_overlay(
-            img_bgr, wall_segments, measurements)
+        wall_bbox_img = build_wall_mask_overlay(img_bgr, wall_mask)
         ax.imshow(cv2.cvtColor(wall_bbox_img, cv2.COLOR_BGR2RGB),
                   interpolation='bilinear')
-        _axes_clean(ax, f'Wall Bounding Boxes ({n_walls})')
+        _axes_clean(ax, f'U-Net Mask (raw)')
         _watermark(ax)
 
-        # Panel 3: Wall Mask Overlay
+        # Panel 3: Rect Decomposition
         ax = fig.add_subplot(gs[0, 2])
-        # Prefer outline_mask if wall_mask is None
-        mask_to_show = wall_mask if wall_mask is not None else outline_mask
-        mask_overlay_img = build_wall_mask_overlay(img_bgr, mask_to_show)
+        mask_overlay_img = build_wall_mask_overlay(img_bgr, outline_mask)
         ax.imshow(cv2.cvtColor(mask_overlay_img, cv2.COLOR_BGR2RGB),
                   interpolation='bilinear')
-        _axes_clean(ax, 'Wall Mask Overlay')
+        _axes_clean(ax, 'Rect Decomposition')
         _watermark(ax)
 
         # ── Row 2 ─────────────────────────────────────────────────
@@ -577,7 +650,7 @@ class FloorplanVisualizer:
         )
         ax.imshow(cv2.cvtColor(combined, cv2.COLOR_BGR2RGB),
                   interpolation='bilinear')
-        _axes_clean(ax, 'All Combined')
+        _axes_clean(ax, f'Walls + Openings ({n_walls}w)')
         _watermark(ax)
 
         fig.savefig(
@@ -586,6 +659,25 @@ class FloorplanVisualizer:
             edgecolor='none', pad_inches=0.015,
         )
         plt.close(fig)
+
+    def render_rooms_with_openings(
+        self,
+        img_bgr: np.ndarray,
+        rooms: List[Any],
+        openings: List[Any],
+        door_arcs: List[Any],
+        output_path: str,
+        pixels_to_cm: float = 2.54,
+    ) -> None:
+        """Save a single-panel rooms+openings image."""
+        out = build_rooms_openings_overlay(
+            img_bgr,
+            rooms=rooms,
+            openings=openings,
+            door_arcs=door_arcs,
+            pixels_to_cm=pixels_to_cm,
+        )
+        cv2.imwrite(output_path, out)
 
     def render_room_ocr_overlay(
         self,

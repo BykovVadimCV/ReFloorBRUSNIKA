@@ -36,11 +36,6 @@ from core.models import (
 )
 from detection.walls import (
     ColorWallDetector,
-    _build_enclosed_regions,
-    build_grey_wall_image,
-    debug_enclosed_regions,
-    find_unenclosed_wall_rects,
-    paint_unenclosed_walls_grey,
     refine_wall_mask_by_enclosed_regions,
     snap_walls,
     wall_rectangle_to_segment,
@@ -1310,9 +1305,6 @@ class FloorplanPipeline:
         raw_rectangles = None
         unet_door_bboxes: list = []
         unet_window_bboxes: list = []
-        used_unet_grey = False
-        has_unet_openings = False
-        enclosed_labels = None
         detection = None
         unet_detection = None
 
@@ -1343,13 +1335,17 @@ class FloorplanPipeline:
                     base_name, len(result.walls),
                     sum(1 for w in result.walls if w.is_diagonal),
                 )
+                # Save intermediate masks for debugging
+                _unet_raw_path = os.path.join(output_dir, f"{base_name}_unet_raw.png")
+                cv2.imwrite(_unet_raw_path, _rd_res.wall_mask if _rd_res.wall_mask is not None else np.zeros((2,2), np.uint8))
+                _rect_mask_path = os.path.join(output_dir, f"{base_name}_rect_mask.png")
+                cv2.imwrite(_rect_mask_path, _rast)
             except Exception as exc:
                 logger.exception(
                     "[%s] Rect-wall detection failed (%s) — falling back to "
                     "legacy U-Net/colour path", base_name, exc,
                 )
                 # Fall through to the legacy path with normal vars
-                used_unet_grey = False
                 result.walls = []
             finally:
                 # Free the cleaned image; downstream stages use `img`
@@ -1381,96 +1377,8 @@ class FloorplanPipeline:
                     base_name, len(unet_door_bboxes), len(unet_window_bboxes),
                 )
                 unet_detection = None  # skip grey wall pipeline, keep door bboxes
-            else:
-                # ── Global solid vs hollow check ──────────────────────────
-                # Sample pixels inside the U-Net wall mask to decide whether
-                # the image has solid-colour walls (use colour detector) or
-                # hollow/outline walls (use grey-fill pipeline).
-                WHITE_THRESH = 240
-                gray_orig = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                mask_px = unet_wall_mask > 0
-                total_mask_px = int(np.sum(mask_px))
-                if total_mask_px > 0:
-                    non_white_px = int(np.sum(gray_orig[mask_px] < WHITE_THRESH))
-                    solid_ratio = non_white_px / total_mask_px
-                else:
-                    solid_ratio = 0.0
-                del gray_orig
 
-                is_solid = solid_ratio >= self.config.solid_wall_threshold
-                logger.info(
-                    "[%s] Wall-mask non-white ratio: %.1f%% (threshold %.0f%%) → %s",
-                    base_name, solid_ratio * 100,
-                    self.config.solid_wall_threshold * 100,
-                    "solid" if is_solid else "hollow",
-                )
-
-                if is_solid:
-                    logger.info(
-                        "[%s] Solid-wall image — skipping grey pipeline, "
-                        "using direct colour detection",
-                        base_name,
-                    )
-                    has_unet_openings = bool(unet_door_bboxes or unet_window_bboxes)
-                    unet_detection = None  # fall through to colour path below
-
-        if _legacy_walls_active and unet_detection is not None:
-            unet_wall_mask, unet_door_bboxes, unet_window_bboxes = unet_detection
-
-            # ── Stage 1 (hollow path): enclosed regions → grey image ─────
-            _notify("detecting walls (U-Net hybrid)")
-            logger.info("[%s] Stage 1: U-Net hybrid wall detection", base_name)
-
-            num_labels, labels = _build_enclosed_regions(img)
-            logger.info("[%s] Found %d enclosed regions", base_name, num_labels - 1)
-            enclosed_labels = labels          # pass to room detector later
-
-            grey_img = build_grey_wall_image(
-                original_bgr=img,
-                labels=labels,
-                num_labels=num_labels,
-                wall_mask=unet_wall_mask,
-                coverage_threshold=0.50,
-            )
-
-            # Add unenclosed wall rects (walls the U-Net sees but
-            # enclosed-region analysis missed due to outline gaps)
-            unenclosed_rects = find_unenclosed_wall_rects(
-                img, unet_wall_mask,
-                min_area=200, merge_gap=15, min_merged_area=1000)
-            if unenclosed_rects:
-                grey_img = paint_unenclosed_walls_grey(
-                    grey_img, unenclosed_rects, grey_value=160)
-                logger.info("[%s] Added %d unenclosed wall rects to grey image",
-                            base_name, len(unenclosed_rects))
-
-            grey_path = os.path.join(output_dir, f"{base_name}_grey_walls.png")
-            cv2.imwrite(grey_path, grey_img)
-            logger.info("[%s] Grey wall image saved: %s", base_name, grey_path)
-
-            debug_path = os.path.join(output_dir, f"{base_name}_enclosed_regions.png")
-            debug_enclosed_regions(
-                original_img=img,
-                wall_mask=unet_wall_mask,
-                output_path=debug_path,
-            )
-
-            del img_clean  # free ~75MB
-
-            GREY_WALL_RGB = (160, 160, 160)
-            detection = self.wall_detector.detect_with_color(grey_img, GREY_WALL_RGB)
-            raw_rectangles = self.wall_detector._last_rectangles
-            del grey_img
-
-            used_unet_grey = True
-            logger.info("[%s] U-Net hybrid: %d walls from grey image",
-                        base_name, len(detection.walls))
-
-            result.walls = detection.walls
-            result.wall_mask = detection.wall_mask
-            result.outline_mask = detection.outline_mask
-
-        if _legacy_walls_active and not used_unet_grey:
+        if _legacy_walls_active:
             # ── Stage 1 (fallback): colour-based wall detection ──────────
             _notify("detecting walls")
             logger.info("[%s] Stage 1: Colour-based wall detection", base_name)
@@ -1514,62 +1422,43 @@ class FloorplanPipeline:
 
         pixel_scale = self.config.pixels_to_m
 
-        if used_unet_grey:
-            # ── Hollow-wall U-Net path: U-Net doors are ground truth ──────────
-            # Gap detection is unreliable on hollow-wall images (the colour
-            # detector sees the grey fill, not actual wall pixels), so skip it
-            # entirely and use only the U-Net door/window bboxes.
-            door_arcs = []
-            if unet_door_bboxes or unet_window_bboxes:
-                openings = self._unet_bboxes_to_openings(
-                    unet_door_bboxes, unet_window_bboxes
-                )
-                logger.info(
-                    "[%s] Hollow-wall path: using %d U-Net openings exclusively "
-                    "(gap detection skipped)",
-                    base_name, len(openings),
-                )
-            else:
-                openings = []
-                logger.info("[%s] Hollow-wall path: no U-Net openings found", base_name)
-        else:
-            # ── Solid-wall / no-U-Net path: gap + U-Net combined ─────────────
-            openings, door_arcs = self._run_opening_detection(
-                img=img,
-                walls=result.walls,
-                wall_mask=result.wall_mask,
-                outline_mask=result.outline_mask,
-                wall_rectangles=raw_rectangles,
-                yolo_results=yolo_results,
-                ocr_bboxes=ocr_bboxes,
-                pixel_scale=pixel_scale,
-                base_name=base_name,
+        # ── Solid-wall / no-U-Net path: gap + U-Net combined ─────────────
+        openings, door_arcs = self._run_opening_detection(
+            img=img,
+            walls=result.walls,
+            wall_mask=result.wall_mask,
+            outline_mask=result.outline_mask,
+            wall_rectangles=raw_rectangles,
+            yolo_results=yolo_results,
+            ocr_bboxes=ocr_bboxes,
+            pixel_scale=pixel_scale,
+            base_name=base_name,
+        )
+
+        # Supplement with U-Net doors that don't overlap gap detections
+        if unet_door_bboxes or unet_window_bboxes:
+            unet_openings = self._unet_bboxes_to_openings(
+                unet_door_bboxes, unet_window_bboxes
             )
+            priority_for_door = [o for o in openings if o.opening_type in (OpeningType.GAP, OpeningType.DOOR)]
+            priority_for_window = [o for o in openings if o.opening_type == OpeningType.WINDOW]
 
-            # Supplement with U-Net doors that don't overlap gap detections
-            if unet_door_bboxes or unet_window_bboxes:
-                unet_openings = self._unet_bboxes_to_openings(
-                    unet_door_bboxes, unet_window_bboxes
+            filtered_unet = []
+            overlapping_count = 0
+            for uo in unet_openings:
+                priority_list = priority_for_door if uo.opening_type == OpeningType.DOOR else priority_for_window
+                if any(self._bbox_iou(uo.bbox, po.bbox) > 0.3 for po in priority_list):
+                    overlapping_count += 1
+                else:
+                    filtered_unet.append(uo)
+
+            if filtered_unet:
+                openings.extend(filtered_unet)
+                logger.info(
+                    "[%s] U-Net supplement: added %d/%d openings "
+                    "(%d overlapped gap/door detections)",
+                    base_name, len(filtered_unet), len(unet_openings), overlapping_count,
                 )
-                priority_for_door = [o for o in openings if o.opening_type in (OpeningType.GAP, OpeningType.DOOR)]
-                priority_for_window = [o for o in openings if o.opening_type == OpeningType.WINDOW]
-
-                filtered_unet = []
-                overlapping_count = 0
-                for uo in unet_openings:
-                    priority_list = priority_for_door if uo.opening_type == OpeningType.DOOR else priority_for_window
-                    if any(self._bbox_iou(uo.bbox, po.bbox) > 0.3 for po in priority_list):
-                        overlapping_count += 1
-                    else:
-                        filtered_unet.append(uo)
-
-                if filtered_unet:
-                    openings.extend(filtered_unet)
-                    logger.info(
-                        "[%s] U-Net supplement: added %d/%d openings "
-                        "(%d overlapped gap/door detections)",
-                        base_name, len(filtered_unet), len(unet_openings), overlapping_count,
-                    )
 
         result.openings = openings
         result.door_arcs = door_arcs
@@ -1666,7 +1555,7 @@ class FloorplanPipeline:
             ocr_labels=ocr_labels,
             debug_image_path=debug_img_path,
             wall_mask=result.wall_mask,
-            enclosed_labels=enclosed_labels,
+            enclosed_labels=None,
         )
 
         result.rooms = rooms
@@ -1712,7 +1601,7 @@ class FloorplanPipeline:
                     ocr_labels=ocr_labels,
                     debug_image_path=debug_img_path,
                     wall_mask=result.wall_mask,
-                    enclosed_labels=enclosed_labels,
+                    enclosed_labels=None,
                 )
                 result.rooms = rooms
                 result.sh3d_path = sh3d_path if os.path.exists(sh3d_path) else None
@@ -1758,6 +1647,17 @@ class FloorplanPipeline:
                 ocr_labels=ocr_labels,
                 door_arcs=result.door_arcs,
                 output_path=rooms_ocr_path,
+            )
+
+        # Additional output: rooms with doors and windows
+        if result.rooms:
+            rooms_openings_path = os.path.join(output_dir, f"{base_name}_rooms_openings.png")
+            self._render_rooms_with_openings(
+                img=img,
+                rooms=result.rooms,
+                openings=result.openings,
+                door_arcs=result.door_arcs,
+                output_path=rooms_openings_path,
             )
 
         result.summary_path = summary_path if os.path.exists(summary_path) else None
@@ -2205,6 +2105,27 @@ class FloorplanPipeline:
             )
         except Exception as e:
             logger.warning("Room OCR rendering failed (non-fatal): %s", e, exc_info=True)
+
+    def _render_rooms_with_openings(
+        self,
+        img: np.ndarray,
+        rooms: List[Room],
+        openings: List[Opening],
+        door_arcs: List,
+        output_path: str,
+    ) -> None:
+        """Render rooms polygons overlaid with all openings (doors + windows)."""
+        try:
+            self.visualizer.render_rooms_with_openings(
+                img_bgr=img,
+                rooms=rooms,
+                openings=openings,
+                door_arcs=door_arcs,
+                output_path=output_path,
+                pixels_to_cm=self.config.pixels_to_cm,
+            )
+        except Exception as e:
+            logger.warning("Rooms+openings rendering failed (non-fatal): %s", e, exc_info=True)
 
     @staticmethod
     def _walls_to_stubs(walls: List[WallSegment]) -> List:
