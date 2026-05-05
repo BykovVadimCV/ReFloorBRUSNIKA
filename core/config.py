@@ -306,6 +306,10 @@ class PipelineConfig:
     rect_snap_gap_floor:  float = 6.0    # but never below this many pixels
     rect_snap_angle_deg:  float = 5.0    # rectangles must agree within this angle
 
+    # Hard spill cap: any candidate rect whose non-wall-pixel fraction exceeds
+    # this is rejected regardless of its score.  0.15 = max 15% bleed.
+    rect_max_spill: float = 0.15
+
     # Door/window diagonal filter — openings whose parent wall has angle
     # deviating from 0°/90° by more than this are dropped (see #1 in spec:
     # diagonals not allowed for openings).

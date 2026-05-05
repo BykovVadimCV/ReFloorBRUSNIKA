@@ -458,6 +458,19 @@ def _overlap_fraction(rect: Rect, placed_union: np.ndarray,
     return int(np.count_nonzero(pix & placed_union)) / area
 
 
+def _spill_fraction(rect: Rect, outside_mask: np.ndarray,
+                    H: int, W: int) -> float:
+    """
+    Return the fraction of `rect`'s pixels that fall OUTSIDE the original
+    wall mask (i.e. the bleed ratio).  0.0 = perfect containment.
+    """
+    pix  = rasterise(rect, H, W)
+    area = int(np.count_nonzero(pix))
+    if area == 0:
+        return 0.0
+    return int(np.count_nonzero(pix & outside_mask)) / area
+
+
 # ---------------------------------------------------------------------------
 # Main decomposition
 # ---------------------------------------------------------------------------
@@ -474,6 +487,7 @@ def decompose(
     axis_only:            bool  = False,
     axis_gap:             float = 0.0,
     max_overlap:          float = 0.5,
+    max_spill_fraction:   float = 0.15,
     refine:               bool  = True,
     verbose:              bool  = True,
 ) -> List[Rect]:
@@ -523,6 +537,12 @@ def decompose(
                            Candidates exceeding this threshold are rejected
                            during the angle search; if no candidate at any
                            angle satisfies the constraint, the loop terminates.
+    max_spill_fraction   : maximum fraction of a candidate rectangle's pixels
+                           that may fall OUTSIDE the original mask (i.e. bleed
+                           into non-wall territory).  Default 0.15 (15%).
+                           Hard-rejects any candidate — before and after
+                           refinement — whose outside-pixel ratio exceeds this
+                           limit.  Set to 1.0 to disable.
     refine               : if True, hill-climb each placed rectangle.
     verbose              : print live progress.
 
@@ -576,6 +596,10 @@ def decompose(
                           f"angle {angle:5.1f}° ({i+1}/{len(angles)})  bw={current_bleed:.1f}")
             rect, s = best_rect_at_angle(remaining, outside, angle, max_grid_dim, current_bleed)
             if rect is not None and s > best_score:
+                # Hard-reject if the rect bleeds too much outside the mask.
+                if max_spill_fraction < 1.0:
+                    if _spill_fraction(rect, outside, H, W) > max_spill_fraction:
+                        continue
                 # Reject candidates that overlap previously-placed rectangles
                 # by more than max_overlap of their own area.
                 if max_overlap < 1.0 and chosen:
@@ -598,8 +622,15 @@ def decompose(
                 if verbose:
                     print(f"\n✗ Refined rect ({best_score}px) below threshold — done.")
                 break
-            # Refinement can drift the rectangle into a higher-overlap region;
-            # re-check the constraint after the hill-climb completes.
+            # Refinement can drift the rectangle; re-check spill constraint.
+            if max_spill_fraction < 1.0:
+                sf = _spill_fraction(best_rect, outside, H, W)
+                if sf > max_spill_fraction:
+                    if verbose:
+                        print(f"\n✗ Refined rect spills {100*sf:.0f}% (>"
+                              f"{100*max_spill_fraction:.0f}%) — done.")
+                    break
+            # Re-check the overlap constraint after the hill-climb completes.
             if max_overlap < 1.0 and chosen:
                 ovf = _overlap_fraction(best_rect, placed_union, H, W)
                 if ovf > max_overlap:
@@ -771,6 +802,11 @@ def main():
                    help="Maximum fraction of a candidate rectangle's area that may "
                         "overlap with the union of previously-placed rectangles "
                         "(default 0.5 = 50%%). Use 1.0 to disable the constraint.")
+    p.add_argument("--max-spill-fraction", type=float, default=0.15,
+                   metavar="F",
+                   help="Maximum fraction of a candidate rectangle's pixels that "
+                        "may fall outside the wall mask (bleed / spillage). "
+                        "Default 0.15 (15%%). Use 1.0 to disable.")
     p.add_argument("--coverage-stop",  type=float, default=0.98,
                    help="Stop once this fraction of mask is covered (default 0.95 = 95%)")
     p.add_argument("--no-refine",     action="store_true",
@@ -814,6 +850,7 @@ def main():
         axis_only            = args.axis_only,
         axis_gap             = args.axis_gap,
         max_overlap          = args.max_overlap,
+        max_spill_fraction   = args.max_spill_fraction,
         refine               = not args.no_refine,
         verbose              = True,
     )

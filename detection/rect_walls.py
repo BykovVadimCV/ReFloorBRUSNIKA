@@ -321,18 +321,31 @@ def rasterise_wall_segments(
     walls: List[WallSegment], shape: Tuple[int, int],
 ) -> np.ndarray:
     """
-    Stamp every wall segment as a thick line on a uint8 mask (255 = wall).
-    Used for variant-A room finding: union with the raw U-Net mask, then
-    feed to ``find_enclosed_spaces``.
+    Stamp every wall segment as a filled rotated rectangle on a uint8 mask
+    (255 = wall).  Each segment's four corners are computed from the
+    centerline endpoints and thickness so the output has sharp right-angle
+    corners — no rounded line-cap artefacts.
     """
     H, W = shape
     out = np.zeros((H, W), dtype=np.uint8)
     for w in walls:
         if not w.outline or len(w.outline) < 2:
             continue
-        p1, p2 = w.outline[0], w.outline[1]
-        thick = max(1, int(round(w.thickness)))
-        cv2.line(out, p1, p2, 255, thick, cv2.LINE_AA)
+        (x1, y1), (x2, y2) = w.outline[0], w.outline[1]
+        dx, dy = x2 - x1, y2 - y1
+        L = math.hypot(dx, dy)
+        if L < 0.5:
+            continue
+        half = max(0.5, w.thickness / 2.0)
+        # Unit normal perpendicular to the wall direction
+        nx, ny = -dy / L * half, dx / L * half
+        corners = np.array([
+            [x1 + nx, y1 + ny],
+            [x2 + nx, y2 + ny],
+            [x2 - nx, y2 - ny],
+            [x1 - nx, y1 - ny],
+        ], dtype=np.int32)
+        cv2.fillConvexPoly(out, corners, 255)
     return out
 
 
@@ -418,6 +431,7 @@ class RectWallDetector:
             axis_only            = force_axis_only,
             axis_gap             = getattr(cfg, "rect_axis_gap",            0.0),
             max_overlap          = getattr(cfg, "rect_max_overlap",         0.5),
+            max_spill_fraction   = getattr(cfg, "rect_max_spill",           0.15),
             refine               = True,
             verbose              = False,
         )
@@ -462,30 +476,94 @@ class RectWallDetector:
     # U-Net (binary, epoch_20.pth)
     # ------------------------------------------------------------------
     def _run_binary_unet(self, img_bgr: np.ndarray) -> Optional[np.ndarray]:
-        """Run the binary wall U-Net and return a uint8 0/255 mask."""
+        """
+        Run the binary wall U-Net following the standard inference protocol:
+
+            logits = model(inp)
+            probs  = softmax(logits, dim=1)
+            conf_map, pred_argmax = probs.max(dim=1)
+            pred[conf_map < threshold] = 0          # uncertain → background
+            wall_mask = (pred == 1)                 # class 1 = wall
+
+        Returns a uint8 H×W mask (255 = wall, 0 = background) in the
+        original image resolution, with NO morphological post-processing
+        so the caller (rect_decompose) gets the raw probability-thresholded
+        output.
+        """
         ckpt = getattr(self.config, "rect_unet_ckpt_path",
-                        "weights/epoch_20.pth")
+                       "weights/epoch_20.pth")
         ckpt_path = Path(ckpt)
         if not ckpt_path.is_absolute():
-            # Path resolved relative to project root if not absolute
             ckpt_path = Path.cwd() / ckpt_path
         if not ckpt_path.exists():
             logger.error("Binary U-Net checkpoint not found: %s", ckpt_path)
             return None
 
         try:
-            from detection.diagonal import _run_unet as _legacy_run_unet
+            import torch
+            from detect_unet import build_model_from_checkpoint, get_val_transform
         except Exception as exc:
-            logger.warning("Cannot import _run_unet: %s", exc)
+            logger.warning("Binary U-Net dependencies unavailable: %s", exc)
             return None
 
-        size = getattr(self.config, "rect_unet_img_size", 1024)
+        size       = getattr(self.config, "rect_unet_img_size", 1024)
+        confidence = getattr(self.config, "unet_confidence",    0.5)
+        device     = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+
+        # ── Load model ──────────────────────────────────────────────────
         try:
-            out = _legacy_run_unet(img_bgr, str(ckpt_path), img_size=size)
+            model, _num_classes = build_model_from_checkpoint(
+                str(ckpt_path), device
+            )
+            model.eval()
+        except Exception as exc:
+            logger.warning("Binary U-Net model load failed: %s", exc)
+            return None
+
+        # ── Pre-process ─────────────────────────────────────────────────
+        h_orig, w_orig = img_bgr.shape[:2]
+        img_rgb   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        transform = get_val_transform(size)
+        inp       = transform(image=img_rgb)["image"].unsqueeze(0).to(device)
+
+        # ── Inference ───────────────────────────────────────────────────
+        try:
+            with torch.no_grad():
+                logits               = model(inp)
+                probs                = torch.softmax(logits, dim=1)
+                conf_map, pred_argmax = probs.max(dim=1)
+
+            conf_np = conf_map.squeeze(0).cpu().numpy()    # (H_model, W_model)
+            pred_np = pred_argmax.squeeze(0).cpu().numpy() # (H_model, W_model)
+
+            # Uncertain pixels → background (class 0)
+            pred_np = pred_np.copy()
+            pred_np[conf_np < confidence] = 0
+
         except Exception as exc:
             logger.warning("Binary U-Net inference failed: %s", exc)
             return None
+        finally:
+            try:
+                del inp, logits, probs, conf_map, pred_argmax
+            except Exception:
+                pass
 
-        if out is None or "wall_mask" not in out:
-            return None
-        return out["wall_mask"]
+        # ── Resize to original resolution ───────────────────────────────
+        pred_full = cv2.resize(
+            pred_np.astype(np.uint8), (w_orig, h_orig),
+            interpolation=cv2.INTER_NEAREST,
+        )
+
+        # Binary model: class 0 = background, class 1 = wall
+        wall_mask = (pred_full == 1).astype(np.uint8) * 255
+
+        logger.info(
+            "Binary U-Net (%s): %.1f%% wall pixels  (conf≥%.2f, %d classes)",
+            ckpt_path.name,
+            100.0 * int(np.count_nonzero(wall_mask)) / wall_mask.size,
+            confidence, _num_classes,
+        )
+        return wall_mask
