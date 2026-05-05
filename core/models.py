@@ -631,6 +631,9 @@ class DetectionResult:
     openings: List[Opening] = field(default_factory=list)
     wall_mask: Optional[np.ndarray] = None
     outline_mask: Optional[np.ndarray] = None
+    # Raw, unprocessed wall mask (e.g. U-Net argmax output before any
+    # cap / enclosed-space refinement).  Useful for diagnostics.
+    raw_wall_mask: Optional[np.ndarray] = None
 
     # Metadata
     pixel_scale: Optional[float] = None  # meters per pixel

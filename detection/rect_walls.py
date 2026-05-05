@@ -579,7 +579,7 @@ class RectWallDetector:
         cfg = self.config
         H, W = img_bgr.shape[:2]
 
-        # ── 1. Wall mask ───────────────────────────────────────────────
+        # ── 1. Raw wall mask (U-Net) ───────────────────────────────────
         if wall_mask is None:
             wall_mask = self._run_binary_unet(img_bgr)
 
@@ -587,19 +587,50 @@ class RectWallDetector:
             logger.warning("RectWallDetector: empty wall mask — no walls returned")
             return DetectionResult(
                 walls=[], openings=[], wall_mask=wall_mask,
+                raw_wall_mask=wall_mask,
                 outline_mask=None, source="rect_walls",
             )
 
+        # Preserve the raw U-Net output for diagnostics / downstream code
+        # that may want to compare against post-processed masks.
+        raw_wall_mask = wall_mask.copy()
+
+        # ── 1a. Cap step — morphological close on the wall mask ────────
+        # Bridges small gaps in U-Net wall coverage so rect_decompose sees
+        # connected wall material.  This is the "cap" preprocessing step
+        # applied directly to wall_mask (not just to the enclosed-space
+        # analysis mask).
+        cap_k = max(1, int(getattr(cfg, "rect_cap_kernel_size", 5)))
+        cap_i = max(1, int(getattr(cfg, "rect_cap_iters", 2)))
+        if cap_k > 1 and cap_i > 0:
+            kernel = np.ones((cap_k, cap_k), dtype=np.uint8)
+            wall_mask = cv2.morphologyEx(
+                wall_mask, cv2.MORPH_CLOSE, kernel, iterations=cap_i,
+            )
+            logger.info(
+                "Cap step (MORPH_CLOSE k=%d iters=%d): "
+                "%.1f%% wall pixels (was %.1f%% raw)",
+                cap_k, cap_i,
+                100.0 * int(np.count_nonzero(wall_mask)) / wall_mask.size,
+                100.0 * int(np.count_nonzero(raw_wall_mask)) / raw_wall_mask.size,
+            )
+
         # ── 1b. Enclosed-space refinement ─────────────────────────────
-        # Before rect decomposition: identify enclosed white spaces in the
-        # image (rooms / structural cavities).
-        # • Spaces with an OCR label inside  → labelled room; clear stray
-        #   wall pixels so room boundaries are clean.
-        # • Spaces without OCR label AND ≥50% wall-mask overlap → structural
-        #   cavity; fill entirely as wall so the decomposer doesn't fragment it.
+        # Identify enclosed white spaces in the image (rooms / structural
+        # cavities) and apply targeted fixes:
+        #   • Spaces with an OCR label inside → labelled room; clear stray
+        #     wall pixels so room boundaries are clean.
+        #   • Spaces without OCR label AND ≥overlap_thr wall-mask overlap →
+        #     structural cavity; fill entirely as wall.
+        overlap_thr = float(
+            getattr(cfg, "rect_enclosed_overlap_threshold", 0.50)
+        )
         try:
             wall_mask = refine_mask_by_enclosed_spaces(
                 wall_mask, img_bgr, ocr_bboxes,
+                wall_overlap_threshold=overlap_thr,
+                close_kernel_size=cap_k,
+                close_iters=cap_i,
             )
         except Exception as _rme:
             logger.warning(
@@ -671,6 +702,7 @@ class RectWallDetector:
             walls=walls,
             openings=[],
             wall_mask=wall_mask,
+            raw_wall_mask=raw_wall_mask,
             outline_mask=outline_mask,
             source="rect_walls",
         )

@@ -310,6 +310,16 @@ class PipelineConfig:
     # this is rejected regardless of its score.  0.15 = max 15% bleed.
     rect_max_spill: float = 0.15
 
+    # Cap (morph-close) kernel size applied to the raw U-Net wall mask
+    # before enclosed-space analysis and rect decomposition.  Bridges small
+    # gaps in wall coverage so the decomposer sees a connected mask.
+    rect_cap_kernel_size: int = 5
+    rect_cap_iters:       int = 2
+
+    # Enclosed-space refinement: fraction of an enclosed region's pixels that
+    # must overlap the wall mask for the region to be filled as wall.
+    rect_enclosed_overlap_threshold: float = 0.50
+
     # Door/window diagonal filter — openings whose parent wall has angle
     # deviating from 0°/90° by more than this are dropped (see #1 in spec:
     # diagonals not allowed for openings).

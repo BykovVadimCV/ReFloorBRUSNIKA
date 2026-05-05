@@ -1354,23 +1354,37 @@ class FloorplanPipeline:
                     sum(1 for w in result.walls if w.is_diagonal),
                 )
                 # ── Save debug masks ───────────────────────────────────
-                # U-Net raw mask (binary, before rect decomposition)
+                # U-Net RAW mask — straight from U-Net softmax+threshold,
+                # before any cap / enclosed-space refinement.
                 _unet_raw_path = os.path.join(output_dir, f"{base_name}_unet_raw.png")
-                _unet_save = (_rd_res.wall_mask
+                _raw_save = (_rd_res.raw_wall_mask
+                             if _rd_res.raw_wall_mask is not None
+                             else np.zeros((2, 2), np.uint8))
+                cv2.imwrite(_unet_raw_path, _raw_save)
+
+                # Processed wall mask — the actual input to rect_decompose
+                # (raw + cap + enclosed-space refinement).  This is what the
+                # rect-bleed error map should be measured against.
+                _proc_save = (_rd_res.wall_mask
                               if _rd_res.wall_mask is not None
                               else np.zeros((2, 2), np.uint8))
-                cv2.imwrite(_unet_raw_path, _unet_save)
+                _unet_proc_path = os.path.join(output_dir,
+                                               f"{base_name}_unet_processed.png")
+                cv2.imwrite(_unet_proc_path, _proc_save)
 
-                # Rect mask: 3-colour error map
-                #   WHITE  = rect pixel ∩ wall mask   (correctly placed)
-                #   RED    = rect pixel ∩ ~wall mask  (bleed — rect outside mask)
-                #   GREEN  = ~rect pixel ∩ wall mask  (missed — mask not covered)
+                # Rect mask: 3-colour error map vs the PROCESSED mask
+                #   WHITE  = rect pixel ∩ proc-mask   (correctly placed)
+                #   RED    = rect pixel ∩ ~proc-mask  (bleed — outside mask)
+                #   GREEN  = ~rect pixel ∩ proc-mask  (missed — mask not covered)
                 #   BLACK  = background
+                # The 15% spill cap is enforced per-rect by rect_decompose,
+                # so red pixels here represent the residual allowed bleed
+                # plus snap-induced drift.
                 _rect_mask_path = os.path.join(output_dir, f"{base_name}_rect_mask.png")
                 _H, _W = img_clean.shape[:2]
                 _err = np.zeros((_H, _W, 3), dtype=np.uint8)
                 _r = (_rect_rast > 0)
-                _m = (_unet_save > 0) if _rd_res.wall_mask is not None else np.zeros((_H, _W), dtype=bool)
+                _m = (_proc_save > 0) if _rd_res.wall_mask is not None else np.zeros((_H, _W), dtype=bool)
                 _err[_r & _m]  = (255, 255, 255)   # correct  → white
                 _err[_r & ~_m] = (  0,   0, 220)   # bleed    → red   (BGR)
                 _err[~_r & _m] = ( 50, 200,  50)   # missed   → green (BGR)
