@@ -1303,18 +1303,72 @@ class FloorplanPipeline:
             base_name, n_erased,
         )
 
-        # ── Stage 0: Try U-Net → wall mask + door/window bboxes ─────────
-        _notify("U-Net detection")
-        unet_detection = self._try_unet_detection(img_clean)
+        # ── Stage 0: Wall detection ─────────────────────────────────────
+        # The new (default) path uses the binary wall U-Net (epoch_20.pth)
+        # plus rectangle decomposition. The legacy color/hollow path stays
+        # available behind ``config.use_rect_walls=False`` for fallback.
         raw_rectangles = None
         unet_door_bboxes: list = []
         unet_window_bboxes: list = []
         used_unet_grey = False
         has_unet_openings = False
-        enclosed_labels = None   # filled during U-Net hollow-wall path
-        detection = None         # set by whichever wall-detection path runs
+        enclosed_labels = None
+        detection = None
+        unet_detection = None
 
-        if unet_detection is not None:
+        if self.config.use_rect_walls:
+            _notify("rect-wall detection")
+            logger.info("[%s] Stage 0: Rectangle-decomposition wall detection",
+                        base_name)
+            try:
+                from detection.rect_walls import (
+                    RectWallDetector, rasterise_wall_segments,
+                )
+                _rect_det = RectWallDetector(self.config)
+                _rect_det.initialize()
+                _rd_res = _rect_det.detect(img_clean)
+                result.walls        = _rd_res.walls
+                result.wall_mask    = _rd_res.wall_mask
+                # outline_mask is the rasterised union of placed rectangles;
+                # OR with the raw U-Net mask so the room-finding step has
+                # extra ink to bridge corner gaps the rects didn't quite close
+                # (variant A from the spec).
+                _rast = rasterise_wall_segments(_rd_res.walls,
+                                                 img_clean.shape[:2])
+                if _rd_res.wall_mask is not None:
+                    _rast = cv2.bitwise_or(_rast, _rd_res.wall_mask)
+                result.outline_mask = _rast
+                logger.info(
+                    "[%s] Rect-wall detector: %d walls (%d diagonal)",
+                    base_name, len(result.walls),
+                    sum(1 for w in result.walls if w.is_diagonal),
+                )
+            except Exception as exc:
+                logger.exception(
+                    "[%s] Rect-wall detection failed (%s) — falling back to "
+                    "legacy U-Net/colour path", base_name, exc,
+                )
+                # Fall through to the legacy path with normal vars
+                used_unet_grey = False
+                result.walls = []
+            finally:
+                # Free the cleaned image; downstream stages use `img`
+                # (un-erased deskewed image) for opening detection.
+                try:
+                    del img_clean
+                except NameError:
+                    pass
+
+        # Legacy path runs only when the new detector is disabled or
+        # produced no walls.
+        _legacy_walls_active = (not self.config.use_rect_walls
+                                or not result.walls)
+
+        if _legacy_walls_active:
+            _notify("U-Net detection")
+            unet_detection = self._try_unet_detection(img_clean)
+
+        if _legacy_walls_active and unet_detection is not None:
             unet_wall_mask, unet_door_bboxes, unet_window_bboxes = unet_detection
 
             # U-Net door/window bboxes are ALWAYS used for opening detection
@@ -1360,7 +1414,7 @@ class FloorplanPipeline:
                     has_unet_openings = bool(unet_door_bboxes or unet_window_bboxes)
                     unet_detection = None  # fall through to colour path below
 
-        if unet_detection is not None:
+        if _legacy_walls_active and unet_detection is not None:
             unet_wall_mask, unet_door_bboxes, unet_window_bboxes = unet_detection
 
             # ── Stage 1 (hollow path): enclosed regions → grey image ─────
@@ -1416,7 +1470,7 @@ class FloorplanPipeline:
             result.wall_mask = detection.wall_mask
             result.outline_mask = detection.outline_mask
 
-        if not used_unet_grey:
+        if _legacy_walls_active and not used_unet_grey:
             # ── Stage 1 (fallback): colour-based wall detection ──────────
             _notify("detecting walls")
             logger.info("[%s] Stage 1: Colour-based wall detection", base_name)
@@ -1519,6 +1573,23 @@ class FloorplanPipeline:
 
         result.openings = openings
         result.door_arcs = door_arcs
+
+        # ── Stage 2b: Drop openings on diagonal walls ───────────────────
+        # Doors and windows must sit on axis-aligned walls. Any opening
+        # whose nearest wall (within opening_wall_proximity_cm) is diagonal
+        # is removed entirely — relocating them onto axis walls would be
+        # wrong and the YOLO/arc detectors are themselves axis-strict.
+        if self.config.use_rect_walls and result.openings:
+            _drop_n = self._drop_diagonal_openings(
+                openings=result.openings,
+                walls=result.walls,
+                tol_deg=self.config.opening_axis_tol_deg,
+            )
+            if _drop_n:
+                logger.info(
+                    "[%s] Stage 2b: dropped %d opening(s) on diagonal walls",
+                    base_name, _drop_n,
+                )
 
         # ── Stage 3: Room Measurement + Scale Calibration (primary) ───────
         _notify("OCR / scale calibration")
@@ -1835,6 +1906,64 @@ class FloorplanPipeline:
         area_b = (bbox_b.x2 - bbox_b.x1) * (bbox_b.y2 - bbox_b.y1)
         union = area_a + area_b - inter
         return inter / union if union > 0 else 0.0
+
+    @staticmethod
+    def _drop_diagonal_openings(
+        openings: list, walls: List[WallSegment], tol_deg: float = 3.0,
+    ) -> int:
+        """
+        Mutate ``openings`` in place: remove every opening whose nearest
+        wall is diagonal (angle deviates from 0°/90° by more than tol_deg).
+        Distance is measured center-to-centerline.
+
+        Returns the number of removed openings.
+        """
+        if not openings or not walls:
+            return 0
+
+        def _seg_dist(px: float, py: float,
+                      a: Tuple[float, float], b: Tuple[float, float]) -> float:
+            ax, ay = a; bx, by = b
+            dx, dy = bx - ax, by - ay
+            l2 = dx * dx + dy * dy
+            if l2 < 1e-9:
+                return math.hypot(px - ax, py - ay)
+            t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / l2))
+            cx, cy = ax + t * dx, ay + t * dy
+            return math.hypot(px - cx, py - cy)
+
+        # Pre-compute centerline endpoints + diagonal flag per wall
+        wall_geo = []
+        for w in walls:
+            if w.outline and len(w.outline) >= 2:
+                p1 = (float(w.outline[0][0]), float(w.outline[0][1]))
+                p2 = (float(w.outline[1][0]), float(w.outline[1][1]))
+            else:
+                # axis-aligned legacy WallSegment — derive from bbox
+                p1, p2 = w.centerline
+                p1 = (float(p1[0]), float(p1[1]))
+                p2 = (float(p2[0]), float(p2[1]))
+            wall_geo.append((w.is_diagonal, p1, p2))
+
+        kept = []
+        dropped = 0
+        for op in openings:
+            cx, cy = op.bbox.center
+            best_d = float('inf'); best_diag = False
+            for is_diag, p1, p2 in wall_geo:
+                d = _seg_dist(cx, cy, p1, p2)
+                if d < best_d:
+                    best_d = d
+                    best_diag = is_diag
+            if best_diag:
+                dropped += 1
+            else:
+                kept.append(op)
+
+        if dropped:
+            openings.clear()
+            openings.extend(kept)
+        return dropped
 
     def _run_wall_detection(self, img: np.ndarray) -> tuple:
         """

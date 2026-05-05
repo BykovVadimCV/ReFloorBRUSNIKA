@@ -32,6 +32,8 @@ from enum import Enum, auto
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 import cv2
 import numpy as np
@@ -563,6 +565,27 @@ class UNetSemanticClasses:
 
         return color_img
 
+    @classmethod
+    def convert_to_binary(cls, mask: np.ndarray) -> np.ndarray:
+        """
+        Collapse the 5-class mask to a 2-class (binary) wall mask.
+
+        Merging rules
+        -------------
+        Window  (pixel 128) → Wall       → output 255
+        Wall    (pixel  64) → Wall       → output 255
+        Door    (pixel 192) → Background → output   0
+        Footprint(pixel 255)→ Background → output   0
+        Background(pixel 0) → Background → output   0
+
+        Returns a uint8 array of the same shape with values 0 or 255.
+        """
+        wall_px   = cls.CLASS_TO_PIXEL[cls.WALL]    # 64
+        window_px = cls.CLASS_TO_PIXEL[cls.WINDOW]  # 128
+        binary = np.zeros_like(mask, dtype=np.uint8)
+        binary[(mask == wall_px) | (mask == window_px)] = 255
+        return binary
+
 
 # ── Pydantic config model ────────────────────────────────────────────────────
 class FloorPlanConfig(BaseModel):
@@ -621,6 +644,9 @@ class FloorPlanConfig(BaseModel):
     door_draw_style: str = Field("random", description="Door drawing style: slab, cross, or random")
     generate_unet_masks: bool = Field(True, description="Generate U-Net segmentation masks")
     unet_mask_colorized: bool = Field(False, description="Also save colorized mask visualization")
+    binary_masks: bool = Field(False, description=(
+        "Binary mask mode: collapse 5-class mask to wall/background only. "
+        "Windows merge into wall (→255), doors merge into background (→0)."))
 
 
     class Config:
@@ -3005,7 +3031,8 @@ class SmartFloorPlanGenerator:
         self.metadata_exporter = MetadataExporter(self.theme, self.solver)
 
     # ── Dataset generation ────────────────────────────────────────────────────
-    def generate_dataset(self, n_images=None, out_dir=None, wall_thickness_range=None):
+    def generate_dataset(self, n_images=None, out_dir=None, wall_thickness_range=None,
+                         n_workers=None):
         n_images = n_images or self.config.count
         out_dir = out_dir or self.config.output_dir
         wall_thickness_range = wall_thickness_range or self.config.wall_thickness_range
@@ -3037,127 +3064,80 @@ class SmartFloorPlanGenerator:
             if self.config.unet_mask_colorized:
                 os.makedirs(mask_vis_dir, exist_ok=True)
 
-        style_counts: Dict[str, int] = defaultdict(int)
-        strategy_counts: Dict[str, int] = defaultdict(int)
+        dirs = {
+            "img":      img_dir,
+            "lbl":      lbl_dir,
+            "mask":     mask_dir     if self.config.generate_unet_masks else "",
+            "mask_vis": mask_vis_dir if self.config.generate_unet_masks
+                                        and self.config.unet_mask_colorized else "",
+            "svg":      svg_dir      if ExportFormat.SVG in export_formats else "",
+            "dxf":      dxf_dir      if ExportFormat.DXF in export_formats else "",
+            "meta":     meta_dir     if (ExportFormat.JSON in export_formats
+                                        or self.config.generate_metadata_json) else "",
+        }
+
+        # ── Pre-compute per-image style assignments (must be sequential) ────
+        # The style rotator, wall-thickness rotator, and main RNG are all
+        # stateful.  We drain them here in order, then ship the results to
+        # worker processes so each worker can be fully independent.
+        base_config = deepcopy(self.config)  # snapshot before per-image mutations
+        tasks: List[dict] = []
 
         for i in range(n_images):
-            overrides = self._apply_style_for_image()
+            overrides = self._apply_style_for_image()   # mutates self.theme / config
 
             if self.config.vary_wall_thickness and self.style_rotator:
                 wall_thickness_range = self.style_rotator.next_wall_thickness()
 
             base_ext = self.rng.randint(*wall_thickness_range)
-            ext_th = base_ext * self.super_sampling
-            int_th = int(ext_th * self.rng.uniform(0.5, 0.7))
+            ext_th   = base_ext * self.super_sampling
+            int_th   = int(ext_th * self.rng.uniform(0.5, 0.7))
 
-            result = self.generate_single_plan(ext_th, int_th)
-            hi_res_img = result["image"]
-            labels = result["labels"]
-            walls = result["walls"]
-            rooms = result["rooms"]
-            balconies = result["balconies"]
-            brief = result["brief"]
+            tasks.append({
+                "idx":       i,
+                "base_seed": base_config.seed,
+                "config":    base_config,   # same snapshot for all — worker applies overrides
+                "ext_th":    ext_th,
+                "int_th":    int_th,
+                "dirs":      dirs,
+                "style": {
+                    "theme_name":    self.theme.name,
+                    "wall_style":    self.current_wall_style,
+                    "door_style":    self.current_door_style,
+                    "min_rooms":     self.config.min_rooms,
+                    "max_rooms":     self.config.max_rooms,
+                    "balcony_prob":  self.config.balcony_probability,
+                    "strategy":      overrides.get("strategy") if overrides else None,
+                    "overrides":     overrides if overrides else None,
+                },
+            })
 
-            style_counts[self.theme.name] += 1
-            strategy_counts[brief.circulation_type] += 1
+        # ── Dispatch ─────────────────────────────────────────────────────────
+        n_workers = n_workers or (os.cpu_count() or 1)
+        style_counts: Dict[str, int] = defaultdict(int)
+        strategy_counts: Dict[str, int] = defaultdict(int)
+        done = 0
 
-            img = cv2.resize(hi_res_img, (self.out_size, self.out_size),
-                             interpolation=cv2.INTER_AREA)
-
-            # Resize mask in sync with the image (NEAREST preserves class IDs)
-            hi_res_mask = result.get("semantic_mask")
-            mask = None
-            if self.config.generate_unet_masks and hi_res_mask is not None:
-                mask = cv2.resize(hi_res_mask, (self.out_size, self.out_size),
-                                  interpolation=cv2.INTER_NEAREST)
-
-            # Apply rotation
-            if self.rng.random() < self.config.rotation_probability:
-                img, labels, mask = self._apply_rotation(img, labels, mask)
-
-            # Augmentations
-            if self.rng.random() < self.config.augmentation_probability:
-                img = self._apply_augmentations(img)
-
-            fname = f"{i:05d}"
-            cv2.imwrite(os.path.join(img_dir, fname + ".png"), img)
-
-            with open(os.path.join(lbl_dir, fname + ".txt"), "w", encoding="utf-8") as f:
-                for cls_id, cx, cy, w, h in labels:
-                    f.write(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
-
-            # ── U-Net segmentation mask ────────────────────────────────────
-            if self.config.generate_unet_masks and mask is not None:
-                cv2.imwrite(os.path.join(mask_dir, fname + ".png"), mask)
-
-                if self.config.unet_mask_colorized:
-                    vis = UNetSemanticClasses.colorize_mask(mask)
-                    cv2.imwrite(os.path.join(mask_vis_dir, fname + ".png"), vis)
-
-            if ExportFormat.SVG in export_formats:
-                scale_f = self.out_size / self.size
-                scaled_walls = [
-                    Wall(int(w.x1 * scale_f), int(w.y1 * scale_f),
-                         int(w.x2 * scale_f), int(w.y2 * scale_f),
-                         max(1, int(w.thickness * scale_f)),
-                         w.is_external, w.is_guardrail, w.is_balcony_interface)
-                    for w in walls
-                ]
-                scaled_rooms = [
-                    Room(int(r.x1 * scale_f), int(r.y1 * scale_f),
-                         int(r.x2 * scale_f), int(r.y2 * scale_f),
-                         r.room_type, r.zone, r.priority, r.needs_window, r.id)
-                    for r in rooms
-                ]
-                scaled_balconies = [
-                    Balcony(int(b.x1 * scale_f), int(b.y1 * scale_f),
-                            int(b.x2 * scale_f), int(b.y2 * scale_f),
-                            b.side, b.archetype)
-                    for b in balconies
-                ]
-                self.svg_exporter.export(os.path.join(svg_dir, fname + ".svg"),
-                                         scaled_walls, scaled_rooms, scaled_balconies)
-
-            if ExportFormat.DXF in export_formats:
-                scale_f = self.out_size / self.size
-                scaled_walls_d = [
-                    Wall(int(w.x1 * scale_f), int(w.y1 * scale_f),
-                         int(w.x2 * scale_f), int(w.y2 * scale_f),
-                         max(1, int(w.thickness * scale_f)),
-                         w.is_external, w.is_guardrail, w.is_balcony_interface)
-                    for w in walls
-                ]
-                scaled_rooms_d = [
-                    Room(int(r.x1 * scale_f), int(r.y1 * scale_f),
-                         int(r.x2 * scale_f), int(r.y2 * scale_f),
-                         r.room_type, r.zone, r.priority, r.needs_window, r.id)
-                    for r in rooms
-                ]
-                scaled_balc_d = [
-                    Balcony(int(b.x1 * scale_f), int(b.y1 * scale_f),
-                            int(b.x2 * scale_f), int(b.y2 * scale_f),
-                            b.side, b.archetype)
-                    for b in balconies
-                ]
-                self.dxf_exporter.export(os.path.join(dxf_dir, fname + ".dxf"),
-                                          scaled_walls_d, scaled_rooms_d, scaled_balc_d)
-
-            if ExportFormat.JSON in export_formats or self.config.generate_metadata_json:
-                meta_path = os.path.join(meta_dir, fname + ".json")
-                self.metadata_exporter.export(meta_path, rooms, walls, balconies, brief, self.config)
-                if overrides:
-                    with open(meta_path, "r") as f:
-                        meta = json.load(f)
-                    meta["style_overrides"] = overrides
-                    meta["actual_theme"] = self.theme.name
-                    meta["wall_draw_style"] = self.current_wall_style
-                    meta["door_draw_style"] = self.current_door_style
-                    with open(meta_path, "w") as f:
-                        json.dump(meta, f, indent=2, ensure_ascii=False)
-
-            if (i + 1) % 100 == 0 or i == n_images - 1:
-                print(f"  [{i + 1}/{n_images}] theme={self.theme.name} "
-                      f"wall={self.current_wall_style} door={self.current_door_style}")
+        if n_workers == 1:
+            # Single-process path — avoids process-spawn overhead for small runs
+            for task in tasks:
+                r = _run_single_image(task)
+                style_counts[r["theme"]] += 1
+                strategy_counts[r["strategy"]] += 1
+                done += 1
+                if done % 100 == 0 or done == n_images:
+                    print(f"  [{done}/{n_images}] theme={r['theme']}")
+        else:
+            print(f"  Spawning {n_workers} worker processes ...")
+            with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                futs = {pool.submit(_run_single_image, t): t["idx"] for t in tasks}
+                for fut in as_completed(futs):
+                    r = fut.result()
+                    style_counts[r["theme"]] += 1
+                    strategy_counts[r["strategy"]] += 1
+                    done += 1
+                    if done % 100 == 0 or done == n_images:
+                        print(f"  [{done}/{n_images}] complete")
 
         if self.style_rotator:
             print(f"\n-- Style distribution across {n_images} images --")
@@ -4173,7 +4153,169 @@ class SmartFloorPlanGenerator:
 DatasetGenerator = SmartFloorPlanGenerator
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# 13. MULTIPROCESSING WORKER
+# Must be a module-level function (not a lambda/method) for pickle to work.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _run_single_image(task: dict) -> dict:
+    """
+    Generate and save one floorplan image.  Runs in a worker process.
+
+    Receives a pre-built task dict from generate_dataset() containing:
+      idx        — image index (used for filename and seed offset)
+      base_seed  — generator base seed; worker seed = base_seed + idx
+      config     — FloorPlanConfig snapshot (before per-image mutations)
+      ext_th     — exterior wall thickness (pre-drawn from main-process RNG)
+      int_th     — interior wall thickness (pre-drawn from main-process RNG)
+      dirs       — dict of output directory paths
+      style      — per-image style snapshot: theme_name, wall_style, door_style,
+                   min_rooms, max_rooms, balcony_prob, strategy, overrides
+    """
+    idx  = task["idx"]
+    cfg  = deepcopy(task["config"])
+    dirs = task["dirs"]
+    sa   = task["style"]
+
+    # ── Per-image config overrides ──────────────────────────────────────────
+    cfg.seed               = task["base_seed"] + idx
+    cfg.palette_name       = sa["theme_name"]
+    cfg.min_rooms          = sa["min_rooms"]
+    cfg.max_rooms          = sa["max_rooms"]
+    cfg.balcony_probability = sa["balcony_prob"]
+
+    gen = SmartFloorPlanGenerator(cfg)
+
+    # Apply colour jitter with this worker's own RNG so each image still
+    # gets independent jitter even though we pre-selected the theme name.
+    _is_bw = gen.theme.name in ("bw_outline", "bw_solid")
+    if cfg.color_jitter_intensity > 0 and not _is_bw:
+        gen.theme = gen.theme.jittered_copy(gen.rng, cfg.color_jitter_intensity)
+
+    # Lock wall/door styles to the pre-computed values
+    gen.current_wall_style = sa["wall_style"]
+    gen.current_door_style = sa["door_style"]
+
+    # Inject strategy override when the rotator requested a specific one
+    strat = sa.get("strategy")
+    if strat and strat in _STRATEGY_REGISTRY:
+        if strat not in gen.strategies:
+            gen.strategies[strat] = _STRATEGY_REGISTRY[strat]()
+
+    gen._rebuild_with_theme()
+
+    # ── Generate ────────────────────────────────────────────────────────────
+    result    = gen.generate_single_plan(task["ext_th"], task["int_th"])
+    hi_res_img = result["image"]
+    labels     = result["labels"]
+    walls      = result["walls"]
+    rooms      = result["rooms"]
+    balconies  = result["balconies"]
+    brief      = result["brief"]
+
+    img = cv2.resize(hi_res_img, (gen.out_size, gen.out_size),
+                     interpolation=cv2.INTER_AREA)
+
+    hi_res_mask = result.get("semantic_mask")
+    mask = None
+    if cfg.generate_unet_masks and hi_res_mask is not None:
+        mask = cv2.resize(hi_res_mask, (gen.out_size, gen.out_size),
+                          interpolation=cv2.INTER_NEAREST)
+
+    if gen.rng.random() < cfg.rotation_probability:
+        img, labels, mask = gen._apply_rotation(img, labels, mask)
+
+    if gen.rng.random() < cfg.augmentation_probability:
+        img = gen._apply_augmentations(img)
+
+    fname = f"{idx:05d}"
+
+    # ── Image + labels ──────────────────────────────────────────────────────
+    cv2.imwrite(os.path.join(dirs["img"], fname + ".png"), img)
+    with open(os.path.join(dirs["lbl"], fname + ".txt"), "w", encoding="utf-8") as f:
+        for cls_id, cx, cy, w, h in labels:
+            f.write(f"{cls_id} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}\n")
+
+    # ── U-Net mask ──────────────────────────────────────────────────────────
+    if cfg.generate_unet_masks and mask is not None:
+        save_mask = (UNetSemanticClasses.convert_to_binary(mask)
+                     if cfg.binary_masks else mask)
+        cv2.imwrite(os.path.join(dirs["mask"], fname + ".png"), save_mask)
+        if cfg.unet_mask_colorized:
+            vis = (cv2.cvtColor(save_mask, cv2.COLOR_GRAY2BGR)
+                   if cfg.binary_masks
+                   else UNetSemanticClasses.colorize_mask(save_mask))
+            cv2.imwrite(os.path.join(dirs["mask_vis"], fname + ".png"), vis)
+
+    # ── SVG / DXF / JSON ────────────────────────────────────────────────────
+    export_formats = [ExportFormat(f) if isinstance(f, str) else f
+                      for f in cfg.export_formats]
+    scale_f = gen.out_size / gen.size
+
+    if ExportFormat.SVG in export_formats and dirs.get("svg"):
+        scaled_walls = [
+            Wall(int(w.x1 * scale_f), int(w.y1 * scale_f),
+                 int(w.x2 * scale_f), int(w.y2 * scale_f),
+                 max(1, int(w.thickness * scale_f)),
+                 w.is_external, w.is_guardrail, w.is_balcony_interface)
+            for w in walls]
+        scaled_rooms = [
+            Room(int(r.x1 * scale_f), int(r.y1 * scale_f),
+                 int(r.x2 * scale_f), int(r.y2 * scale_f),
+                 r.room_type, r.zone, r.priority, r.needs_window, r.id)
+            for r in rooms]
+        scaled_balconies = [
+            Balcony(int(b.x1 * scale_f), int(b.y1 * scale_f),
+                    int(b.x2 * scale_f), int(b.y2 * scale_f),
+                    b.side, b.archetype)
+            for b in balconies]
+        gen.svg_exporter.export(os.path.join(dirs["svg"], fname + ".svg"),
+                                scaled_walls, scaled_rooms, scaled_balconies)
+
+    if ExportFormat.DXF in export_formats and dirs.get("dxf"):
+        scaled_walls_d = [
+            Wall(int(w.x1 * scale_f), int(w.y1 * scale_f),
+                 int(w.x2 * scale_f), int(w.y2 * scale_f),
+                 max(1, int(w.thickness * scale_f)),
+                 w.is_external, w.is_guardrail, w.is_balcony_interface)
+            for w in walls]
+        scaled_rooms_d = [
+            Room(int(r.x1 * scale_f), int(r.y1 * scale_f),
+                 int(r.x2 * scale_f), int(r.y2 * scale_f),
+                 r.room_type, r.zone, r.priority, r.needs_window, r.id)
+            for r in rooms]
+        scaled_balc_d = [
+            Balcony(int(b.x1 * scale_f), int(b.y1 * scale_f),
+                    int(b.x2 * scale_f), int(b.y2 * scale_f),
+                    b.side, b.archetype)
+            for b in balconies]
+        gen.dxf_exporter.export(os.path.join(dirs["dxf"], fname + ".dxf"),
+                                scaled_walls_d, scaled_rooms_d, scaled_balc_d)
+
+    if (ExportFormat.JSON in export_formats or cfg.generate_metadata_json) \
+            and dirs.get("meta"):
+        meta_path = os.path.join(dirs["meta"], fname + ".json")
+        gen.metadata_exporter.export(meta_path, rooms, walls, balconies, brief, cfg)
+        overrides = sa.get("overrides")
+        if overrides:
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            meta["style_overrides"]  = overrides
+            meta["actual_theme"]     = gen.theme.name
+            meta["wall_draw_style"]  = gen.current_wall_style
+            meta["door_draw_style"]  = gen.current_door_style
+            with open(meta_path, "w") as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    return {
+        "idx":      idx,
+        "theme":    gen.theme.name,
+        "strategy": brief.circulation_type,
+    }
+
+
 def main():
+    multiprocessing.freeze_support()   # needed for Windows PyInstaller bundles
     parser = argparse.ArgumentParser(
         description="SmartFloorPlanGenerator v6.0 — Professional Procedural Engine"
     )
@@ -4214,6 +4356,9 @@ def main():
                         help="Disable U-Net segmentation mask generation")
     parser.add_argument("--unet-colorized", action="store_true",
                         help="Also save colorized U-Net mask visualization")
+    parser.add_argument("--binary", action="store_true",
+                        help="Binary mask mode: windows merge into wall (255), "
+                             "doors merge into background (0). Implies --no-unet-masks=False.")
     parser.add_argument("--no-aug", action="store_true",
                         help="Disable visual augmentations")
     parser.add_argument("--color-jitter", type=int, default=12,
@@ -4225,6 +4370,11 @@ def main():
     parser.add_argument("--aug-jpeg-prob", type=float, default=0.5)
     parser.add_argument("--aug-brightness", type=float, default=0.15)
     parser.add_argument("--aug-rotation", type=float, default=5.0)
+    parser.add_argument("--workers", type=int, default=None,
+                        metavar="N",
+                        help="Number of parallel worker processes "
+                             "(default: all CPU cores). Use 1 to disable "
+                             "multiprocessing.")
 
     args = parser.parse_args()
 
@@ -4257,8 +4407,9 @@ def main():
             constraint_solver=args.solver,
             wall_draw_style=args.wall_draw_style,
             door_draw_style=args.door_draw_style,
-            generate_unet_masks=not args.no_unet_masks,
+            generate_unet_masks=not args.no_unet_masks or args.binary,
             unet_mask_colorized=args.unet_colorized,
+            binary_masks=args.binary,
             enable_augmentations=not args.no_aug,
             color_jitter_intensity=args.color_jitter,
             generate_metadata_json=not args.no_metadata,
@@ -4285,14 +4436,19 @@ def main():
     print(f"  Solver       : {cfg.constraint_solver}")
     print(f"  Wall style   : {cfg.wall_draw_style}")
     print(f"  Door style   : {cfg.door_draw_style}")
-    print(f"  U-Net masks  : {'yes' + (' + colorized' if cfg.unet_mask_colorized else '') if cfg.generate_unet_masks else 'no'}")
+    mask_note = "no"
+    if cfg.generate_unet_masks:
+        mask_note = "binary (wall/bg)" if cfg.binary_masks else "5-class"
+        if cfg.unet_mask_colorized:
+            mask_note += " + colorized"
+    print(f"  U-Net masks  : {mask_note}")
     print(f"  Augmentations: {'yes' if cfg.enable_augmentations else 'no'}")
     print(f"  Exports      : {', '.join(str(f) for f in cfg.export_formats)}")
     print("=" * 60)
 
     # ── Run generation ────────────────────────────────────────────────────────
     generator = DatasetGenerator(cfg)
-    generator.generate_dataset()
+    generator.generate_dataset(n_workers=args.workers)
 
     print("\nDataset generation complete.")
     print(f"  Output: {os.path.abspath(cfg.output_dir)}")

@@ -272,6 +272,45 @@ class PipelineConfig:
     # detection is used instead.  Range 0.0–1.0.
     solid_wall_threshold: float = 0.50
 
+    # ============================================================
+    # RECTANGLE-DECOMPOSITION WALL DETECTION  (new pipeline)
+    # ============================================================
+
+    # Master switch — when True, use the rect-decomposition wall detector
+    # (epoch_20.pth + rect_decompose) instead of the legacy color/hollow
+    # path. The legacy path remains available for fallback.
+    use_rect_walls: bool = True
+
+    # Binary wall U-Net checkpoint
+    rect_unet_ckpt_path: str = "weights/epoch_20.pth"
+    rect_unet_img_size:  int = 1024
+
+    # Diagonal-presence test (LSD on the wall mask)
+    rect_axis_tol_deg:    float = 3.0     # angles within ±this of 0/90 = axis
+    rect_diag_lsd_ratio:  float = 0.05    # fraction of off-axis LSD length
+    rect_diag_lsd_min_len: float = 25.0   # ignore LSD segments shorter than this
+
+    # rect_decompose parameters (defaults requested by the user)
+    rect_angle_steps:          int   = 12
+    rect_penalty:              float = 0.02
+    rect_max_grid_dim:         int   = 200
+    rect_coverage_stop:        float = 0.93
+    rect_bleed_weight:         float = 1.5
+    rect_initial_bleed_weight: float = 10.0
+    rect_bleed_decay:          float = 1.0
+    rect_axis_gap:             float = 0.0
+    rect_max_overlap:          float = 0.5
+
+    # Endpoint snapping (extends collinear walls to meet)
+    rect_snap_gap_factor: float = 2.0    # gap ≤ factor × max_thickness
+    rect_snap_gap_floor:  float = 6.0    # but never below this many pixels
+    rect_snap_angle_deg:  float = 5.0    # rectangles must agree within this angle
+
+    # Door/window diagonal filter — openings whose parent wall has angle
+    # deviating from 0°/90° by more than this are dropped (see #1 in spec:
+    # diagonals not allowed for openings).
+    opening_axis_tol_deg: float = 3.0
+
     def __post_init__(self) -> None:
         """Validate configuration after initialization."""
         assert self.pixels_to_cm > 0, "pixels_to_cm must be positive"

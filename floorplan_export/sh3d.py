@@ -8,6 +8,7 @@ unified core.models types and converting them as needed.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -16,6 +17,91 @@ from core.config import PipelineConfig
 from core.models import Opening, OpeningType, Room, WallSegment
 
 logger = logging.getLogger(__name__)
+
+
+def _wall_centerline(w: WallSegment) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """Return centerline endpoints in pixel coords for any WallSegment."""
+    if w.outline and len(w.outline) >= 2:
+        return (
+            (float(w.outline[0][0]), float(w.outline[0][1])),
+            (float(w.outline[1][0]), float(w.outline[1][1])),
+        )
+    p1, p2 = w.centerline
+    return (float(p1[0]), float(p1[1])), (float(p2[0]), float(p2[1]))
+
+
+def _seg_dist(px: float, py: float,
+              a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    ax, ay = a; bx, by = b
+    dx, dy = bx - ax, by - ay
+    l2 = dx * dx + dy * dy
+    if l2 < 1e-9:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / l2))
+    cx, cy = ax + t * dx, ay + t * dy
+    return math.hypot(px - cx, py - cy)
+
+
+def window_opening_to_overlay_wall(
+    window: Opening, walls: List[WallSegment], pixels_to_cm: float,
+):
+    """
+    Build a LegacyWall placed on top of the window's parent wall.
+
+    Behaviour:
+        • parent = nearest non-diagonal wall to the window's center
+        • window endpoints projected onto the parent's centerline direction
+        • new wall has parent's thickness, length spans the window's projected extent
+        • returns None when no suitable parent wall exists
+
+    The returned wall is appended to the SH3D export's
+    ``extra_structural_walls`` list (with ``is_structural=False``).
+    """
+    from floorplanexporter import Wall as _LegacyWall, Point as _LegacyPoint
+
+    cx, cy = window.bbox.center
+
+    best = None
+    best_d = float('inf')
+    for w in walls:
+        if w.is_diagonal:
+            continue
+        p1, p2 = _wall_centerline(w)
+        d = _seg_dist(cx, cy, p1, p2)
+        if d < best_d:
+            best_d = d
+            best = (w, p1, p2)
+
+    if best is None:
+        return None
+    parent, p1, p2 = best
+
+    dx, dy = p2[0] - p1[0], p2[1] - p1[1]
+    L = math.hypot(dx, dy)
+    if L < 1e-6:
+        return None
+    ux, uy = dx / L, dy / L
+
+    # Project window bbox corners onto the parent direction
+    corners = [
+        (window.bbox.x1, window.bbox.y1),
+        (window.bbox.x2, window.bbox.y1),
+        (window.bbox.x2, window.bbox.y2),
+        (window.bbox.x1, window.bbox.y2),
+    ]
+    projs = [(cx_ - p1[0]) * ux + (cy_ - p1[1]) * uy for cx_, cy_ in corners]
+    t_min, t_max = min(projs), max(projs)
+
+    # Window-wall endpoints, snapped to the parent's centerline
+    wp1 = (p1[0] + t_min * ux, p1[1] + t_min * uy)
+    wp2 = (p1[0] + t_max * ux, p1[1] + t_max * uy)
+
+    return _LegacyWall(
+        start=_LegacyPoint(wp1[0] * pixels_to_cm, wp1[1] * pixels_to_cm),
+        end=_LegacyPoint(wp2[0] * pixels_to_cm, wp2[1] * pixels_to_cm),
+        thickness=max(parent.thickness * pixels_to_cm, 2.0),
+        is_structural=False,
+    )
 
 
 def wall_segment_to_rect_dict(seg: WallSegment) -> Dict[str, float]:
@@ -183,7 +269,24 @@ class SH3DExporter:
         fused_doors = [opening_to_fused_door(d) for d in doors if d.hinge_point is not None]
         plain_doors = [opening_to_rect_dict(d) for d in doors if d.hinge_point is None]
 
-        window_rects = [opening_to_rect_dict(w) for w in windows]
+        # ── Windows-as-overlay-walls ─────────────────────────────────────
+        # When the rect-wall pipeline is active, render each window as a
+        # separate wall placed on top of its parent wall (same thickness,
+        # length = window-mask projection). The legacy window-rect path is
+        # skipped so windows don't get cut into the parent walls.
+        window_rects: List[Dict] = []
+        if getattr(self.config, "use_rect_walls", False) and windows:
+            for win in windows:
+                lw = window_opening_to_overlay_wall(win, walls, ptcm)
+                if lw is not None:
+                    extra_structural.append(lw)
+            logger.info(
+                "SH3DExporter: %d windows → overlay walls on parent walls",
+                len(windows),
+            )
+        else:
+            window_rects = [opening_to_rect_dict(w) for w in windows]
+
         gap_rects = [opening_to_rect_dict(g) for g in gaps]
 
         try:
