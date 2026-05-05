@@ -1316,17 +1316,35 @@ class FloorplanPipeline:
                 from detection.rect_walls import (
                     RectWallDetector, rasterise_wall_segments,
                 )
+                # Build OCR bbox list for enclosed-space refinement.
+                # Format accepted by refine_mask_by_enclosed_spaces:
+                # list of (x1, y1, x2, y2).
+                _ocr_bboxes_for_rect: list = []
+                for _src in (ocr_text_labels_early, rotated_ocr_labels):
+                    for _item in _src:
+                        if len(_item) >= 5:
+                            _ocr_bboxes_for_rect.append((
+                                int(_item[1]), int(_item[2]),
+                                int(_item[3]), int(_item[4]),
+                            ))
                 _rect_det = RectWallDetector(self.config)
                 _rect_det.initialize()
-                _rd_res = _rect_det.detect(img_clean)
+                _rd_res = _rect_det.detect(
+                    img_clean,
+                    ocr_bboxes=_ocr_bboxes_for_rect,
+                )
                 result.walls        = _rd_res.walls
                 result.wall_mask    = _rd_res.wall_mask
                 # outline_mask is the rasterised union of placed rectangles;
                 # OR with the raw U-Net mask so the room-finding step has
                 # extra ink to bridge corner gaps the rects didn't quite close
                 # (variant A from the spec).
-                _rast = rasterise_wall_segments(_rd_res.walls,
-                                                 img_clean.shape[:2])
+                # Pure rect raster (before merging with U-Net mask)
+                _rect_rast = rasterise_wall_segments(_rd_res.walls,
+                                                      img_clean.shape[:2])
+                # outline_mask = rect raster OR raw U-Net mask so room-finding
+                # has extra ink to bridge corner gaps the rects didn't close.
+                _rast = _rect_rast.copy()
                 if _rd_res.wall_mask is not None:
                     _rast = cv2.bitwise_or(_rast, _rd_res.wall_mask)
                 result.outline_mask = _rast
@@ -1335,11 +1353,28 @@ class FloorplanPipeline:
                     base_name, len(result.walls),
                     sum(1 for w in result.walls if w.is_diagonal),
                 )
-                # Save intermediate masks for debugging
+                # ── Save debug masks ───────────────────────────────────
+                # U-Net raw mask (binary, before rect decomposition)
                 _unet_raw_path = os.path.join(output_dir, f"{base_name}_unet_raw.png")
-                cv2.imwrite(_unet_raw_path, _rd_res.wall_mask if _rd_res.wall_mask is not None else np.zeros((2,2), np.uint8))
+                _unet_save = (_rd_res.wall_mask
+                              if _rd_res.wall_mask is not None
+                              else np.zeros((2, 2), np.uint8))
+                cv2.imwrite(_unet_raw_path, _unet_save)
+
+                # Rect mask: 3-colour error map
+                #   WHITE  = rect pixel ∩ wall mask   (correctly placed)
+                #   RED    = rect pixel ∩ ~wall mask  (bleed — rect outside mask)
+                #   GREEN  = ~rect pixel ∩ wall mask  (missed — mask not covered)
+                #   BLACK  = background
                 _rect_mask_path = os.path.join(output_dir, f"{base_name}_rect_mask.png")
-                cv2.imwrite(_rect_mask_path, _rast)
+                _H, _W = img_clean.shape[:2]
+                _err = np.zeros((_H, _W, 3), dtype=np.uint8)
+                _r = (_rect_rast > 0)
+                _m = (_unet_save > 0) if _rd_res.wall_mask is not None else np.zeros((_H, _W), dtype=bool)
+                _err[_r & _m]  = (255, 255, 255)   # correct  → white
+                _err[_r & ~_m] = (  0,   0, 220)   # bleed    → red   (BGR)
+                _err[~_r & _m] = ( 50, 200,  50)   # missed   → green (BGR)
+                cv2.imwrite(_rect_mask_path, _err)
             except Exception as exc:
                 logger.exception(
                     "[%s] Rect-wall detection failed (%s) — falling back to "

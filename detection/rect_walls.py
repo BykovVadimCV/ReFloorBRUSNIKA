@@ -350,6 +350,182 @@ def rasterise_wall_segments(
 
 
 # ---------------------------------------------------------------------------
+# Enclosed-space filtering
+# ---------------------------------------------------------------------------
+
+def find_enclosed_spaces(
+    img_bgr: np.ndarray,
+    wall_mask: Optional[np.ndarray] = None,
+    *,
+    close_kernel_size: int = 7,
+    close_iters: int = 2,
+) -> np.ndarray:
+    """
+    Identify white spaces in the image that are fully enclosed by walls.
+
+    Algorithm
+    ---------
+    1. Grayscale → invert (walls/text become bright, white background dark).
+    2. Otsu-binarise → binary mask (walls = 255, background = 0).
+    3. Morphological *close* with a ``close_kernel_size`` kernel to bridge
+       small gaps in the wall structure (the "cap" step).
+    4. OR with a dilated copy of ``wall_mask`` to reinforce boundaries.
+    5. Flood-fill from all border pixels → marks exterior background as 128.
+    6. Connected components on the remaining 0-pixels → enclosed regions.
+
+    Returns
+    -------
+    labels : ndarray (H, W), int32
+        Each enclosed region has a unique positive label ≥ 1.
+        Exterior / wall pixels have label 0.
+    """
+    H, W = img_bgr.shape[:2]
+
+    # 1. Invert grayscale
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    inverted = 255 - gray
+
+    # 2. Otsu binarise
+    _, binary = cv2.threshold(
+        inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    # 3. Close to bridge small wall gaps
+    k = np.ones((close_kernel_size, close_kernel_size), dtype=np.uint8)
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k, iterations=close_iters)
+
+    # 4. Reinforce with dilated wall_mask
+    if wall_mask is not None and wall_mask.size > 0:
+        wm = (wall_mask > 0).astype(np.uint8) * 255
+        dil_k = np.ones((3, 3), dtype=np.uint8)
+        wm_dil = cv2.dilate(wm, dil_k, iterations=2)
+        closed = cv2.bitwise_or(closed, wm_dil)
+
+    # 5. Flood-fill from all border background pixels → exterior = 128
+    filled = closed.copy()
+    flood_seed = np.zeros((H + 2, W + 2), dtype=np.uint8)   # required by cv2
+
+    def _try_fill(x: int, y: int) -> None:
+        if 0 <= y < H and 0 <= x < W and filled[y, x] == 0:
+            cv2.floodFill(filled, flood_seed, (x, y), 128)
+
+    for x in range(W):
+        _try_fill(x, 0)
+        _try_fill(x, H - 1)
+    for y in range(H):
+        _try_fill(0, y)
+        _try_fill(W - 1, y)
+
+    # 6. Remaining 0-pixels are enclosed → connected-component label them
+    enclosed_bin = (filled == 0).astype(np.uint8)
+    _, labels = cv2.connectedComponents(enclosed_bin, connectivity=8)
+    return labels.astype(np.int32)
+
+
+def refine_mask_by_enclosed_spaces(
+    wall_mask: np.ndarray,
+    img_bgr: np.ndarray,
+    ocr_bboxes: Optional[List] = None,
+    *,
+    wall_overlap_threshold: float = 0.50,
+    close_kernel_size: int = 7,
+    close_iters: int = 2,
+) -> np.ndarray:
+    """
+    Refine *wall_mask* using enclosed-space analysis.
+
+    For every enclosed region (a white space surrounded by walls):
+
+    * **No OCR label inside + ≥ wall_overlap_threshold wall-mask overlap**
+      → structural cavity; fill the whole region as wall (255).
+    * **OCR label centre inside**
+      → labelled room; clear any stray wall pixels (set to 0).
+
+    Parameters
+    ----------
+    wall_mask  : H×W uint8, 255 = wall
+    img_bgr    : BGR image (text regions already erased)
+    ocr_bboxes : list of ``(x1, y1, x2, y2)`` or ``(text, x1, y1, x2, y2)``
+    wall_overlap_threshold : fraction of region pixels that must be wall
+                             for the "fill as wall" branch to fire
+
+    Returns
+    -------
+    Refined wall_mask (a copy — the input is not modified).
+    """
+    if wall_mask is None:
+        return wall_mask
+
+    refined = wall_mask.copy()
+    H, W = refined.shape[:2]
+
+    # Normalise ocr_bboxes to plain (x1, y1, x2, y2) int tuples
+    boxes: List[Tuple[int, int, int, int]] = []
+    if ocr_bboxes:
+        for item in ocr_bboxes:
+            if len(item) == 4:
+                boxes.append((int(item[0]), int(item[1]),
+                               int(item[2]), int(item[3])))
+            elif len(item) >= 5:
+                # (text, x1, y1, x2, y2) — skip text token
+                boxes.append((int(item[1]), int(item[2]),
+                               int(item[3]), int(item[4])))
+
+    # Precompute OCR bbox centres once
+    ocr_centres: List[Tuple[float, float]] = []
+    for (bx1, by1, bx2, by2) in boxes:
+        ocr_centres.append(((bx1 + bx2) / 2.0, (by1 + by2) / 2.0))
+
+    # Get enclosed region labels
+    labels = find_enclosed_spaces(
+        img_bgr, wall_mask,
+        close_kernel_size=close_kernel_size,
+        close_iters=close_iters,
+    )
+
+    n_labels = int(labels.max())
+    if n_labels == 0:
+        logger.debug("refine_mask_by_enclosed_spaces: no enclosed regions found")
+        return refined
+
+    filled_count = 0
+    cleared_count = 0
+
+    for region_id in range(1, n_labels + 1):
+        region_mask = labels == region_id
+        region_area = int(np.count_nonzero(region_mask))
+        if region_area == 0:
+            continue
+
+        # Check if any OCR bbox centre falls inside this region
+        has_ocr = False
+        for (cx, cy) in ocr_centres:
+            xi, yi = int(round(cx)), int(round(cy))
+            if 0 <= yi < H and 0 <= xi < W and region_mask[yi, xi]:
+                has_ocr = True
+                break
+
+        if has_ocr:
+            # Labelled room — clear stray wall pixels
+            refined[region_mask] = 0
+            cleared_count += 1
+        else:
+            # No room label — check wall-mask overlap
+            overlap = int(np.count_nonzero(wall_mask[region_mask] > 0))
+            overlap_frac = overlap / region_area
+            if overlap_frac >= wall_overlap_threshold:
+                refined[region_mask] = 255
+                filled_count += 1
+
+    logger.info(
+        "refine_mask_by_enclosed_spaces: %d structural regions filled, "
+        "%d room regions cleared  (total enclosed=%d)",
+        filled_count, cleared_count, n_labels,
+    )
+    return refined
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -384,10 +560,21 @@ class RectWallDetector:
         img_bgr: np.ndarray,
         *,
         wall_mask: Optional[np.ndarray] = None,
+        ocr_bboxes: Optional[List] = None,
     ) -> DetectionResult:
         """
         Detect walls in ``img_bgr``.  If ``wall_mask`` is supplied it is used
         directly; otherwise the binary U-Net is invoked.
+
+        Parameters
+        ----------
+        img_bgr    : BGR image (text regions ideally already erased).
+        wall_mask  : optional pre-computed binary wall mask; if None the
+                     U-Net checkpoint is used.
+        ocr_bboxes : list of ``(x1, y1, x2, y2)`` or ``(text, x1, y1, x2, y2)``
+                     bounding boxes for OCR text regions.  Used by the
+                     enclosed-space refinement step to distinguish rooms
+                     (labelled) from structural cavities (unlabelled).
         """
         cfg = self.config
         H, W = img_bgr.shape[:2]
@@ -401,6 +588,22 @@ class RectWallDetector:
             return DetectionResult(
                 walls=[], openings=[], wall_mask=wall_mask,
                 outline_mask=None, source="rect_walls",
+            )
+
+        # ── 1b. Enclosed-space refinement ─────────────────────────────
+        # Before rect decomposition: identify enclosed white spaces in the
+        # image (rooms / structural cavities).
+        # • Spaces with an OCR label inside  → labelled room; clear stray
+        #   wall pixels so room boundaries are clean.
+        # • Spaces without OCR label AND ≥50% wall-mask overlap → structural
+        #   cavity; fill entirely as wall so the decomposer doesn't fragment it.
+        try:
+            wall_mask = refine_mask_by_enclosed_spaces(
+                wall_mask, img_bgr, ocr_bboxes,
+            )
+        except Exception as _rme:
+            logger.warning(
+                "refine_mask_by_enclosed_spaces failed (%s) — skipping", _rme
             )
 
         # ── 2. Diagonal-presence test ──────────────────────────────────
