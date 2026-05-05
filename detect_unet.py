@@ -64,16 +64,43 @@ def build_model(num_classes: int = NUM_CLASSES, encoder: str = ENCODER):
     )
 
 
+def _infer_num_classes_from_state(state_dict: dict) -> int:
+    """Detect the number of output classes from the segmentation head weight shape.
+
+    The segmentation head weight tensor has shape (num_classes, C, kH, kW).
+    Falls back to NUM_CLASSES (4) if the key is absent.
+    """
+    for key in ("segmentation_head.0.weight", "decoder.segmentation_head.0.weight"):
+        if key in state_dict:
+            return int(state_dict[key].shape[0])
+    return NUM_CLASSES
+
+
 def load_checkpoint(model, ckpt_path: str, device: torch.device):
     state = torch.load(ckpt_path, map_location=device, weights_only=False)
     if isinstance(state, dict) and "model" in state:
-        model.load_state_dict(state["model"])
-        epoch = state.get("epoch", "?")
-        miou = state.get("best_val_iou", None)
+        state_dict = state["model"]
     else:
-        model.load_state_dict(state)
+        state_dict = state
+    model.load_state_dict(state_dict)
     model.eval()
     return model
+
+
+def build_model_from_checkpoint(ckpt_path: str, device: torch.device,
+                                 encoder: str = ENCODER):
+    """Build a U-Net whose class count matches the checkpoint automatically."""
+    raw = torch.load(ckpt_path, map_location=device, weights_only=False)
+    state_dict = raw["model"] if (isinstance(raw, dict) and "model" in raw) else raw
+    num_classes = _infer_num_classes_from_state(state_dict)
+    logger.info(
+        "Checkpoint '%s': detected %d output class(es)",
+        ckpt_path, num_classes,
+    )
+    model = build_model(num_classes=num_classes, encoder=encoder)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model, num_classes
 
 
 def get_val_transform(img_size: int):
@@ -1152,8 +1179,7 @@ def _get_or_load_model(checkpoint_path: str, device: torch.device):
             and _cached_ckpt_path == checkpoint_path
             and _cached_device == device):
         return _cached_model
-    model = build_model()
-    model = load_checkpoint(model, checkpoint_path, device)
+    model, _num_classes = build_model_from_checkpoint(checkpoint_path, device)
     model = model.to(device)
     _cached_model = model
     _cached_ckpt_path = checkpoint_path
@@ -1206,6 +1232,9 @@ def run_unet_pipeline(
     h_orig, w_orig = image_rgb.shape[:2]
     transform = get_val_transform(img_size)
 
+    # Determine how many classes this checkpoint has from the model head.
+    _num_classes = int(model.segmentation_head[0].weight.shape[0])
+
     augmented = transform(image=image_rgb)
     inp = augmented["image"].unsqueeze(0).to(dev)
 
@@ -1223,8 +1252,9 @@ def run_unet_pipeline(
                            interpolation=cv2.INTER_NEAREST)
 
     wall_mask = (pred_full == 1).astype(np.uint8)
-    window_mask = (pred_full == 2).astype(np.uint8)
-    door_mask = (pred_full == 3).astype(np.uint8)
+    # window and door masks only exist in 4-class checkpoints
+    window_mask = (pred_full == 2).astype(np.uint8) if _num_classes >= 3 else np.zeros_like(wall_mask)
+    door_mask   = (pred_full == 3).astype(np.uint8) if _num_classes >= 4 else np.zeros_like(wall_mask)
 
     _close_k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
     wall_mask = cv2.morphologyEx(wall_mask, cv2.MORPH_CLOSE, _close_k)
