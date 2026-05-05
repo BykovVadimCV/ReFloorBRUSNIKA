@@ -295,9 +295,9 @@ class PipelineConfig:
     rect_penalty:              float = 0.02
     rect_max_grid_dim:         int   = 200
     rect_coverage_stop:        float = 0.93
-    rect_bleed_weight:         float = 3.5
+    rect_bleed_weight:         float = 15.0
     rect_initial_bleed_weight: float = 15.0
-    rect_bleed_decay:          float = 0.3
+    rect_bleed_decay:          float = 0.0
     rect_axis_gap:             float = 0.0
     rect_max_overlap:          float = 0.5
 
