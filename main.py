@@ -78,6 +78,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help='Enable debug output and images')
     parser.add_argument('--debug-arcs', action='store_true',
                         help='Save door arc detection debug images')
+    parser.add_argument('--snap-strength', type=float, default=1.0,
+                        metavar='S',
+                        help='Wall-snapping strength multiplier (default: 1.0). '
+                             'Values > 1 snap more aggressively; '
+                             '0 disables all snapping.')
     return parser
 
 
@@ -113,6 +118,9 @@ def main() -> None:
         raise ValueError(f"No images found at: {args.input}")
 
     # Build config from CLI args
+    # --snap-strength scales all snapping tolerances uniformly.
+    # 0 = no snapping, 1.0 = defaults, >1 = more aggressive.
+    _s = max(0.0, args.snap_strength)
     config = PipelineConfig(
         yolo_weights_path=args.yolo_model,
         yolo_confidence=args.yolo_conf,
@@ -129,6 +137,12 @@ def main() -> None:
         enable_unet=args.enable_unet,
         debug_mode=args.debug,
         debug_arcs=args.debug_arcs,
+        # Snapping tolerances scaled by --snap-strength
+        snap_tolerance_cm=40.0 * _s,
+        axis_snap_tolerance_cm=15.0 * _s,
+        t_junction_snap_tolerance_cm=30.0 * _s,
+        rect_snap_gap_factor=2.0 * _s,
+        rect_snap_gap_floor=6.0 * _s,
     )
 
     pipeline = FloorplanPipeline(config)
