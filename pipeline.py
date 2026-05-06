@@ -1276,17 +1276,19 @@ class FloorplanPipeline:
             base_name,
         )
         img_clean = img.copy()
-        pad = 3
+        shrink = 3  # inset each OCR bbox by this many pixels before erasing
         for _src in (ocr_text_labels_early, rotated_ocr_labels):
             for item in _src:
                 if len(item) < 5:
                     continue
-                rx1, ry1 = int(item[1]), int(item[2])
-                rx2, ry2 = int(item[3]), int(item[4])
+                rx1, ry1 = int(item[1]) + shrink, int(item[2]) + shrink
+                rx2, ry2 = int(item[3]) - shrink, int(item[4]) - shrink
+                if rx2 <= rx1 or ry2 <= ry1:
+                    continue  # bbox too small after shrink — skip
                 cv2.rectangle(
                     img_clean,
-                    (max(0, rx1 - pad), max(0, ry1 - pad)),
-                    (min(w_img, rx2 + pad), min(h_img, ry2 + pad)),
+                    (max(0, rx1), max(0, ry1)),
+                    (min(w_img, rx2), min(h_img, ry2)),
                     (255, 255, 255), -1,
                 )
 
