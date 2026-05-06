@@ -355,70 +355,49 @@ def rasterise_wall_segments(
 
 def find_enclosed_spaces(
     img_bgr: np.ndarray,
-    wall_mask: Optional[np.ndarray] = None,
+    wall_mask: Optional[np.ndarray] = None,   # kept for API compat, unused
     *,
     close_kernel_size: int = 7,
     close_iters: int = 2,
 ) -> np.ndarray:
     """
-    Identify white spaces in the image that are fully enclosed by walls.
+    Label every white connected region in the floor-plan image.
 
     Algorithm
     ---------
-    1. Grayscale → invert (walls/text become bright, white background dark).
-    2. Otsu-binarise → binary mask (walls = 255, background = 0).
-    3. Morphological *close* with a ``close_kernel_size`` kernel to bridge
-       small gaps in the wall structure (the "cap" step).
-    4. OR with a dilated copy of ``wall_mask`` to reinforce boundaries.
-    5. Flood-fill from all border pixels → marks exterior background as 128.
-    6. Connected components on the remaining 0-pixels → enclosed regions.
+    1. Grayscale.
+    2. Otsu binarise: walls/dark features → 0, white regions → 255.
+    3. Cap step: morphological CLOSE on the *wall* mask (inverted binary)
+       to bridge small gaps in wall coverage, so interior rooms are
+       fully enclosed before labelling.
+    4. ``cv2.connectedComponents`` on the white (room/exterior) pixels.
+
+    All white regions are returned — rooms, corridors, and the exterior.
+    The caller decides what to do with each region.
 
     Returns
     -------
     labels : ndarray (H, W), int32
-        Each enclosed region has a unique positive label ≥ 1.
-        Exterior / wall pixels have label 0.
+        0 = wall/dark pixels, 1..N = individual white regions.
     """
-    H, W = img_bgr.shape[:2]
-
-    # 1. Invert grayscale
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    inverted = 255 - gray
 
-    # 2. Otsu binarise
-    _, binary = cv2.threshold(
-        inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-    )
+    # Otsu: walls → 0, rooms/background → 255
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # 3. Close to bridge small wall gaps
-    k = np.ones((close_kernel_size, close_kernel_size), dtype=np.uint8)
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k, iterations=close_iters)
+    # Cap: close gaps in the wall structure so rooms are properly enclosed.
+    # We work on the inverted image (walls = 255) so MORPH_CLOSE thickens
+    # walls and bridges narrow breaks without permanently shrinking rooms.
+    if close_kernel_size > 1 and close_iters > 0:
+        k = np.ones((close_kernel_size, close_kernel_size), dtype=np.uint8)
+        walls = cv2.bitwise_not(binary)                          # walls = 255
+        walls_capped = cv2.morphologyEx(
+            walls, cv2.MORPH_CLOSE, k, iterations=close_iters
+        )
+        binary = cv2.bitwise_not(walls_capped)                   # rooms = 255
 
-    # 4. Reinforce with dilated wall_mask
-    if wall_mask is not None and wall_mask.size > 0:
-        wm = (wall_mask > 0).astype(np.uint8) * 255
-        dil_k = np.ones((3, 3), dtype=np.uint8)
-        wm_dil = cv2.dilate(wm, dil_k, iterations=2)
-        closed = cv2.bitwise_or(closed, wm_dil)
-
-    # 5. Flood-fill from all border background pixels → exterior = 128
-    filled = closed.copy()
-    flood_seed = np.zeros((H + 2, W + 2), dtype=np.uint8)   # required by cv2
-
-    def _try_fill(x: int, y: int) -> None:
-        if 0 <= y < H and 0 <= x < W and filled[y, x] == 0:
-            cv2.floodFill(filled, flood_seed, (x, y), 128)
-
-    for x in range(W):
-        _try_fill(x, 0)
-        _try_fill(x, H - 1)
-    for y in range(H):
-        _try_fill(0, y)
-        _try_fill(W - 1, y)
-
-    # 6. Remaining 0-pixels are enclosed → connected-component label them
-    enclosed_bin = (filled == 0).astype(np.uint8)
-    _, labels = cv2.connectedComponents(enclosed_bin, connectivity=8)
+    # Label all connected white regions (8-connectivity)
+    _, labels = cv2.connectedComponents(binary, connectivity=8)
     return labels.astype(np.int32)
 
 
@@ -525,76 +504,70 @@ def refine_mask_by_enclosed_spaces(
     )
 
     # ── Optional debug image ───────────────────────────────────────────────
-    # Shows every enclosed white region found by the flood-fill step,
-    # each painted with a distinct hue so the user can verify detection.
-    # A thin white border is drawn around each region, and a small label
-    # prints the region's pixel area.  OCR bounding boxes are shown as
-    # dashed white rectangles.
+    # Each white connected region gets a unique colour (golden-angle HSV
+    # spacing for maximum visual separation), walls stay black, and the
+    # top-N largest regions get a pixel-area label at their centroid.
+    # OCR bboxes are overlaid in white so it is clear which regions have
+    # been identified as labelled rooms.
     if debug_img_path:
         try:
-            # Faded greyscale base so the coloured regions stand out
             gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            base = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-            # Dim slightly so overlays are vivid against it
-            dbg = (base * 0.45).astype(np.uint8)
 
-            alpha = 0.75   # overlay opacity
+            # Otsu binarise (same as find_enclosed_spaces, but we need the
+            # binary to paint walls black in the output)
+            _, binary_dbg = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
 
-            for region_id in range(1, n_labels + 1):
-                rmask = (labels == region_id)
-                region_px = int(np.count_nonzero(rmask))
-                if region_px == 0:
+            # Build a colour LUT: one BGR colour per label
+            n_regions = int(labels.max())
+            lut = np.zeros((n_regions + 1, 3), dtype=np.uint8)
+            lut[0] = (0, 0, 0)   # label 0 = walls → black
+            for i in range(1, n_regions + 1):
+                hue = int((i * 137.508) % 360) // 2   # golden angle, max separation
+                hsv = np.uint8([[[hue, 220, 220]]])
+                lut[i] = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
+
+            # Map every pixel through the LUT
+            colored = lut[labels]   # (H, W, 3)
+
+            # Stamp walls black so structure is always visible
+            colored[binary_dbg == 0] = (0, 0, 0)
+
+            # Collect region stats for labelling (skip tiny noise)
+            region_stats = []
+            for i in range(1, n_regions + 1):
+                rmask = labels == i
+                area = int(np.count_nonzero(rmask))
+                if area < 500:
                     continue
-
-                # Assign a unique, evenly-spaced hue (HSV → BGR)
-                hue = int((region_id * 37) % 180)       # cycles through hue wheel
-                hsv_pixel = np.array([[[hue, 230, 240]]], dtype=np.uint8)
-                bgr_color = tuple(
-                    int(v) for v in cv2.cvtColor(hsv_pixel, cv2.COLOR_HSV2BGR)[0, 0]
-                )
-
-                # Flood-fill the region with its colour
-                overlay = np.zeros_like(dbg)
-                overlay[rmask] = bgr_color
-                dbg = cv2.addWeighted(dbg, 1.0 - alpha, overlay, alpha, 0)
-
-                # Draw a 1-px white contour around the region border
-                region_u8 = rmask.astype(np.uint8) * 255
-                contours, _ = cv2.findContours(
-                    region_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-                )
-                cv2.drawContours(dbg, contours, -1, (255, 255, 255), 1)
-
-                # Label the centroid with the pixel area
                 ys, xs = np.where(rmask)
-                cx_r, cy_r = int(xs.mean()), int(ys.mean())
-                label_txt = str(region_px)
+                region_stats.append((area, i, int(xs.mean()), int(ys.mean())))
+            region_stats.sort(reverse=True)
+
+            # Label the top regions by area
+            for area, idx, cx_r, cy_r in region_stats[:30]:
+                txt = str(area)
                 (tw, th), _ = cv2.getTextSize(
-                    label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1
+                    txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
                 )
-                # Dark backing rectangle for legibility
-                cv2.rectangle(
-                    dbg,
-                    (cx_r - tw // 2 - 1, cy_r - th - 1),
-                    (cx_r + tw // 2 + 1, cy_r + 1),
-                    (0, 0, 0), -1,
-                )
-                cv2.putText(
-                    dbg, label_txt,
-                    (cx_r - tw // 2, cy_r),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1,
-                    cv2.LINE_AA,
-                )
+                # White shadow then black text for legibility on any colour
+                cv2.putText(colored, txt, (cx_r - tw // 2 + 1, cy_r + 1),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
+                            cv2.LINE_AA)
+                cv2.putText(colored, txt, (cx_r - tw // 2, cy_r),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1,
+                            cv2.LINE_AA)
 
-            # OCR bounding boxes — white outlines so we can see which
-            # regions have been identified as labelled rooms
+            # OCR bbox outlines
             for (bx1, by1, bx2, by2) in boxes:
-                cv2.rectangle(dbg, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
+                cv2.rectangle(colored, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
 
-            cv2.imwrite(debug_img_path, dbg)
+            cv2.imwrite(debug_img_path, colored)
             logger.info(
-                "Enclosed-space debug image saved → %s  (%d regions)",
-                debug_img_path, n_labels,
+                "Enclosed-space debug image saved → %s  (%d regions, "
+                "%d labelled)",
+                debug_img_path, n_regions, len(region_stats),
             )
         except Exception as _dbe:
             logger.warning("Could not save enclosed-space debug image: %s", _dbe)
