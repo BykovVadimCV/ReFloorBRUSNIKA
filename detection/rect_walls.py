@@ -525,50 +525,77 @@ def refine_mask_by_enclosed_spaces(
     )
 
     # ── Optional debug image ───────────────────────────────────────────────
-    # Colour-coded overlay showing what happened to every enclosed region:
-    #   GREEN  (0,180,0)   → filled as wall (structural cavity)
-    #   RED    (0,0,200)   → cleared (labelled room)
-    #   YELLOW (0,200,200) → skipped (no OCR, low wall overlap)
+    # Shows every enclosed white region found by the flood-fill step,
+    # each painted with a distinct hue so the user can verify detection.
+    # A thin white border is drawn around each region, and a small label
+    # prints the region's pixel area.  OCR bounding boxes are shown as
+    # dashed white rectangles.
     if debug_img_path:
         try:
-            gray3 = cv2.cvtColor(
-                cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR
-            )
-            dbg = gray3.copy()
-            COLOR_FILLED  = (  0, 180,   0)   # BGR green
-            COLOR_CLEARED = (  0,   0, 200)   # BGR red
-            COLOR_SKIPPED = (  0, 200, 200)   # BGR yellow
-            alpha = 0.55
+            # Faded greyscale base so the coloured regions stand out
+            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            base = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+            # Dim slightly so overlays are vivid against it
+            dbg = (base * 0.45).astype(np.uint8)
+
+            alpha = 0.75   # overlay opacity
 
             for region_id in range(1, n_labels + 1):
-                rmask = labels == region_id
-                if not np.any(rmask):
+                rmask = (labels == region_id)
+                region_px = int(np.count_nonzero(rmask))
+                if region_px == 0:
                     continue
-                # Determine fate by repeating the same logic
-                has_ocr_here = False
-                for (cx, cy) in ocr_centres:
-                    xi, yi = int(round(cx)), int(round(cy))
-                    if 0 <= yi < H and 0 <= xi < W and rmask[yi, xi]:
-                        has_ocr_here = True
-                        break
-                if has_ocr_here:
-                    color = COLOR_CLEARED
-                else:
-                    ov = int(np.count_nonzero(wall_mask[rmask] > 0))
-                    color = (COLOR_FILLED
-                             if ov / max(int(np.count_nonzero(rmask)), 1)
-                             >= wall_overlap_threshold
-                             else COLOR_SKIPPED)
+
+                # Assign a unique, evenly-spaced hue (HSV → BGR)
+                hue = int((region_id * 37) % 180)       # cycles through hue wheel
+                hsv_pixel = np.array([[[hue, 230, 240]]], dtype=np.uint8)
+                bgr_color = tuple(
+                    int(v) for v in cv2.cvtColor(hsv_pixel, cv2.COLOR_HSV2BGR)[0, 0]
+                )
+
+                # Flood-fill the region with its colour
                 overlay = np.zeros_like(dbg)
-                overlay[rmask] = color
+                overlay[rmask] = bgr_color
                 dbg = cv2.addWeighted(dbg, 1.0 - alpha, overlay, alpha, 0)
 
-            # Draw OCR bbox outlines in white for reference
+                # Draw a 1-px white contour around the region border
+                region_u8 = rmask.astype(np.uint8) * 255
+                contours, _ = cv2.findContours(
+                    region_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                cv2.drawContours(dbg, contours, -1, (255, 255, 255), 1)
+
+                # Label the centroid with the pixel area
+                ys, xs = np.where(rmask)
+                cx_r, cy_r = int(xs.mean()), int(ys.mean())
+                label_txt = str(region_px)
+                (tw, th), _ = cv2.getTextSize(
+                    label_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1
+                )
+                # Dark backing rectangle for legibility
+                cv2.rectangle(
+                    dbg,
+                    (cx_r - tw // 2 - 1, cy_r - th - 1),
+                    (cx_r + tw // 2 + 1, cy_r + 1),
+                    (0, 0, 0), -1,
+                )
+                cv2.putText(
+                    dbg, label_txt,
+                    (cx_r - tw // 2, cy_r),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1,
+                    cv2.LINE_AA,
+                )
+
+            # OCR bounding boxes — white outlines so we can see which
+            # regions have been identified as labelled rooms
             for (bx1, by1, bx2, by2) in boxes:
-                cv2.rectangle(dbg, (bx1, by1), (bx2, by2), (220, 220, 220), 1)
+                cv2.rectangle(dbg, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
 
             cv2.imwrite(debug_img_path, dbg)
-            logger.info("Enclosed-space debug image saved → %s", debug_img_path)
+            logger.info(
+                "Enclosed-space debug image saved → %s  (%d regions)",
+                debug_img_path, n_labels,
+            )
         except Exception as _dbe:
             logger.warning("Could not save enclosed-space debug image: %s", _dbe)
 
