@@ -163,9 +163,11 @@ def deduplicate_openings(
     # YOLO and U-Net doors that overlap them.
     def _priority(o: Opening) -> float:
         base = {OpeningType.DOOR: 2.0, OpeningType.WINDOW: 1.0, OpeningType.GAP: 3.0}
-        # U-Net doors rank below traditional YOLO/gap doors
-        if o.source == 'unet':
-            return 0.5 + o.confidence * 0.1
+        # U-Net doors rank just below traditional YOLO/gap doors so that
+        # geometric gaps and YOLO resolutions beat them when co-located.
+        src = getattr(o, 'source', '') or ''
+        if src.startswith('unet'):
+            return 1.8 + o.confidence * 0.1
         return base.get(o.opening_type, 0.0) + o.confidence * 0.1
 
     # Sort by priority desc, then confidence desc
@@ -217,8 +219,10 @@ class OpeningDetectionPipeline:
         self._arc_detector = None
         self._fusion_engine = None
         self._yolo_detector = None
+        self._unet_door_detector = None
         # Populated during detect() for external debug consumers
         self._debug_yolo_doors_raw: List[Opening] = []
+        self._debug_unet_door_mask: Optional[np.ndarray] = None
 
     def initialize(self, yolo_model=None) -> None:
         """
@@ -252,6 +256,25 @@ class OpeningDetectionPipeline:
         )
         self._fusion_engine = DoorFusionEngine()
         self._yolo_detector = yolo_model
+
+        # U-Net 4-class door detector (epoch_040.pth) — optional
+        if cfg.enable_unet:
+            from detection.unet_doors import UNetDoorDetector
+            self._unet_door_detector = UNetDoorDetector(
+                ckpt_path=cfg.unet_checkpoint_path,
+                img_size=cfg.unet_img_size,
+                confidence=cfg.unet_confidence,
+                min_door_area=cfg.unet_min_door_area,
+                match_margin=getattr(cfg, "unet_door_match_margin", 40),
+                device=cfg.unet_device,
+            )
+            ok = self._unet_door_detector.initialize()
+            if not ok:
+                logger.warning(
+                    "OpeningDetectionPipeline: UNetDoorDetector failed to load — "
+                    "U-Net door detection disabled"
+                )
+                self._unet_door_detector = None
 
     def detect(
         self,
@@ -334,14 +357,33 @@ class OpeningDetectionPipeline:
             except Exception:
                 logger.warning("Geometric gap detection failed", exc_info=True)
 
+        # Keep original gaps for arc detector (Step 4) and for U-Net snap targets.
+        all_geo_gaps = list(geo_gaps)
+
+        # ── Step 2.5: U-Net 4-class door detection ────────────────────
+        # Uses epoch_040.pth (bg/wall/window/door) to extract a door-class
+        # mask, then snaps each detected blob to the nearest geometric gap.
+        self._debug_unet_door_mask = None
+        if self._unet_door_detector is not None:
+            try:
+                unet_doors, unet_door_mask = self._unet_door_detector.detect(
+                    image, all_geo_gaps
+                )
+                self._debug_unet_door_mask = unet_door_mask
+                if unet_doors:
+                    all_openings.extend(unet_doors)
+                    logger.info(
+                        "OpeningDetectionPipeline: U-Net added %d door(s)",
+                        len(unet_doors),
+                    )
+            except Exception:
+                logger.warning("U-Net door detection failed", exc_info=True)
+
         # ── Step 2b: Resolve YOLO doors to gap bboxes ─────────────────
         # YOLO door bboxes include the door leaf (swinging part), which
         # offsets the centre from the actual wall gap.  When a geometric
         # gap overlaps a YOLO door, adopt the gap's bbox for precise
         # wall-gap positioning while keeping the DOOR type and confidence.
-        # Keep original gaps for arc detector (Step 4) before resolution
-        # removes claimed ones.
-        all_geo_gaps = list(geo_gaps)
         if yolo_doors and geo_gaps:
             yolo_doors, geo_gaps = _resolve_doors_to_gaps(
                 yolo_doors, geo_gaps, match_margin=25)

@@ -2003,11 +2003,15 @@ class FloorplanPipeline:
         # ── Door debug images ──────────────────────────────────────────
         if output_dir:
             try:
+                unet_door_mask = getattr(
+                    self.opening_detector, '_debug_unet_door_mask', None
+                )
                 self._save_door_debug(
                     img=img,
                     openings=openings,
                     output_dir=output_dir,
                     base_name=base_name,
+                    unet_door_mask=unet_door_mask,
                 )
             except Exception as _dde:
                 logger.warning("Door debug image failed (non-fatal): %s", _dde)
@@ -2020,19 +2024,22 @@ class FloorplanPipeline:
         openings: List[Opening],
         output_dir: str,
         base_name: str,
+        unet_door_mask: Optional[np.ndarray] = None,
     ) -> None:
         """
         Write two door debug images:
 
         ``*_door_mask.png``
-            Binary white-on-black mask of every accepted door region.
+            U-Net door-class pixel mask (uint8, 255=door) when available;
+            otherwise a white-filled rectangle mask of accepted doors.
 
         ``*_door_boxes.png``
             Original image annotated with:
               - GREEN  solid rect  = accepted door (in final openings)
-              - RED    dashed rect = rejected YOLO candidate (detected but
+              - RED    solid rect  = rejected YOLO candidate (detected but
                                     not in final output after dedup/fusion)
-            Confidence score shown above each box.
+              - CYAN   solid rect  = U-Net door bboxes (source="unet_door")
+            Confidence score and source shown above each box.
         """
         H, W = img.shape[:2]
 
@@ -2043,11 +2050,15 @@ class FloorplanPipeline:
         yolo_raw = getattr(self.opening_detector, '_debug_yolo_doors_raw', [])
 
         # ── 1. Door mask ───────────────────────────────────────────────
-        mask = np.zeros((H, W), dtype=np.uint8)
-        for o in accepted:
-            x1, y1, x2, y2 = (int(o.bbox.x1), int(o.bbox.y1),
-                               int(o.bbox.x2), int(o.bbox.y2))
-            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+        # Prefer the raw U-Net pixel mask; fall back to bbox rectangles.
+        if unet_door_mask is not None and unet_door_mask.shape[:2] == (H, W):
+            mask = unet_door_mask.copy()
+        else:
+            mask = np.zeros((H, W), dtype=np.uint8)
+            for o in accepted:
+                x1, y1, x2, y2 = (int(o.bbox.x1), int(o.bbox.y1),
+                                   int(o.bbox.x2), int(o.bbox.y2))
+                cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
         cv2.imwrite(os.path.join(output_dir, f"{base_name}_door_mask.png"), mask)
 
         # ── 2. Door bounding box image ─────────────────────────────────
@@ -2068,18 +2079,21 @@ class FloorplanPipeline:
             if _iou_any(o.bbox, accepted) < REJECT_IOU_THR
         ]
 
-        # Draw rejected (red)
+        # Draw rejected YOLO candidates (red)
         for o in rejected:
             x1, y1, x2, y2 = (int(o.bbox.x1), int(o.bbox.y1),
                                int(o.bbox.x2), int(o.bbox.y2))
             cv2.rectangle(ann, (x1, y1), (x2, y2), (0, 0, 220), 2)
-            lbl = f"{o.confidence:.2f}"
+            lbl = f"{o.confidence:.2f} yolo-rej"
             cv2.putText(ann, lbl, (x1, max(0, y1 - 4)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 220), 1,
                         cv2.LINE_AA)
 
-        # Draw accepted (green, thicker)
-        for o in accepted:
+        # Draw accepted openings — colour by source
+        unet_accepted = [o for o in accepted if getattr(o, 'source', '') == 'unet_door']
+        other_accepted = [o for o in accepted if getattr(o, 'source', '') != 'unet_door']
+
+        for o in other_accepted:
             x1, y1, x2, y2 = (int(o.bbox.x1), int(o.bbox.y1),
                                int(o.bbox.x2), int(o.bbox.y2))
             cv2.rectangle(ann, (x1, y1), (x2, y2), (0, 200, 0), 2)
@@ -2089,9 +2103,19 @@ class FloorplanPipeline:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 0), 1,
                         cv2.LINE_AA)
 
+        # U-Net door detections in cyan
+        for o in unet_accepted:
+            x1, y1, x2, y2 = (int(o.bbox.x1), int(o.bbox.y1),
+                               int(o.bbox.x2), int(o.bbox.y2))
+            cv2.rectangle(ann, (x1, y1), (x2, y2), (220, 200, 0), 2)
+            lbl = f"{o.confidence:.2f} unet"
+            cv2.putText(ann, lbl, (x1, max(0, y1 - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 200, 0), 1,
+                        cv2.LINE_AA)
+
         logger.info(
-            "[%s] Door debug: %d accepted, %d rejected YOLO candidates",
-            base_name, len(accepted), len(rejected),
+            "[%s] Door debug: %d accepted (%d unet), %d rejected YOLO candidates",
+            base_name, len(accepted), len(unet_accepted), len(rejected),
         )
         cv2.imwrite(
             os.path.join(output_dir, f"{base_name}_door_boxes.png"), ann

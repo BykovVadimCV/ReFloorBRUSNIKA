@@ -251,6 +251,9 @@ class PipelineConfig:
     unet_min_door_area: int = 300
     unet_min_window_area: int = 300
 
+    # Gap-snap search margin for U-Net door bboxes (pixels)
+    unet_door_match_margin: int = 40
+
     # ============================================================
     # PLAUSIBILITY VALIDATION
     # ============================================================
