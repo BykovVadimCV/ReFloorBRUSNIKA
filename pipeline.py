@@ -926,6 +926,7 @@ class PipelineResult:
     # Masks
     wall_mask: Optional[np.ndarray] = None
     outline_mask: Optional[np.ndarray] = None
+    raw_wall_mask: Optional[np.ndarray] = None   # U-Net output before cap/refinement
 
     # Scale calibration
     pixel_scale: Optional[float] = None  # meters per pixel
@@ -1339,6 +1340,7 @@ class FloorplanPipeline:
                 )
                 result.walls        = _rd_res.walls
                 result.wall_mask    = _rd_res.wall_mask
+                result.raw_wall_mask = _rd_res.raw_wall_mask
                 # outline_mask = rect raster OR processed U-Net mask so
                 # room-finding has extra ink to bridge corner gaps.
                 _rect_rast = rasterise_wall_segments(_rd_res.walls,
@@ -1645,23 +1647,24 @@ class FloorplanPipeline:
             wall_stubs=wall_stubs,
             openings=result.openings,
             door_arcs=result.door_arcs,
-            wall_mask=result.wall_mask,
+            raw_wall_mask=result.raw_wall_mask,
             outline_mask=result.outline_mask,
             measurements=measurements,
             output_path=summary_path,
         )
 
-        if result.rooms:
-            self._render_rooms_ocr(
-                img=img,
-                rooms=result.rooms,
-                openings=[],  # Empty — legacy rooms use legacy opening format
-                ocr_labels=ocr_labels,
-                door_arcs=result.door_arcs,
-                output_path=rooms_ocr_path,
-            )
+        # rooms_ocr is always generated — works fine with an empty rooms list
+        # (just shows the image with OCR labels and no room polygons).
+        self._render_rooms_ocr(
+            img=img,
+            rooms=result.rooms or [],
+            openings=[],
+            ocr_labels=ocr_labels,
+            door_arcs=result.door_arcs,
+            output_path=rooms_ocr_path,
+        )
 
-        # Additional output: rooms with doors and windows
+        # Rooms + openings overlay — only meaningful when rooms exist
         if result.rooms:
             rooms_openings_path = os.path.join(output_dir, f"{base_name}_rooms_openings.png")
             self._render_rooms_with_openings(
@@ -1678,6 +1681,7 @@ class FloorplanPipeline:
         # ── Cleanup: free heavy intermediate data ─────────────────────
         result.wall_mask = None
         result.outline_mask = None
+        result.raw_wall_mask = None
         result.raw_yolo_results = None
         result.raw_measurements = None
         import gc
@@ -2069,7 +2073,7 @@ class FloorplanPipeline:
         wall_stubs: List,
         openings: List[Opening],
         door_arcs: List,
-        wall_mask: Optional[np.ndarray],
+        raw_wall_mask: Optional[np.ndarray],
         outline_mask: Optional[np.ndarray],
         measurements: Optional[Any],
         output_path: str,
@@ -2084,7 +2088,7 @@ class FloorplanPipeline:
                 wall_segments=wall_stubs,
                 openings=openings,
                 door_arcs=door_arcs,
-                wall_mask=wall_mask,
+                wall_mask=raw_wall_mask,
                 outline_mask=outline_mask,
                 measurements=measurements,
                 output_path=output_path,
