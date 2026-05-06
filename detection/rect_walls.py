@@ -14,7 +14,7 @@ The new wall-detection pipeline:
         ▼
     rect_decompose.decompose()
         │   • initial_bleed_weight=10, bleed_weight=1.5
-        │   • coverage_stop=0.93, max_overlap=0.5
+        │   • coverage_stop=0.97, max_overlap=0.5
         │   • axis_only=True when no diagonals detected
         │   • axis_gap snaps near-axis features to 0/45/90/135
         ▼

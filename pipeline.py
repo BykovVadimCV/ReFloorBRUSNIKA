@@ -26,6 +26,7 @@ import cv2
 import numpy as np
 
 from core.config import PipelineConfig
+from core.geometry import iou_xyxy
 from core.models import (
     BBox,
     DetectionResult,
@@ -1468,6 +1469,7 @@ class FloorplanPipeline:
             ocr_bboxes=ocr_bboxes,
             pixel_scale=pixel_scale,
             base_name=base_name,
+            output_dir=output_dir,
         )
 
         # Supplement with U-Net doors that don't overlap gap detections
@@ -1939,6 +1941,7 @@ class FloorplanPipeline:
         ocr_bboxes: Optional[List],
         pixel_scale: float,
         base_name: str,
+        output_dir: Optional[str] = None,
     ) -> Tuple[List[Opening], List[Any]]:
         """
         Run opening detection and door arc detection.
@@ -1997,7 +2000,102 @@ class FloorplanPipeline:
             except Exception as e:
                 logger.warning("Door arc extraction failed (non-fatal): %s", e)
 
+        # ── Door debug images ──────────────────────────────────────────
+        if output_dir:
+            try:
+                self._save_door_debug(
+                    img=img,
+                    openings=openings,
+                    output_dir=output_dir,
+                    base_name=base_name,
+                )
+            except Exception as _dde:
+                logger.warning("Door debug image failed (non-fatal): %s", _dde)
+
         return openings, door_arcs
+
+    def _save_door_debug(
+        self,
+        img: np.ndarray,
+        openings: List[Opening],
+        output_dir: str,
+        base_name: str,
+    ) -> None:
+        """
+        Write two door debug images:
+
+        ``*_door_mask.png``
+            Binary white-on-black mask of every accepted door region.
+
+        ``*_door_boxes.png``
+            Original image annotated with:
+              - GREEN  solid rect  = accepted door (in final openings)
+              - RED    dashed rect = rejected YOLO candidate (detected but
+                                    not in final output after dedup/fusion)
+            Confidence score shown above each box.
+        """
+        H, W = img.shape[:2]
+
+        # Accepted doors from the final opening list
+        accepted = [o for o in openings if o.opening_type == OpeningType.DOOR]
+
+        # Raw YOLO door candidates stored by detect() before dedup/fusion
+        yolo_raw = getattr(self.opening_detector, '_debug_yolo_doors_raw', [])
+
+        # ── 1. Door mask ───────────────────────────────────────────────
+        mask = np.zeros((H, W), dtype=np.uint8)
+        for o in accepted:
+            x1, y1, x2, y2 = (int(o.bbox.x1), int(o.bbox.y1),
+                               int(o.bbox.x2), int(o.bbox.y2))
+            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+        cv2.imwrite(os.path.join(output_dir, f"{base_name}_door_mask.png"), mask)
+
+        # ── 2. Door bounding box image ─────────────────────────────────
+        ann = img.copy()
+
+        def _iou_any(bbox: BBox, others: List[Opening]) -> float:
+            """Max IoU of bbox against a list of openings."""
+            a = bbox.to_xyxy()
+            return max(
+                (iou_xyxy(a, o.bbox.to_xyxy()) for o in others),
+                default=0.0,
+            )
+
+        # Rejected = raw YOLO doors with low overlap against accepted set
+        REJECT_IOU_THR = 0.30
+        rejected = [
+            o for o in yolo_raw
+            if _iou_any(o.bbox, accepted) < REJECT_IOU_THR
+        ]
+
+        # Draw rejected (red)
+        for o in rejected:
+            x1, y1, x2, y2 = (int(o.bbox.x1), int(o.bbox.y1),
+                               int(o.bbox.x2), int(o.bbox.y2))
+            cv2.rectangle(ann, (x1, y1), (x2, y2), (0, 0, 220), 2)
+            lbl = f"{o.confidence:.2f}"
+            cv2.putText(ann, lbl, (x1, max(0, y1 - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 220), 1,
+                        cv2.LINE_AA)
+
+        # Draw accepted (green, thicker)
+        for o in accepted:
+            x1, y1, x2, y2 = (int(o.bbox.x1), int(o.bbox.y1),
+                               int(o.bbox.x2), int(o.bbox.y2))
+            cv2.rectangle(ann, (x1, y1), (x2, y2), (0, 200, 0), 2)
+            src = getattr(o, 'source', '')
+            lbl = f"{o.confidence:.2f} {src}"
+            cv2.putText(ann, lbl, (x1, max(0, y1 - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 0), 1,
+                        cv2.LINE_AA)
+
+        logger.info(
+            "[%s] Door debug: %d accepted, %d rejected YOLO candidates",
+            base_name, len(accepted), len(rejected),
+        )
+        cv2.imwrite(
+            os.path.join(output_dir, f"{base_name}_door_boxes.png"), ann
+        )
 
     def _get_ocr_bboxes(self, img: np.ndarray) -> List:
         """Get OCR text bounding boxes from the wall detector's OCR model."""

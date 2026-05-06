@@ -217,6 +217,8 @@ class OpeningDetectionPipeline:
         self._arc_detector = None
         self._fusion_engine = None
         self._yolo_detector = None
+        # Populated during detect() for external debug consumers
+        self._debug_yolo_doors_raw: List[Opening] = []
 
     def initialize(self, yolo_model=None) -> None:
         """
@@ -282,6 +284,7 @@ class OpeningDetectionPipeline:
         ps = pixel_scale or cfg.pixels_to_m
 
         all_openings: List[Opening] = []
+        self._debug_yolo_doors_raw = []   # reset before each run
 
         # ── Step 1: YOLO detection ─────────────────────────────────────
         yolo_doors: List[Opening] = []
@@ -312,6 +315,8 @@ class OpeningDetectionPipeline:
                 ]
 
         all_openings.extend(yolo_windows)
+        # Snapshot raw YOLO doors before any resolution / deduplication
+        self._debug_yolo_doors_raw = list(yolo_doors)
 
         # ── Step 2: Geometric gap detection ───────────────────────────
         geo_gaps: List[Opening] = []
