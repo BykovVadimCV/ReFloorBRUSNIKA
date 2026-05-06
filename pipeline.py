@@ -1354,6 +1354,25 @@ class FloorplanPipeline:
                     base_name, len(result.walls),
                     sum(1 for w in result.walls if w.is_diagonal),
                 )
+
+                # ── Save wall mask debug images ────────────────────────
+                # Raw: straight U-Net argmax output, no post-processing.
+                _raw_mask = (_rd_res.raw_wall_mask
+                             if _rd_res.raw_wall_mask is not None
+                             else np.zeros((2, 2), np.uint8))
+                cv2.imwrite(
+                    os.path.join(output_dir, f"{base_name}_mask_raw.png"),
+                    _raw_mask,
+                )
+                # Filtered: after cap (morph-close) + enclosed-space
+                # refinement — the actual input to rect_decompose.
+                _filt_mask = (_rd_res.wall_mask
+                              if _rd_res.wall_mask is not None
+                              else np.zeros((2, 2), np.uint8))
+                cv2.imwrite(
+                    os.path.join(output_dir, f"{base_name}_mask_filtered.png"),
+                    _filt_mask,
+                )
             except Exception as exc:
                 logger.exception(
                     "[%s] Rect-wall detection failed (%s) — falling back to "
