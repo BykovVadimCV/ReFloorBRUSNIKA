@@ -1329,21 +1329,20 @@ class FloorplanPipeline:
                             ))
                 _rect_det = RectWallDetector(self.config)
                 _rect_det.initialize()
+                _enclosed_dbg_path = os.path.join(
+                    output_dir, f"{base_name}_enclosed_spaces.png"
+                )
                 _rd_res = _rect_det.detect(
                     img_clean,
                     ocr_bboxes=_ocr_bboxes_for_rect,
+                    debug_img_path=_enclosed_dbg_path,
                 )
                 result.walls        = _rd_res.walls
                 result.wall_mask    = _rd_res.wall_mask
-                # outline_mask is the rasterised union of placed rectangles;
-                # OR with the raw U-Net mask so the room-finding step has
-                # extra ink to bridge corner gaps the rects didn't quite close
-                # (variant A from the spec).
-                # Pure rect raster (before merging with U-Net mask)
+                # outline_mask = rect raster OR processed U-Net mask so
+                # room-finding has extra ink to bridge corner gaps.
                 _rect_rast = rasterise_wall_segments(_rd_res.walls,
                                                       img_clean.shape[:2])
-                # outline_mask = rect raster OR raw U-Net mask so room-finding
-                # has extra ink to bridge corner gaps the rects didn't close.
                 _rast = _rect_rast.copy()
                 if _rd_res.wall_mask is not None:
                     _rast = cv2.bitwise_or(_rast, _rd_res.wall_mask)
@@ -1353,42 +1352,6 @@ class FloorplanPipeline:
                     base_name, len(result.walls),
                     sum(1 for w in result.walls if w.is_diagonal),
                 )
-                # ── Save debug masks ───────────────────────────────────
-                # U-Net RAW mask — straight from U-Net softmax+threshold,
-                # before any cap / enclosed-space refinement.
-                _unet_raw_path = os.path.join(output_dir, f"{base_name}_unet_raw.png")
-                _raw_save = (_rd_res.raw_wall_mask
-                             if _rd_res.raw_wall_mask is not None
-                             else np.zeros((2, 2), np.uint8))
-                cv2.imwrite(_unet_raw_path, _raw_save)
-
-                # Processed wall mask — the actual input to rect_decompose
-                # (raw + cap + enclosed-space refinement).  This is what the
-                # rect-bleed error map should be measured against.
-                _proc_save = (_rd_res.wall_mask
-                              if _rd_res.wall_mask is not None
-                              else np.zeros((2, 2), np.uint8))
-                _unet_proc_path = os.path.join(output_dir,
-                                               f"{base_name}_unet_processed.png")
-                cv2.imwrite(_unet_proc_path, _proc_save)
-
-                # Rect mask: 3-colour error map vs the PROCESSED mask
-                #   WHITE  = rect pixel ∩ proc-mask   (correctly placed)
-                #   RED    = rect pixel ∩ ~proc-mask  (bleed — outside mask)
-                #   GREEN  = ~rect pixel ∩ proc-mask  (missed — mask not covered)
-                #   BLACK  = background
-                # The 15% spill cap is enforced per-rect by rect_decompose,
-                # so red pixels here represent the residual allowed bleed
-                # plus snap-induced drift.
-                _rect_mask_path = os.path.join(output_dir, f"{base_name}_rect_mask.png")
-                _H, _W = img_clean.shape[:2]
-                _err = np.zeros((_H, _W, 3), dtype=np.uint8)
-                _r = (_rect_rast > 0)
-                _m = (_proc_save > 0) if _rd_res.wall_mask is not None else np.zeros((_H, _W), dtype=bool)
-                _err[_r & _m]  = (255, 255, 255)   # correct  → white
-                _err[_r & ~_m] = (  0,   0, 220)   # bleed    → red   (BGR)
-                _err[~_r & _m] = ( 50, 200,  50)   # missed   → green (BGR)
-                cv2.imwrite(_rect_mask_path, _err)
             except Exception as exc:
                 logger.exception(
                     "[%s] Rect-wall detection failed (%s) — falling back to "

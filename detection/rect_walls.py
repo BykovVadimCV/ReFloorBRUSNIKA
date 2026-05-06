@@ -430,6 +430,7 @@ def refine_mask_by_enclosed_spaces(
     wall_overlap_threshold: float = 0.50,
     close_kernel_size: int = 7,
     close_iters: int = 2,
+    debug_img_path: Optional[str] = None,
 ) -> np.ndarray:
     """
     Refine *wall_mask* using enclosed-space analysis.
@@ -522,6 +523,55 @@ def refine_mask_by_enclosed_spaces(
         "%d room regions cleared  (total enclosed=%d)",
         filled_count, cleared_count, n_labels,
     )
+
+    # ── Optional debug image ───────────────────────────────────────────────
+    # Colour-coded overlay showing what happened to every enclosed region:
+    #   GREEN  (0,180,0)   → filled as wall (structural cavity)
+    #   RED    (0,0,200)   → cleared (labelled room)
+    #   YELLOW (0,200,200) → skipped (no OCR, low wall overlap)
+    if debug_img_path:
+        try:
+            gray3 = cv2.cvtColor(
+                cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR
+            )
+            dbg = gray3.copy()
+            COLOR_FILLED  = (  0, 180,   0)   # BGR green
+            COLOR_CLEARED = (  0,   0, 200)   # BGR red
+            COLOR_SKIPPED = (  0, 200, 200)   # BGR yellow
+            alpha = 0.55
+
+            for region_id in range(1, n_labels + 1):
+                rmask = labels == region_id
+                if not np.any(rmask):
+                    continue
+                # Determine fate by repeating the same logic
+                has_ocr_here = False
+                for (cx, cy) in ocr_centres:
+                    xi, yi = int(round(cx)), int(round(cy))
+                    if 0 <= yi < H and 0 <= xi < W and rmask[yi, xi]:
+                        has_ocr_here = True
+                        break
+                if has_ocr_here:
+                    color = COLOR_CLEARED
+                else:
+                    ov = int(np.count_nonzero(wall_mask[rmask] > 0))
+                    color = (COLOR_FILLED
+                             if ov / max(int(np.count_nonzero(rmask)), 1)
+                             >= wall_overlap_threshold
+                             else COLOR_SKIPPED)
+                overlay = np.zeros_like(dbg)
+                overlay[rmask] = color
+                dbg = cv2.addWeighted(dbg, 1.0 - alpha, overlay, alpha, 0)
+
+            # Draw OCR bbox outlines in white for reference
+            for (bx1, by1, bx2, by2) in boxes:
+                cv2.rectangle(dbg, (bx1, by1), (bx2, by2), (220, 220, 220), 1)
+
+            cv2.imwrite(debug_img_path, dbg)
+            logger.info("Enclosed-space debug image saved → %s", debug_img_path)
+        except Exception as _dbe:
+            logger.warning("Could not save enclosed-space debug image: %s", _dbe)
+
     return refined
 
 
@@ -561,6 +611,7 @@ class RectWallDetector:
         *,
         wall_mask: Optional[np.ndarray] = None,
         ocr_bboxes: Optional[List] = None,
+        debug_img_path: Optional[str] = None,
     ) -> DetectionResult:
         """
         Detect walls in ``img_bgr``.  If ``wall_mask`` is supplied it is used
@@ -631,6 +682,7 @@ class RectWallDetector:
                 wall_overlap_threshold=overlap_thr,
                 close_kernel_size=cap_k,
                 close_iters=cap_i,
+                debug_img_path=debug_img_path,
             )
         except Exception as _rme:
             logger.warning(
