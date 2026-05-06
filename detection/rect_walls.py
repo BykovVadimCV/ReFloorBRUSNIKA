@@ -485,17 +485,22 @@ def refine_mask_by_enclosed_spaces(
                 has_ocr = True
                 break
 
-        if has_ocr:
-            # Labelled room — clear stray wall pixels
+        # Always check wall-mask overlap so both branches can use it
+        overlap = int(np.count_nonzero(wall_mask[region_mask] > 0))
+        overlap_frac = overlap / region_area
+
+        if not has_ocr and overlap_frac >= wall_overlap_threshold:
+            # Structural cavity: no room label and mostly wall already →
+            # fill the whole region solid so the decomposer sees it as wall.
+            refined[region_mask] = 255
+            filled_count += 1
+        else:
+            # Exclude from wall mask: region is either a labelled room
+            # (has_ocr) or a white space with sparse wall coverage
+            # (overlap < threshold).  Both should be clear of wall pixels
+            # so rect_decompose doesn't fragment them into spurious walls.
             refined[region_mask] = 0
             cleared_count += 1
-        else:
-            # No room label — check wall-mask overlap
-            overlap = int(np.count_nonzero(wall_mask[region_mask] > 0))
-            overlap_frac = overlap / region_area
-            if overlap_frac >= wall_overlap_threshold:
-                refined[region_mask] = 255
-                filled_count += 1
 
     logger.info(
         "refine_mask_by_enclosed_spaces: %d structural regions filled, "
