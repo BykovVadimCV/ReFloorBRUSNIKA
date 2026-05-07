@@ -223,6 +223,7 @@ class OpeningDetectionPipeline:
         # Populated during detect() for external debug consumers
         self._debug_yolo_doors_raw: List[Opening] = []
         self._debug_unet_door_mask: Optional[np.ndarray] = None
+        self._debug_door_wall_segments: List = []   # WallSegment objects from U-Net door rects
 
     def initialize(self, yolo_model=None) -> None:
         """
@@ -381,17 +382,22 @@ class OpeningDetectionPipeline:
         # Uses epoch_040.pth (bg/wall/window/door) to extract a door-class
         # mask, then snaps each detected blob to the nearest geometric gap.
         self._debug_unet_door_mask = None
+        self._debug_door_wall_segments = []
         if self._unet_door_detector is not None:
             try:
                 unet_doors, unet_door_mask = self._unet_door_detector.detect(
                     image, all_geo_gaps, wall_mask=wall_mask
                 )
                 self._debug_unet_door_mask = unet_door_mask
+                self._debug_door_wall_segments = list(
+                    getattr(self._unet_door_detector, '_debug_door_wall_segments', [])
+                )
                 if unet_doors:
                     all_openings.extend(unet_doors)
                     logger.info(
-                        "OpeningDetectionPipeline: U-Net added %d door(s)",
-                        len(unet_doors),
+                        "OpeningDetectionPipeline: U-Net added %d door(s), "
+                        "%d door-wall segments",
+                        len(unet_doors), len(self._debug_door_wall_segments),
                     )
             except Exception:
                 logger.warning("U-Net door detection failed", exc_info=True)

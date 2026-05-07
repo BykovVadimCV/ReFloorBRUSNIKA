@@ -321,6 +321,7 @@ class WallSegment:
     is_structural: bool = False
     is_outer: bool = False
     is_diagonal: bool = False  # True for non-axis-aligned walls detected by LSD
+    is_door_wall: bool = False  # True for thin wall segments representing door openings
 
     # Optional outline for complex shapes; for diagonal walls holds the two
     # actual line endpoints [(x1,y1),(x2,y2)] in pixel coordinates.

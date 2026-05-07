@@ -34,7 +34,7 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-from core.models import BBox, Opening, OpeningType
+from core.models import BBox, Opening, OpeningType, WallSegment
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +264,36 @@ def _is_bbox_valid(
     return True
 
 
+def _bbox_to_door_wall_segment(bbox: BBox, idx: int) -> WallSegment:
+    """
+    Build a door-wall WallSegment from a door bbox.
+
+    The shorter bbox dimension becomes the wall thickness (= the wall the door
+    sits in); the longer dimension becomes the door opening width (= wall
+    length).  The centerline runs along the middle of the longer axis.
+    """
+    x1, y1, x2, y2 = bbox.x1, bbox.y1, bbox.x2, bbox.y2
+    w, h = x2 - x1, y2 - y1
+    if w >= h:                       # horizontal door
+        thickness = h
+        cy = (y1 + y2) / 2.0
+        outline = [(int(x1), int(cy)), (int(x2), int(cy))]
+    else:                            # vertical door
+        thickness = w
+        cx = (x1 + x2) / 2.0
+        outline = [(int(cx), int(y1)), (int(cx), int(y2))]
+    return WallSegment(
+        id=f"door-wall-{idx:04d}",
+        bbox=bbox,
+        thickness=float(thickness),
+        is_structural=False,
+        is_outer=False,
+        is_diagonal=False,
+        is_door_wall=True,
+        outline=outline,
+    )
+
+
 def _snap_to_gap(
     door_bbox: Tuple[int, int, int, int],
     geo_gaps: List[Opening],
@@ -371,6 +401,10 @@ class UNetDoorDetector:
         # Populated during detect() — valid pieces after decompose/filter,
         # before gap snapping.  Consumed by the rect overlay debug image.
         self._debug_rect_bboxes: List[Tuple[int, int, int, int]] = []
+        # Door-wall WallSegments built from snapped bboxes — injected into
+        # result.walls so the SH3D exporter has a precise parent wall for
+        # each door and never needs to guess or create a synthetic wall.
+        self._debug_door_wall_segments: List[WallSegment] = []
 
     # ------------------------------------------------------------------
     def initialize(self) -> bool:
@@ -445,7 +479,8 @@ class UNetDoorDetector:
         snapped_count = 0
         decomposed_count = 0
         filtered_count = 0
-        self._debug_rect_bboxes = []   # reset for this run
+        self._debug_rect_bboxes = []          # reset for this run
+        self._debug_door_wall_segments = []   # reset for this run
 
         for blob_bbox, sub_mask in blobs:
             # ── 1. Get candidate bboxes from this blob ─────────────────
@@ -500,6 +535,15 @@ class UNetDoorDetector:
                 )
                 if was_snapped:
                     snapped_count += 1
+
+                # ── 4. Build door-wall segment from final bbox ───────────
+                # The door wall gives the SH3D exporter a pre-built parent
+                # wall so ParentWallFinder always finds an exact match —
+                # no synthetic wall creation or thickness guessing needed.
+                dw_seg = _bbox_to_door_wall_segment(
+                    snapped_bbox, len(self._debug_door_wall_segments)
+                )
+                self._debug_door_wall_segments.append(dw_seg)
 
                 doors.append(Opening(
                     bbox=snapped_bbox,

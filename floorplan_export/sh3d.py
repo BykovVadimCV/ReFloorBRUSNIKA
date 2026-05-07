@@ -233,20 +233,29 @@ class SH3DExporter:
         Returns:
             List of detected Room objects for visualization
         """
-        # Separate diagonal walls from axis-aligned walls.
-        # Diagonal walls bypass the rect-dict path and are injected directly
-        # as pre-built LegacyWall objects into export_to_sh3d().
+        # Partition walls into three groups:
+        #   regular   — axis-aligned solid walls  → rect-dict path
+        #   diagonal  — rotated solid walls        → pre-built LegacyWall (is_structural=True)
+        #   door_wall — door-opening segments      → pre-built LegacyWall (is_structural=False)
+        #
+        # Door walls are passed as non-structural extra walls so that:
+        #   • ParentWallFinder finds them (it searches ALL walls)
+        #   • ThicknessNormalizer ignores them (only uses is_structural=True walls)
+        # This guarantees every U-Net door has a pre-built parent wall and the
+        # exporter never needs to synthesise or guess wall geometry for doors.
         from floorplanexporter import Wall as _LegacyWall, Point as _LegacyPoint
 
-        axis_walls = [w for w in walls if not w.is_diagonal]
-        diag_walls  = [w for w in walls if w.is_diagonal]
+        regular_walls = [w for w in walls if not w.is_diagonal and not w.is_door_wall]
+        diag_walls    = [w for w in walls if w.is_diagonal]
+        door_walls    = [w for w in walls if w.is_door_wall]
 
-        # Convert axis-aligned walls to rect dicts (existing path)
-        wall_rects = [wall_segment_to_rect_dict(w) for w in axis_walls]
+        # Convert regular axis-aligned walls to rect dicts (existing path)
+        wall_rects = [wall_segment_to_rect_dict(w) for w in regular_walls]
 
-        # Build LegacyWall objects for diagonal walls
         ptcm = self.config.pixels_to_cm
         extra_structural: List = []
+
+        # Diagonal walls (structural)
         for dw in diag_walls:
             if dw.outline and len(dw.outline) >= 2:
                 (ox1, oy1), (ox2, oy2) = dw.outline[0], dw.outline[1]
@@ -259,6 +268,19 @@ class SH3DExporter:
         if diag_walls:
             logger.debug("SH3DExporter: %d diagonal walls → %d LegacyWall objects",
                          len(diag_walls), len(extra_structural))
+
+        # Door walls (non-structural — parent for each U-Net door opening)
+        for dw in door_walls:
+            p1, p2 = _wall_centerline(dw)
+            extra_structural.append(_LegacyWall(
+                start=_LegacyPoint(p1[0] * ptcm, p1[1] * ptcm),
+                end=_LegacyPoint(p2[0] * ptcm, p2[1] * ptcm),
+                thickness=max(dw.thickness * ptcm, 2.0),
+                is_structural=False,
+            ))
+        if door_walls:
+            logger.info("SH3DExporter: %d door-wall segments → extra walls (non-structural)",
+                        len(door_walls))
 
         # Separate openings by type
         doors = [o for o in openings if o.opening_type == OpeningType.DOOR]

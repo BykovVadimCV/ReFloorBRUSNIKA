@@ -339,14 +339,14 @@ class PipelineConfig:
 
     # rect_decompose parameters (defaults requested by the user)
     rect_angle_steps:          int   = 12
-    rect_penalty:              float = 0.02
+    rect_penalty:              float = 0.003
     rect_max_grid_dim:         int   = 200
     rect_coverage_stop:        float = 0.99
     rect_bleed_weight:         float = 15.0
     rect_initial_bleed_weight: float = 15.0
     rect_bleed_decay:          float = 0.0
     rect_axis_gap:             float = 0.0
-    rect_max_overlap:          float = 0.5
+    rect_max_overlap:          float = 0.3
 
     # Endpoint snapping (extends collinear walls to meet)
     rect_snap_gap_factor: float = 2.0    # gap ≤ factor × max_thickness

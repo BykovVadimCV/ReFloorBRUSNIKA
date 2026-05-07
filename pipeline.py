@@ -1584,6 +1584,23 @@ class FloorplanPipeline:
         logger.info("[%s] Stage 3c: Wall cleanup", base_name)
         result.walls = cleanup_walls(result.walls)
 
+        # ── Stage 3d: Inject door walls ───────────────────────────────
+        # Door-wall segments (is_door_wall=True) are thin WallSegments whose
+        # geometry matches each detected door opening exactly.  They are added
+        # AFTER cleanup so they are not filtered/merged by cleanup_walls.
+        # The SH3D exporter routes them as non-structural extra walls so
+        # ParentWallFinder always finds an exact parent — no synthetic wall
+        # creation or thickness guessing in the exporter.
+        _door_walls = list(
+            getattr(self.opening_detector, '_debug_door_wall_segments', [])
+        )
+        if _door_walls:
+            result.walls = result.walls + _door_walls
+            logger.info(
+                "[%s] Stage 3d: injected %d door-wall segment(s)",
+                base_name, len(_door_walls),
+            )
+
         # ── Stage 4: SH3D Export ───────────────────────────────────────
         _notify("exporting SH3D")
         logger.info("[%s] Stage 4: SH3D export", base_name)
