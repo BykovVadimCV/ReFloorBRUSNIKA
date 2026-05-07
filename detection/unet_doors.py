@@ -322,7 +322,8 @@ def _refine_door_mask_by_enclosed_spaces(
     img_bgr   : original BGR image (used by find_enclosed_spaces)
     ocr_bboxes: list of ``(x1, y1, x2, y2)`` or ``(text, x1, y1, x2, y2)``
     door_overlap_threshold : fraction of region pixels that must be door
-                             for the "fill as door" branch to fire
+                             for the "fill as door" branch to fire (default
+                             0.99 = at most 1% non-door bleed allowed)
 
     Returns
     -------
@@ -592,7 +593,7 @@ class UNetDoorDetector:
         # spurious predictions inside rooms are suppressed.
         door_mask = _refine_door_mask_by_enclosed_spaces(
             door_mask, img_bgr, ocr_bboxes,
-            door_overlap_threshold=0.50,
+            door_overlap_threshold=0.99,
         )
 
         blobs = _extract_door_blobs(door_mask, min_area=self.min_door_area)
