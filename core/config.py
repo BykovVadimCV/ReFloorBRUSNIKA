@@ -254,6 +254,20 @@ class PipelineConfig:
     # Gap-snap search margin for U-Net door bboxes (pixels)
     unet_door_match_margin: int = 40
 
+    # Wall-interruption splitting: fraction of bbox span that must be wall
+    # pixels in a row/column for it to count as a "wall band" dividing the door
+    unet_door_wall_band_ratio: float = 0.50
+
+    # Minimum wall band thickness (pixels) to trigger a split
+    unet_door_min_wall_band_px: int = 5
+
+    # Minimum area (pixels) for a post-split sub-bbox to be kept
+    unet_door_min_piece_area: int = 200
+
+    # Minimum thickness of the short side (pixels) for a post-split piece;
+    # filters hair-thin slivers that are not real door openings
+    unet_door_min_piece_thickness_px: int = 12
+
     # ============================================================
     # PLAUSIBILITY VALIDATION
     # ============================================================

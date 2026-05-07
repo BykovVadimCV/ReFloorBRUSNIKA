@@ -267,6 +267,10 @@ class OpeningDetectionPipeline:
                 min_door_area=cfg.unet_min_door_area,
                 match_margin=getattr(cfg, "unet_door_match_margin", 40),
                 device=cfg.unet_device,
+                wall_band_ratio=getattr(cfg, "unet_door_wall_band_ratio", 0.50),
+                min_wall_band_px=getattr(cfg, "unet_door_min_wall_band_px", 5),
+                min_piece_area=getattr(cfg, "unet_door_min_piece_area", 200),
+                min_piece_thickness_px=getattr(cfg, "unet_door_min_piece_thickness_px", 12),
             )
             ok = self._unet_door_detector.initialize()
             if not ok:
@@ -367,7 +371,7 @@ class OpeningDetectionPipeline:
         if self._unet_door_detector is not None:
             try:
                 unet_doors, unet_door_mask = self._unet_door_detector.detect(
-                    image, all_geo_gaps
+                    image, all_geo_gaps, wall_mask=wall_mask
                 )
                 self._debug_unet_door_mask = unet_door_mask
                 if unet_doors:
