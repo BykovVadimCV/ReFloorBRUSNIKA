@@ -5,11 +5,14 @@ Pipeline
 --------
 1. Run the 4-class segmentation U-Net (background / wall / window / door).
 2. Extract the door-class mask (class index 3).
-3. Connected-component labelling → raw door candidate bboxes.
-4. Wall-interruption splitting: if a candidate bbox is significantly crossed
-   by a wall-mask band, split it into two sub-bboxes at the band boundary.
-   This handles the case where two adjacent door openings were merged into
-   one U-Net blob by a thin or misclassified wall segment.
+3. Connected-component labelling → per-blob door masks.
+4. For each blob:
+   a. Rect decomposition (rect_decompose.decompose) on the blob's sub-mask
+      with coverage_stop=0.70 and max_spill=0.05.  Produces tight axis-aligned
+      rectangles that precisely follow the door-mask shape.
+   b. Wall-interruption splitting (fallback when rect decompose is disabled):
+      if a candidate bbox is significantly crossed by a wall-mask band, split
+      it into two sub-bboxes at the band boundary.
 5. Size / thickness filtering: discard sub-bboxes that are too small or too
    thin to be plausible door openings.
 6. Gap snapping: for each surviving bbox search the geometric gap list for the
@@ -68,11 +71,18 @@ def _find_runs(mask_1d: np.ndarray, min_length: int = 1) -> List[Tuple[int, int]
     return runs
 
 
-def _extract_door_bboxes(
+def _extract_door_blobs(
     door_mask: np.ndarray,
     min_area: int = 300,
-) -> List[Tuple[int, int, int, int]]:
-    """Connected components on a binary door mask → (x1,y1,x2,y2) bboxes."""
+) -> List[Tuple[Tuple[int, int, int, int], np.ndarray]]:
+    """
+    Connected components on a binary door mask.
+
+    Returns a list of (bbox, sub_mask) pairs where:
+    - bbox is (x1, y1, x2, y2) in image coordinates
+    - sub_mask is a cropped uint8 binary mask (255=door) for that blob only,
+      sized to the bbox dimensions
+    """
     if door_mask is None or not np.any(door_mask):
         return []
 
@@ -83,8 +93,8 @@ def _extract_door_bboxes(
         cv2.MORPH_CLOSE, k, iterations=1,
     )
 
-    n, _, stats, _ = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
-    bboxes: List[Tuple[int, int, int, int]] = []
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(cleaned, connectivity=8)
+    blobs: List[Tuple[Tuple[int, int, int, int], np.ndarray]] = []
     for i in range(1, n):
         area = int(stats[i, cv2.CC_STAT_AREA])
         if area < min_area:
@@ -93,9 +103,81 @@ def _extract_door_bboxes(
         y  = int(stats[i, cv2.CC_STAT_TOP])
         bw = int(stats[i, cv2.CC_STAT_WIDTH])
         bh = int(stats[i, cv2.CC_STAT_HEIGHT])
-        bboxes.append((x, y, x + bw, y + bh))
+        bbox = (x, y, x + bw, y + bh)
+        # Crop the label mask to this blob's bbox (255 where this component)
+        sub_mask = ((labels[y:y + bh, x:x + bw] == i).astype(np.uint8) * 255)
+        blobs.append((bbox, sub_mask))
 
-    return bboxes
+    return blobs
+
+
+def _rect_decompose_blob(
+    sub_mask: np.ndarray,
+    bbox: Tuple[int, int, int, int],
+    coverage_stop: float = 0.70,
+    max_spill: float = 0.05,
+    max_overlap: float = 0.50,
+    bleed_weight: float = 15.0,
+    initial_bleed_weight: float = 15.0,
+    bleed_decay: float = 0.0,
+    rect_penalty: float = 0.02,
+    max_grid_dim: int = 200,
+    axis_only: bool = True,
+) -> List[Tuple[int, int, int, int]]:
+    """
+    Run rect_decompose on a single door blob's sub-mask and return a list of
+    (x1, y1, x2, y2) bboxes in the original image coordinate space.
+
+    *sub_mask* is a uint8 H×W binary mask (255=door) cropped to the blob bbox.
+    *bbox* is the (x1, y1, x2, y2) offset of sub_mask within the full image.
+    """
+    try:
+        import rect_decompose as rd
+    except ImportError:
+        logger.debug("rect_decompose not available — using blob bbox directly")
+        return [bbox]
+
+    if sub_mask is None or not np.any(sub_mask):
+        return [bbox]
+
+    mask01 = (sub_mask > 0).astype(np.uint8)
+
+    try:
+        rects = rd.decompose(
+            mask01,
+            angle_steps          = 2 if axis_only else 12,   # 0° and 90° only
+            rect_penalty         = rect_penalty,
+            max_grid_dim         = max_grid_dim,
+            coverage_stop        = coverage_stop,
+            bleed_weight         = bleed_weight,
+            initial_bleed_weight = initial_bleed_weight,
+            bleed_decay          = bleed_decay,
+            axis_only            = axis_only,
+            axis_gap             = 0.0,
+            max_overlap          = max_overlap,
+            max_spill_fraction   = max_spill,
+            refine               = True,
+            verbose              = False,
+        )
+    except Exception as exc:
+        logger.warning("Door rect decompose failed for blob %s: %s", bbox, exc)
+        return [bbox]
+
+    if not rects:
+        return [bbox]
+
+    # Convert each Rect's corner points back to image coordinates
+    ox, oy = bbox[0], bbox[1]
+    result: List[Tuple[int, int, int, int]] = []
+    for r in rects:
+        corners = r.corners()   # ndarray shape (4,2)
+        xs = corners[:, 0] + ox
+        ys = corners[:, 1] + oy
+        x1, y1 = int(np.floor(xs.min())), int(np.floor(ys.min()))
+        x2, y2 = int(np.ceil(xs.max())),  int(np.ceil(ys.max()))
+        result.append((x1, y1, x2, y2))
+
+    return result
 
 
 def _split_by_wall(
@@ -105,14 +187,11 @@ def _split_by_wall(
     min_band_thickness_px: int = 5,
 ) -> List[Tuple[int, int, int, int]]:
     """
-    Split *door_bbox* wherever the wall mask has a continuous band of wall
-    pixels spanning at least *wall_band_ratio* of the bbox width (for a
-    horizontal band) or height (for a vertical band), provided the band is at
-    least *min_band_thickness_px* pixels thick.
+    Fallback splitter: splits *door_bbox* wherever the wall mask has a
+    continuous band spanning >= *wall_band_ratio* of the bbox width/height
+    and >= *min_band_thickness_px* pixels thick.
 
-    Checks the Y axis first (horizontal wall bands → split top/bottom), then
-    the X axis (vertical wall bands → split left/right).  Returns the original
-    single-element list when no qualifying band is found.
+    Returns [door_bbox] when no qualifying band is found.
     """
     x1, y1, x2, y2 = door_bbox
     if wall_mask is None:
@@ -129,11 +208,9 @@ def _split_by_wall(
 
     for axis in ('y', 'x'):
         if axis == 'y':
-            # Fraction of wall pixels per row (project onto Y)
             frac = region.sum(axis=1) / max(1.0, float(rw))
             span = rh
         else:
-            # Fraction of wall pixels per col (project onto X)
             frac = region.sum(axis=0) / max(1.0, float(rh))
             span = rw
 
@@ -141,7 +218,6 @@ def _split_by_wall(
         if not bands:
             continue
 
-        # Collect the gaps between (and around) the wall bands as sub-pieces
         pieces: List[Tuple[int, int]] = []
         prev_end = 0
         for band_start, band_end in bands:
@@ -151,17 +227,10 @@ def _split_by_wall(
         if prev_end < span:
             pieces.append((prev_end, span))
 
-        # Translate spans back to image coordinates
         if axis == 'y':
-            sub_bboxes = [
-                (x1, cy1 + s, x2, cy1 + e)
-                for s, e in pieces if e > s
-            ]
+            sub_bboxes = [(x1, cy1 + s, x2, cy1 + e) for s, e in pieces if e > s]
         else:
-            sub_bboxes = [
-                (cx1 + s, y1, cx1 + e, y2)
-                for s, e in pieces if e > s
-            ]
+            sub_bboxes = [(cx1 + s, y1, cx1 + e, y2) for s, e in pieces if e > s]
 
         if len(sub_bboxes) >= 2:
             logger.debug(
@@ -182,7 +251,7 @@ def _is_bbox_valid(
     Return True when the bbox meets minimum area and thickness requirements.
 
     *min_thickness_px* guards against hair-thin slivers produced by
-    wall-splitting (e.g. a 3 px wide strip that is not a real door).
+    rect-decomposition or wall-splitting.
     """
     x1, y1, x2, y2 = bbox
     w, h = x2 - x1, y2 - y1
@@ -257,10 +326,21 @@ class UNetDoorDetector:
         min_door_area: int = 300,
         match_margin: int = 40,
         device: Optional[str] = None,
-        # Wall-split parameters
+        # Rect decomposition
+        use_rect_decompose: bool = True,
+        door_rect_coverage_stop: float = 0.70,
+        door_rect_max_spill: float = 0.05,
+        door_rect_max_overlap: float = 0.50,
+        door_rect_bleed_weight: float = 15.0,
+        door_rect_initial_bleed_weight: float = 15.0,
+        door_rect_bleed_decay: float = 0.0,
+        door_rect_penalty: float = 0.02,
+        door_rect_max_grid_dim: int = 200,
+        door_rect_axis_only: bool = True,
+        # Wall-split fallback parameters
         wall_band_ratio: float = 0.50,
         min_wall_band_px: int = 5,
-        # Post-split validity
+        # Post-decompose validity
         min_piece_area: int = 200,
         min_piece_thickness_px: int = 12,
     ) -> None:
@@ -270,6 +350,16 @@ class UNetDoorDetector:
         self.min_door_area = min_door_area
         self.match_margin = match_margin
         self.device = device
+        self.use_rect_decompose = use_rect_decompose
+        self.door_rect_coverage_stop = door_rect_coverage_stop
+        self.door_rect_max_spill = door_rect_max_spill
+        self.door_rect_max_overlap = door_rect_max_overlap
+        self.door_rect_bleed_weight = door_rect_bleed_weight
+        self.door_rect_initial_bleed_weight = door_rect_initial_bleed_weight
+        self.door_rect_bleed_decay = door_rect_bleed_decay
+        self.door_rect_penalty = door_rect_penalty
+        self.door_rect_max_grid_dim = door_rect_max_grid_dim
+        self.door_rect_axis_only = door_rect_axis_only
         self.wall_band_ratio = wall_band_ratio
         self.min_wall_band_px = min_wall_band_px
         self.min_piece_area = min_piece_area
@@ -325,8 +415,8 @@ class UNetDoorDetector:
             Geometric gap openings used for bbox snapping.
         wall_mask:
             Optional binary wall mask (uint8, 255=wall) at the same
-            resolution as *img_bgr*.  When supplied, each raw U-Net door
-            bbox is split wherever a thick wall band crosses it.
+            resolution as *img_bgr*.  Used as the fallback wall-split
+            splitter when rect decompose is disabled.
 
         Returns
         -------
@@ -343,38 +433,58 @@ class UNetDoorDetector:
         if door_mask is None:
             return [], None
 
-        raw_bboxes = _extract_door_bboxes(door_mask, min_area=self.min_door_area)
-        if not raw_bboxes:
+        blobs = _extract_door_blobs(door_mask, min_area=self.min_door_area)
+        if not blobs:
             logger.info("UNetDoorDetector: no door blobs found after inference")
             return [], door_mask
 
         doors: List[Opening] = []
         snapped_count = 0
-        split_count = 0
+        decomposed_count = 0
         filtered_count = 0
 
-        for raw_bbox in raw_bboxes:
-            # ── 1. Split by wall interruption ──────────────────────────
-            pieces = _split_by_wall(
-                raw_bbox,
-                wall_mask,
-                wall_band_ratio=self.wall_band_ratio,
-                min_band_thickness_px=self.min_wall_band_px,
-            )
-            if len(pieces) > 1:
-                split_count += 1
+        for blob_bbox, sub_mask in blobs:
+            # ── 1. Get candidate bboxes from this blob ─────────────────
+            if self.use_rect_decompose:
+                # Rect decomposition: tight rectangles that follow the mask
+                # shape with only 5% bleed allowed.
+                candidates = _rect_decompose_blob(
+                    sub_mask,
+                    blob_bbox,
+                    coverage_stop        = self.door_rect_coverage_stop,
+                    max_spill            = self.door_rect_max_spill,
+                    max_overlap          = self.door_rect_max_overlap,
+                    bleed_weight         = self.door_rect_bleed_weight,
+                    initial_bleed_weight = self.door_rect_initial_bleed_weight,
+                    bleed_decay          = self.door_rect_bleed_decay,
+                    rect_penalty         = self.door_rect_penalty,
+                    max_grid_dim         = self.door_rect_max_grid_dim,
+                    axis_only            = self.door_rect_axis_only,
+                )
+                if len(candidates) > 1:
+                    decomposed_count += 1
+                    logger.debug(
+                        "Door blob %s → %d rects via decompose",
+                        blob_bbox, len(candidates),
+                    )
+            else:
+                # Fallback: wall-band splitting
+                candidates = _split_by_wall(
+                    blob_bbox,
+                    wall_mask,
+                    wall_band_ratio      = self.wall_band_ratio,
+                    min_band_thickness_px = self.min_wall_band_px,
+                )
 
-            for piece in pieces:
+            for piece in candidates:
                 # ── 2. Size / thickness filter ──────────────────────────
                 if not _is_bbox_valid(
                     piece,
-                    min_area=self.min_piece_area,
-                    min_thickness_px=self.min_piece_thickness_px,
+                    min_area         = self.min_piece_area,
+                    min_thickness_px = self.min_piece_thickness_px,
                 ):
                     filtered_count += 1
-                    logger.debug(
-                        "UNetDoorDetector: dropped thin/tiny piece %s", piece
-                    )
+                    logger.debug("UNetDoorDetector: dropped thin/tiny piece %s", piece)
                     continue
 
                 # ── 3. Snap to nearest geometric gap ────────────────────
@@ -392,9 +502,9 @@ class UNetDoorDetector:
                 ))
 
         logger.info(
-            "UNetDoorDetector: %d blobs → %d split → %d filtered → %d openings "
-            "(%d snapped to gaps)",
-            len(raw_bboxes), split_count, filtered_count,
+            "UNetDoorDetector: %d blobs → %d decomposed → %d filtered → "
+            "%d openings (%d snapped to gaps)",
+            len(blobs), decomposed_count, filtered_count,
             len(doors), snapped_count,
         )
         return doors, door_mask

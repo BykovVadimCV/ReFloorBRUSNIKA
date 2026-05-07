@@ -267,8 +267,21 @@ class OpeningDetectionPipeline:
                 min_door_area=cfg.unet_min_door_area,
                 match_margin=getattr(cfg, "unet_door_match_margin", 40),
                 device=cfg.unet_device,
+                # Rect decomposition
+                use_rect_decompose=getattr(cfg, "enable_door_rect_decompose", True),
+                door_rect_coverage_stop=getattr(cfg, "door_rect_coverage_stop", 0.70),
+                door_rect_max_spill=getattr(cfg, "door_rect_max_spill", 0.05),
+                door_rect_max_overlap=getattr(cfg, "door_rect_max_overlap", 0.50),
+                door_rect_bleed_weight=getattr(cfg, "door_rect_bleed_weight", 15.0),
+                door_rect_initial_bleed_weight=getattr(cfg, "door_rect_initial_bleed_weight", 15.0),
+                door_rect_bleed_decay=getattr(cfg, "door_rect_bleed_decay", 0.0),
+                door_rect_penalty=getattr(cfg, "door_rect_penalty", 0.02),
+                door_rect_max_grid_dim=getattr(cfg, "door_rect_max_grid_dim", 200),
+                door_rect_axis_only=getattr(cfg, "door_rect_axis_only", True),
+                # Wall-split fallback
                 wall_band_ratio=getattr(cfg, "unet_door_wall_band_ratio", 0.50),
                 min_wall_band_px=getattr(cfg, "unet_door_min_wall_band_px", 5),
+                # Post-decompose validity
                 min_piece_area=getattr(cfg, "unet_door_min_piece_area", 200),
                 min_piece_thickness_px=getattr(cfg, "unet_door_min_piece_thickness_px", 12),
             )

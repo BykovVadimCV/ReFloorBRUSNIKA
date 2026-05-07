@@ -269,6 +269,36 @@ class PipelineConfig:
     unet_door_min_piece_thickness_px: int = 12
 
     # ============================================================
+    # DOOR RECT DECOMPOSITION  (U-Net door mask → precise bboxes)
+    # ============================================================
+
+    # Enable rect-decompose pass on the U-Net door mask.
+    # When True, the raw blob bboxes are replaced by tight decomposed rects.
+    enable_door_rect_decompose: bool = True
+
+    # Coverage stop: greedy decomposer runs until this fraction of door-mask
+    # pixels are covered.  70% is intentionally low — doors are small and a
+    # single well-placed rectangle usually suffices.
+    door_rect_coverage_stop: float = 0.70
+
+    # Maximum fraction of a door rect's pixels that may bleed outside the
+    # door mask (tight: 5% vs 15% for walls).
+    door_rect_max_spill: float = 0.05
+
+    # Number of angle steps tested per greedy iteration.
+    # Doors are always axis-aligned, so we only need 0°/90°.
+    door_rect_axis_only: bool = True
+
+    # Remaining rect_decompose tunables for doors (generous defaults —
+    # doors are small so the decomposer is fast regardless).
+    door_rect_penalty:              float = 0.02
+    door_rect_max_grid_dim:         int   = 200
+    door_rect_bleed_weight:         float = 15.0
+    door_rect_initial_bleed_weight: float = 15.0
+    door_rect_bleed_decay:          float = 0.0
+    door_rect_max_overlap:          float = 0.5
+
+    # ============================================================
     # PLAUSIBILITY VALIDATION
     # ============================================================
 
@@ -311,7 +341,7 @@ class PipelineConfig:
     rect_angle_steps:          int   = 12
     rect_penalty:              float = 0.02
     rect_max_grid_dim:         int   = 200
-    rect_coverage_stop:        float = 0.97
+    rect_coverage_stop:        float = 0.99
     rect_bleed_weight:         float = 15.0
     rect_initial_bleed_weight: float = 15.0
     rect_bleed_decay:          float = 0.0
