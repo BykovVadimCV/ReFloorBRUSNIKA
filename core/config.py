@@ -365,8 +365,8 @@ class PipelineConfig:
 
     # Enclosed-space refinement: fraction of an enclosed region's pixels that
     # must overlap the wall mask for the region to be filled as wall.
-    # 0.80 = allow at most 20% "bleed" (non-wall pixels) before filling.
-    rect_enclosed_overlap_threshold: float = 0.80
+    # 0.50 = at least half the enclosed region must already be wall pixels.
+    rect_enclosed_overlap_threshold: float = 0.50
 
     # Door/window diagonal filter — openings whose parent wall has angle
     # deviating from 0°/90° by more than this are dropped (see #1 in spec:

@@ -321,9 +321,10 @@ def _refine_door_mask_by_enclosed_spaces(
     door_mask : H×W uint8, 255 = door pixel (output of _run_inference)
     img_bgr   : original BGR image (used by find_enclosed_spaces)
     ocr_bboxes: list of ``(x1, y1, x2, y2)`` or ``(text, x1, y1, x2, y2)``
-    door_overlap_threshold : fraction of region pixels that must be door
-                             for the "fill as door" branch to fire (default
-                             0.99 = at most 1% non-door bleed allowed)
+    door_overlap_threshold : fraction of region pixels that must already be
+                             door-class for the "fill as door" branch to fire
+                             (default 0.50 = at least half the region must be
+                             door pixels)
 
     Returns
     -------
@@ -368,7 +369,15 @@ def _refine_door_mask_by_enclosed_spaces(
 
     n_labels = int(labels.max())
     if n_labels == 0:
+        logger.info("_refine_door_mask_by_enclosed_spaces: no enclosed regions found "
+                    "(find_enclosed_spaces returned 0 labels)")
         return refined
+
+    logger.info(
+        "_refine_door_mask_by_enclosed_spaces: %d enclosed regions found, "
+        "threshold=%.2f, ocr_boxes=%d",
+        n_labels, door_overlap_threshold, len(boxes),
+    )
 
     filled_count = 0
     cleared_count = 0
@@ -380,12 +389,12 @@ def _refine_door_mask_by_enclosed_spaces(
             continue
 
         # Check for OCR labels inside this region
-        has_ocr = any(
-            0 <= int(round(cy)) < H
-            and 0 <= int(round(cx)) < W
-            and region_mask[int(round(cy)), int(round(cx))]
-            for cx, cy in ocr_centres
-        )
+        has_ocr = False
+        for cx, cy in ocr_centres:
+            xi, yi = int(round(cx)), int(round(cy))
+            if 0 <= yi < H and 0 <= xi < W and region_mask[yi, xi]:
+                has_ocr = True
+                break
 
         # Door-mask overlap fraction for this region
         overlap = int(np.count_nonzero(door_mask[region_mask] > 0))
@@ -395,14 +404,31 @@ def _refine_door_mask_by_enclosed_spaces(
             # Likely a door opening — fill entire region
             refined[region_mask] = 255
             filled_count += 1
+            logger.info(
+                "  Door region %d: area=%d px, door_overlap=%.1f%% (≥%.0f%%), "
+                "has_ocr=False → FILLED entirely as door",
+                region_id, region_area, overlap_frac * 100,
+                door_overlap_threshold * 100,
+            )
         else:
             # Room or unrelated space — clear any door predictions
             refined[region_mask] = 0
             cleared_count += 1
+            reason = (
+                "has OCR label inside"
+                if has_ocr
+                else f"door_overlap={overlap_frac*100:.1f}% < threshold {door_overlap_threshold*100:.0f}%"
+            )
+            logger.info(
+                "  Door region %d: area=%d px, door_overlap=%.1f%%, "
+                "has_ocr=%s → CLEARED (%s)",
+                region_id, region_area, overlap_frac * 100, has_ocr, reason,
+            )
 
-    logger.debug(
-        "_refine_door_mask_by_enclosed_spaces: %d regions filled, %d cleared",
-        filled_count, cleared_count,
+    logger.info(
+        "_refine_door_mask_by_enclosed_spaces: %d door regions filled, "
+        "%d cleared  (total enclosed=%d)",
+        filled_count, cleared_count, n_labels,
     )
     return refined
 
@@ -593,7 +619,7 @@ class UNetDoorDetector:
         # spurious predictions inside rooms are suppressed.
         door_mask = _refine_door_mask_by_enclosed_spaces(
             door_mask, img_bgr, ocr_bboxes,
-            door_overlap_threshold=0.99,
+            door_overlap_threshold=0.50,
         )
 
         blobs = _extract_door_blobs(door_mask, min_area=self.min_door_area)

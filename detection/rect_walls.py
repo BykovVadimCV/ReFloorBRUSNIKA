@@ -31,8 +31,11 @@ have ``is_diagonal=True`` and carry their two centerline endpoints in
 
 from __future__ import annotations
 
+import contextlib
+import io
 import logging
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -465,8 +468,15 @@ def refine_mask_by_enclosed_spaces(
 
     n_labels = int(labels.max())
     if n_labels == 0:
-        logger.debug("refine_mask_by_enclosed_spaces: no enclosed regions found")
+        logger.info("refine_mask_by_enclosed_spaces: no enclosed regions found "
+                    "(find_enclosed_spaces returned 0 labels)")
         return refined
+
+    logger.info(
+        "refine_mask_by_enclosed_spaces: %d enclosed regions found, "
+        "threshold=%.2f, ocr_boxes=%d",
+        n_labels, wall_overlap_threshold, len(boxes),
+    )
 
     filled_count = 0
     cleared_count = 0
@@ -494,6 +504,12 @@ def refine_mask_by_enclosed_spaces(
             # fill the whole region solid so the decomposer sees it as wall.
             refined[region_mask] = 255
             filled_count += 1
+            logger.info(
+                "  Region %d: area=%d px, wall_overlap=%.1f%% (≥%.0f%%), "
+                "has_ocr=False → FILLED entirely as wall",
+                region_id, region_area, overlap_frac * 100,
+                wall_overlap_threshold * 100,
+            )
         else:
             # Exclude from wall mask: region is either a labelled room
             # (has_ocr) or a white space with sparse wall coverage
@@ -501,6 +517,16 @@ def refine_mask_by_enclosed_spaces(
             # so rect_decompose doesn't fragment them into spurious walls.
             refined[region_mask] = 0
             cleared_count += 1
+            reason = (
+                "has OCR label inside"
+                if has_ocr
+                else f"wall_overlap={overlap_frac*100:.1f}% < threshold {wall_overlap_threshold*100:.0f}%"
+            )
+            logger.info(
+                "  Region %d: area=%d px, wall_overlap=%.1f%%, "
+                "has_ocr=%s → CLEARED (%s)",
+                region_id, region_area, overlap_frac * 100, has_ocr, reason,
+            )
 
     logger.info(
         "refine_mask_by_enclosed_spaces: %d structural regions filled, "
@@ -617,6 +643,7 @@ class RectWallDetector:
         wall_mask: Optional[np.ndarray] = None,
         ocr_bboxes: Optional[List] = None,
         debug_img_path: Optional[str] = None,
+        log_file_path: Optional[str] = None,
     ) -> DetectionResult:
         """
         Detect walls in ``img_bgr``.  If ``wall_mask`` is supplied it is used
@@ -624,13 +651,17 @@ class RectWallDetector:
 
         Parameters
         ----------
-        img_bgr    : BGR image (text regions ideally already erased).
-        wall_mask  : optional pre-computed binary wall mask; if None the
-                     U-Net checkpoint is used.
-        ocr_bboxes : list of ``(x1, y1, x2, y2)`` or ``(text, x1, y1, x2, y2)``
-                     bounding boxes for OCR text regions.  Used by the
-                     enclosed-space refinement step to distinguish rooms
-                     (labelled) from structural cavities (unlabelled).
+        img_bgr       : BGR image (text regions ideally already erased).
+        wall_mask     : optional pre-computed binary wall mask; if None the
+                        U-Net checkpoint is used.
+        ocr_bboxes    : list of ``(x1, y1, x2, y2)`` or ``(text, x1, y1, x2, y2)``
+                        bounding boxes for OCR text regions.  Used by the
+                        enclosed-space refinement step to distinguish rooms
+                        (labelled) from structural cavities (unlabelled).
+        log_file_path : optional path for an exhaustive rect-decompose log
+                        file.  All decompose parameters, rd.decompose verbose
+                        output, per-rect stats, and final coverage are written
+                        there.  Does not affect any return values.
         """
         cfg = self.config
         H, W = img_bgr.shape[:2]
@@ -709,27 +740,127 @@ class RectWallDetector:
 
         # ── 3. Rect decomposition ──────────────────────────────────────
         mask01 = (wall_mask > 0).astype(np.uint8)
+        total_wall_px = int(np.count_nonzero(mask01))
+        total_px      = mask01.size
 
-        rects: List[rd.Rect] = rd.decompose(
-            mask01,
-            angle_steps          = getattr(cfg, "rect_angle_steps",         12),
-            rect_penalty         = getattr(cfg, "rect_penalty",             0.02),
-            max_grid_dim         = getattr(cfg, "rect_max_grid_dim",        200),
-            coverage_stop        = getattr(cfg, "rect_coverage_stop",       0.93),
-            bleed_weight         = getattr(cfg, "rect_bleed_weight",        1.5),
-            initial_bleed_weight = getattr(cfg, "rect_initial_bleed_weight", 10.0),
-            bleed_decay          = getattr(cfg, "rect_bleed_decay",         1.0),
-            axis_only            = force_axis_only,
-            axis_gap             = getattr(cfg, "rect_axis_gap",            0.0),
-            max_overlap          = getattr(cfg, "rect_max_overlap",         0.5),
-            max_spill_fraction   = getattr(cfg, "rect_max_spill",           0.15),
-            refine               = True,
-            verbose              = False,
-        )
+        # Collect all decompose params for logging
+        _p_angle_steps   = getattr(cfg, "rect_angle_steps",          12)
+        _p_penalty       = getattr(cfg, "rect_penalty",              0.003)
+        _p_max_grid      = getattr(cfg, "rect_max_grid_dim",         200)
+        _p_cov_stop      = getattr(cfg, "rect_coverage_stop",        0.99)
+        _p_bleed_w       = getattr(cfg, "rect_bleed_weight",         1.5)
+        _p_init_bleed    = getattr(cfg, "rect_initial_bleed_weight", 10.0)
+        _p_bleed_decay   = getattr(cfg, "rect_bleed_decay",          1.0)
+        _p_axis_gap      = getattr(cfg, "rect_axis_gap",             0.0)
+        _p_max_overlap   = getattr(cfg, "rect_max_overlap",          0.3)
+        _p_max_spill     = getattr(cfg, "rect_max_spill",            0.15)
+
+        log_lines: List[str] = []
+        log_lines.append("=" * 70 + "\n")
+        log_lines.append("RECT DECOMPOSE EXHAUSTIVE LOG\n")
+        log_lines.append("=" * 70 + "\n\n")
+        log_lines.append(f"Image size          : {W} x {H} px  ({total_px} total)\n")
+        log_lines.append(f"Wall pixels (input) : {total_wall_px} / {total_px}  "
+                         f"({100.0*total_wall_px/max(1,total_px):.2f}%)\n")
+        log_lines.append("\nDecompose parameters:\n")
+        log_lines.append(f"  coverage_stop        = {_p_cov_stop}  (target: "
+                         f"{_p_cov_stop*100:.1f}% of wall pixels covered)\n")
+        log_lines.append(f"  rect_penalty         = {_p_penalty}\n")
+        log_lines.append(f"  max_overlap          = {_p_max_overlap}\n")
+        log_lines.append(f"  max_spill_fraction   = {_p_max_spill}\n")
+        log_lines.append(f"  bleed_weight         = {_p_bleed_w}\n")
+        log_lines.append(f"  initial_bleed_weight = {_p_init_bleed}\n")
+        log_lines.append(f"  bleed_decay          = {_p_bleed_decay}\n")
+        log_lines.append(f"  angle_steps          = {_p_angle_steps}\n")
+        log_lines.append(f"  axis_only            = {force_axis_only}\n")
+        log_lines.append(f"  axis_gap             = {_p_axis_gap}\n")
+        log_lines.append(f"  max_grid_dim         = {_p_max_grid}\n")
+        log_lines.append(f"  has_diagonals        = {has_diagonals}\n")
+        log_lines.append("\n--- rd.decompose verbose output ---\n")
+
+        _verbose_buf = io.StringIO()
+        with contextlib.redirect_stdout(_verbose_buf):
+            rects: List[rd.Rect] = rd.decompose(
+                mask01,
+                angle_steps          = _p_angle_steps,
+                rect_penalty         = _p_penalty,
+                max_grid_dim         = _p_max_grid,
+                coverage_stop        = _p_cov_stop,
+                bleed_weight         = _p_bleed_w,
+                initial_bleed_weight = _p_init_bleed,
+                bleed_decay          = _p_bleed_decay,
+                axis_only            = force_axis_only,
+                axis_gap             = _p_axis_gap,
+                max_overlap          = _p_max_overlap,
+                max_spill_fraction   = _p_max_spill,
+                refine               = True,
+                verbose              = True,
+            )
+        _verbose_text = _verbose_buf.getvalue()
+        log_lines.append(_verbose_text if _verbose_text else "(no verbose output from rd.decompose)\n")
+
+        # ── Post-decompose coverage analysis ──────────────────────────
+        log_lines.append("\n--- Post-decompose analysis ---\n")
+        log_lines.append(f"Rectangles placed    : {len(rects)}\n")
+
+        # Rasterise all rects to measure actual covered wall pixels
+        _covered = np.zeros((H, W), dtype=np.uint8)
+        for _r in rects:
+            _corners = _r.corners().astype(np.int32)
+            cv2.fillPoly(_covered, [_corners], 1)
+        _covered_wall_px   = int(np.count_nonzero((_covered > 0) & (mask01 > 0)))
+        _covered_total_px  = int(np.count_nonzero(_covered > 0))
+        _coverage_frac     = _covered_wall_px / max(1, total_wall_px)
+        _gap_px            = total_wall_px - _covered_wall_px
+        log_lines.append(f"Wall px covered      : {_covered_wall_px} / {total_wall_px}  "
+                         f"({_coverage_frac*100:.2f}%)\n")
+        log_lines.append(f"Target coverage      : {_p_cov_stop*100:.1f}%\n")
+        log_lines.append(f"Gap to target        : {(_p_cov_stop - _coverage_frac)*100:.2f}pp\n")
+        log_lines.append(f"Uncovered wall px    : {_gap_px}\n")
+        log_lines.append(f"Extra (spill) px     : {_covered_total_px - _covered_wall_px} "
+                         f"(outside wall mask)\n")
+
+        if len(rects) > 0:
+            _areas = []
+            for _r in rects:
+                _c = _r.corners()
+                _xs, _ys = _c[:, 0], _c[:, 1]
+                _areas.append(float((_xs.max()-_xs.min()) * (_ys.max()-_ys.min())))
+            log_lines.append(f"\nPer-rect area stats (px²):\n")
+            log_lines.append(f"  min={min(_areas):.0f}  max={max(_areas):.0f}  "
+                             f"mean={sum(_areas)/len(_areas):.0f}\n")
+            log_lines.append("\nAll rects (x1,y1,x2,y2  angle_deg  area_px²):\n")
+            for _idx, _r in enumerate(rects):
+                _c = _r.corners()
+                _xs, _ys = _c[:, 0], _c[:, 1]
+                _ang = getattr(_r, 'angle', 0.0)
+                _a   = (_xs.max()-_xs.min()) * (_ys.max()-_ys.min())
+                log_lines.append(
+                    f"  rect[{_idx:3d}]: "
+                    f"({_xs.min():.0f},{_ys.min():.0f})-"
+                    f"({_xs.max():.0f},{_ys.max():.0f})  "
+                    f"angle={_ang:.1f}°  area={_a:.0f}\n"
+                )
+
+        log_lines.append("\n" + "=" * 70 + "\n")
+
+        # Write log file (always; path derived from debug_img_path if not given)
+        _lf_path = log_file_path
+        if not _lf_path and debug_img_path:
+            _lf_path = os.path.splitext(debug_img_path)[0] + "_rectdecompose.log"
+        if _lf_path:
+            try:
+                with open(_lf_path, "w", encoding="utf-8") as _lf:
+                    _lf.writelines(log_lines)
+                logger.info("RectWallDetector: exhaustive decompose log → %s", _lf_path)
+            except Exception as _le:
+                logger.warning("RectWallDetector: could not write log file: %s", _le)
 
         logger.info(
-            "RectWallDetector: %d rectangles  (axis_only=%s, diagonals=%s)",
-            len(rects), force_axis_only, has_diagonals,
+            "RectWallDetector: %d rectangles, coverage=%.2f%% / target %.1f%%  "
+            "(axis_only=%s, diagonals=%s)",
+            len(rects), _coverage_frac * 100, _p_cov_stop * 100,
+            force_axis_only, has_diagonals,
         )
 
         # ── 4. Snap collinear endpoints ────────────────────────────────

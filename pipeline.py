@@ -1340,10 +1340,14 @@ class FloorplanPipeline:
                 _enclosed_dbg_path = os.path.join(
                     output_dir, f"{base_name}_enclosed_spaces.png"
                 )
+                _rectdecompose_log = os.path.join(
+                    output_dir, f"{base_name}_rectdecompose.log"
+                )
                 _rd_res = _rect_det.detect(
                     img_clean,
                     ocr_bboxes=_ocr_bboxes_for_rect,
                     debug_img_path=_enclosed_dbg_path,
+                    log_file_path=_rectdecompose_log,
                 )
                 result.walls             = _rd_res.walls
                 result.wall_mask         = _rd_res.wall_mask
