@@ -368,6 +368,9 @@ class UNetDoorDetector:
         self._model = None
         self._num_classes: int = 0
         self._torch_device = None
+        # Populated during detect() — valid pieces after decompose/filter,
+        # before gap snapping.  Consumed by the rect overlay debug image.
+        self._debug_rect_bboxes: List[Tuple[int, int, int, int]] = []
 
     # ------------------------------------------------------------------
     def initialize(self) -> bool:
@@ -442,6 +445,7 @@ class UNetDoorDetector:
         snapped_count = 0
         decomposed_count = 0
         filtered_count = 0
+        self._debug_rect_bboxes = []   # reset for this run
 
         for blob_bbox, sub_mask in blobs:
             # ── 1. Get candidate bboxes from this blob ─────────────────
@@ -486,6 +490,9 @@ class UNetDoorDetector:
                     filtered_count += 1
                     logger.debug("UNetDoorDetector: dropped thin/tiny piece %s", piece)
                     continue
+
+                # Record the valid decomposed piece before snapping
+                self._debug_rect_bboxes.append(piece)
 
                 # ── 3. Snap to nearest geometric gap ────────────────────
                 snapped_bbox, was_snapped = _snap_to_gap(

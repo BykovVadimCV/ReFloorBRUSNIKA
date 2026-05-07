@@ -929,6 +929,10 @@ class PipelineResult:
     outline_mask: Optional[np.ndarray] = None
     raw_wall_mask: Optional[np.ndarray] = None   # U-Net output before cap/refinement
 
+    # Raw rect_decompose polygon corners (4×2 float32 each), captured before
+    # endpoint snapping.  Used for the rect overlay debug image.
+    wall_rect_polygons: List[Any] = field(default_factory=list)
+
     # Scale calibration
     pixel_scale: Optional[float] = None  # meters per pixel
     pixels_to_cm: float = 2.54
@@ -1341,9 +1345,10 @@ class FloorplanPipeline:
                     ocr_bboxes=_ocr_bboxes_for_rect,
                     debug_img_path=_enclosed_dbg_path,
                 )
-                result.walls        = _rd_res.walls
-                result.wall_mask    = _rd_res.wall_mask
-                result.raw_wall_mask = _rd_res.raw_wall_mask
+                result.walls             = _rd_res.walls
+                result.wall_mask         = _rd_res.wall_mask
+                result.raw_wall_mask     = _rd_res.raw_wall_mask
+                result.wall_rect_polygons = _rd_res.wall_rect_polygons
                 # outline_mask = rect raster OR processed U-Net mask so
                 # room-finding has extra ink to bridge corner gaps.
                 _rect_rast = rasterise_wall_segments(_rd_res.walls,
@@ -1470,6 +1475,7 @@ class FloorplanPipeline:
             pixel_scale=pixel_scale,
             base_name=base_name,
             output_dir=output_dir,
+            wall_rect_polygons=result.wall_rect_polygons,
         )
 
         # Supplement with U-Net doors that don't overlap gap detections
@@ -1942,6 +1948,7 @@ class FloorplanPipeline:
         pixel_scale: float,
         base_name: str,
         output_dir: Optional[str] = None,
+        wall_rect_polygons: Optional[List] = None,
     ) -> Tuple[List[Opening], List[Any]]:
         """
         Run opening detection and door arc detection.
@@ -2015,6 +2022,20 @@ class FloorplanPipeline:
                 )
             except Exception as _dde:
                 logger.warning("Door debug image failed (non-fatal): %s", _dde)
+
+            # ── Rect decompose overlay ─────────────────────────────────
+            try:
+                _unet_det = getattr(self.opening_detector, '_unet_door_detector', None)
+                door_rect_bboxes = list(getattr(_unet_det, '_debug_rect_bboxes', []))
+                self._save_rect_overlay(
+                    img=img,
+                    wall_rect_polygons=wall_rect_polygons or [],
+                    door_rect_bboxes=door_rect_bboxes,
+                    output_dir=output_dir,
+                    base_name=base_name,
+                )
+            except Exception as _roe:
+                logger.warning("Rect overlay image failed (non-fatal): %s", _roe)
 
         return openings, door_arcs
 
@@ -2120,6 +2141,64 @@ class FloorplanPipeline:
         cv2.imwrite(
             os.path.join(output_dir, f"{base_name}_door_boxes.png"), ann
         )
+
+    def _save_rect_overlay(
+        self,
+        img: np.ndarray,
+        wall_rect_polygons: List,
+        door_rect_bboxes: List,
+        output_dir: str,
+        base_name: str,
+    ) -> None:
+        """
+        Write ``*_rect_overlay.png`` — the original floorplan with
+        rect-decompose rectangles drawn on top.
+
+        Colour coding
+        -------------
+        Walls  (filled + outline): semi-transparent **teal**  (BGR 160,120,0)
+        Doors  (filled + outline): semi-transparent **orange** (BGR 0,100,230)
+
+        Each rectangle is filled at 40% opacity then outlined at full opacity
+        so individual rects remain distinguishable.
+        """
+        ann = img.copy()
+        canvas = img.copy()
+
+        # ── Wall polygons (4×2 float32 each) ──────────────────────────
+        WALL_FILL    = (160, 120,   0)   # teal fill
+        WALL_OUTLINE = (255, 200,   0)   # bright teal outline
+
+        for poly in wall_rect_polygons:
+            pts = np.round(poly).astype(np.int32).reshape((-1, 1, 2))
+            cv2.fillPoly(canvas, [pts], WALL_FILL)
+
+        # ── Door rect bboxes ──────────────────────────────────────────
+        DOOR_FILL    = (  0, 100, 230)   # orange fill
+        DOOR_OUTLINE = (  0,  50, 255)   # vivid orange outline
+
+        for x1, y1, x2, y2 in door_rect_bboxes:
+            pts = np.array(
+                [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.int32
+            ).reshape((-1, 1, 2))
+            cv2.fillPoly(canvas, [pts], DOOR_FILL)
+
+        # Blend filled canvas over original
+        ann = cv2.addWeighted(canvas, 0.40, img, 0.60, 0)
+
+        # ── Outlines (fully opaque, drawn on blended result) ──────────
+        for poly in wall_rect_polygons:
+            pts = np.round(poly).astype(np.int32).reshape((-1, 1, 2))
+            cv2.polylines(ann, [pts], isClosed=True, color=WALL_OUTLINE, thickness=1)
+
+        for x1, y1, x2, y2 in door_rect_bboxes:
+            cv2.rectangle(ann, (x1, y1), (x2, y2), DOOR_OUTLINE, thickness=2)
+
+        logger.info(
+            "[%s] Rect overlay: %d wall rects, %d door rects",
+            base_name, len(wall_rect_polygons), len(door_rect_bboxes),
+        )
+        cv2.imwrite(os.path.join(output_dir, f"{base_name}_rect_overlay.png"), ann)
 
     def _get_ocr_bboxes(self, img: np.ndarray) -> List:
         """Get OCR text bounding boxes from the wall detector's OCR model."""

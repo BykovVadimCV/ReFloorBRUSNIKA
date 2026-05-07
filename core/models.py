@@ -635,6 +635,11 @@ class DetectionResult:
     # cap / enclosed-space refinement).  Useful for diagnostics.
     raw_wall_mask: Optional[np.ndarray] = None
 
+    # Polygon corners for each rect returned by rect_decompose.decompose()
+    # before endpoint snapping.  Each element is a (4, 2) float32 ndarray
+    # in image pixel coordinates (x, y).  Used for the rect overlay debug image.
+    wall_rect_polygons: List[np.ndarray] = field(default_factory=list)
+
     # Metadata
     pixel_scale: Optional[float] = None  # meters per pixel
     source: str = "unknown"

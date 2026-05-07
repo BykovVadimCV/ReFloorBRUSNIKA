@@ -755,12 +755,18 @@ class RectWallDetector:
         #      later to OR with the U-Net mask for room finding.
         outline_mask = rasterise_wall_segments(walls, (H, W))
 
+        # Store raw rect corners for the overlay debug image.
+        # Captured before endpoint snapping so the polygons reflect exactly
+        # what rect_decompose placed, without post-hoc adjustments.
+        wall_rect_polygons = [r.corners().astype(np.float32) for r in rects]
+
         return DetectionResult(
             walls=walls,
             openings=[],
             wall_mask=wall_mask,
             raw_wall_mask=raw_wall_mask,
             outline_mask=outline_mask,
+            wall_rect_polygons=wall_rect_polygons,
             source="rect_walls",
         )
 
