@@ -386,7 +386,9 @@ class OpeningDetectionPipeline:
         if self._unet_door_detector is not None:
             try:
                 unet_doors, unet_door_mask = self._unet_door_detector.detect(
-                    image, all_geo_gaps, wall_mask=wall_mask
+                    image, all_geo_gaps,
+                    wall_mask=wall_mask,
+                    ocr_bboxes=ocr_bboxes,
                 )
                 self._debug_unet_door_mask = unet_door_mask
                 self._debug_door_wall_segments = list(

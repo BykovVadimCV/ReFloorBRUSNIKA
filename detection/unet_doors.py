@@ -294,6 +294,118 @@ def _bbox_to_door_wall_segment(bbox: BBox, idx: int) -> WallSegment:
     )
 
 
+def _refine_door_mask_by_enclosed_spaces(
+    door_mask: np.ndarray,
+    img_bgr: np.ndarray,
+    ocr_bboxes: Optional[List] = None,
+    *,
+    door_overlap_threshold: float = 0.50,
+    close_kernel_size: int = 7,
+    close_iters: int = 2,
+) -> np.ndarray:
+    """
+    Refine *door_mask* using the same enclosed-space logic applied to wall masks.
+
+    For every enclosed white region (room / corridor / gap) in the floor-plan:
+
+    * **No OCR label inside + ≥ door_overlap_threshold door-mask overlap**
+      → treat the entire region as a door opening; fill to 255.
+    * **Otherwise** (labelled room or sparse door coverage)
+      → clear any door pixels in that region to 0.
+
+    This removes spurious U-Net predictions inside rooms and fills partially-
+    detected openings so rect decomposition gets complete blobs.
+
+    Parameters
+    ----------
+    door_mask : H×W uint8, 255 = door pixel (output of _run_inference)
+    img_bgr   : original BGR image (used by find_enclosed_spaces)
+    ocr_bboxes: list of ``(x1, y1, x2, y2)`` or ``(text, x1, y1, x2, y2)``
+    door_overlap_threshold : fraction of region pixels that must be door
+                             for the "fill as door" branch to fire
+
+    Returns
+    -------
+    Refined door_mask (a copy — the input is not modified).
+    """
+    try:
+        from detection.rect_walls import find_enclosed_spaces
+    except ImportError:
+        logger.debug("_refine_door_mask_by_enclosed_spaces: rect_walls unavailable, skipping")
+        return door_mask
+
+    if door_mask is None:
+        return door_mask
+
+    refined = door_mask.copy()
+    H, W = refined.shape[:2]
+
+    # Normalise ocr_bboxes to plain (x1, y1, x2, y2) int tuples
+    boxes: List[Tuple[int, int, int, int]] = []
+    if ocr_bboxes:
+        for item in ocr_bboxes:
+            if len(item) == 4:
+                boxes.append((int(item[0]), int(item[1]),
+                               int(item[2]), int(item[3])))
+            elif len(item) >= 5:
+                # (text, x1, y1, x2, y2) — skip text token
+                boxes.append((int(item[1]), int(item[2]),
+                               int(item[3]), int(item[4])))
+
+    # Precompute OCR bbox centres
+    ocr_centres: List[Tuple[float, float]] = [
+        ((bx1 + bx2) / 2.0, (by1 + by2) / 2.0)
+        for bx1, by1, bx2, by2 in boxes
+    ]
+
+    # Label enclosed white regions in the image
+    labels = find_enclosed_spaces(
+        img_bgr,
+        close_kernel_size=close_kernel_size,
+        close_iters=close_iters,
+    )
+
+    n_labels = int(labels.max())
+    if n_labels == 0:
+        return refined
+
+    filled_count = 0
+    cleared_count = 0
+
+    for region_id in range(1, n_labels + 1):
+        region_mask = labels == region_id
+        region_area = int(np.count_nonzero(region_mask))
+        if region_area == 0:
+            continue
+
+        # Check for OCR labels inside this region
+        has_ocr = any(
+            0 <= int(round(cy)) < H
+            and 0 <= int(round(cx)) < W
+            and region_mask[int(round(cy)), int(round(cx))]
+            for cx, cy in ocr_centres
+        )
+
+        # Door-mask overlap fraction for this region
+        overlap = int(np.count_nonzero(door_mask[region_mask] > 0))
+        overlap_frac = overlap / region_area
+
+        if not has_ocr and overlap_frac >= door_overlap_threshold:
+            # Likely a door opening — fill entire region
+            refined[region_mask] = 255
+            filled_count += 1
+        else:
+            # Room or unrelated space — clear any door predictions
+            refined[region_mask] = 0
+            cleared_count += 1
+
+    logger.debug(
+        "_refine_door_mask_by_enclosed_spaces: %d regions filled, %d cleared",
+        filled_count, cleared_count,
+    )
+    return refined
+
+
 def _snap_to_gap(
     door_bbox: Tuple[int, int, int, int],
     geo_gaps: List[Opening],
@@ -440,6 +552,7 @@ class UNetDoorDetector:
         img_bgr: np.ndarray,
         geo_gaps: List[Opening],
         wall_mask: Optional[np.ndarray] = None,
+        ocr_bboxes: Optional[List] = None,
     ) -> Tuple[List[Opening], Optional[np.ndarray]]:
         """
         Run inference and return ``(door_openings, door_mask)``.
@@ -454,6 +567,10 @@ class UNetDoorDetector:
             Optional binary wall mask (uint8, 255=wall) at the same
             resolution as *img_bgr*.  Used as the fallback wall-split
             splitter when rect decompose is disabled.
+        ocr_bboxes:
+            Optional list of OCR bounding boxes ``(x1, y1, x2, y2)`` or
+            ``(text, x1, y1, x2, y2)`` used by the enclosed-space refinement
+            step to protect labelled rooms from being mis-classified as doors.
 
         Returns
         -------
@@ -469,6 +586,14 @@ class UNetDoorDetector:
         door_mask = self._run_inference(img_bgr)
         if door_mask is None:
             return [], None
+
+        # Refine door mask using enclosed-space analysis: fill regions that are
+        # mostly door-class and have no OCR label; clear all others so
+        # spurious predictions inside rooms are suppressed.
+        door_mask = _refine_door_mask_by_enclosed_spaces(
+            door_mask, img_bgr, ocr_bboxes,
+            door_overlap_threshold=0.50,
+        )
 
         blobs = _extract_door_blobs(door_mask, min_area=self.min_door_area)
         if not blobs:
