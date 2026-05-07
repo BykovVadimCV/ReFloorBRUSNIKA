@@ -565,19 +565,19 @@ def refine_mask_by_enclosed_spaces(
             # Stamp walls black so structure is always visible
             colored[binary_dbg == 0] = (0, 0, 0)
 
-            # Collect region stats for labelling (skip tiny noise)
+            # Collect region stats for labelling — all non-empty regions
             region_stats = []
             for i in range(1, n_regions + 1):
                 rmask = labels == i
                 area = int(np.count_nonzero(rmask))
-                if area < 500:
+                if area == 0:
                     continue
                 ys, xs = np.where(rmask)
                 region_stats.append((area, i, int(xs.mean()), int(ys.mean())))
             region_stats.sort(reverse=True)
 
-            # Label the top regions by area
-            for area, idx, cx_r, cy_r in region_stats[:30]:
+            # Label all regions (largest first, capped at 200 labels for readability)
+            for area, idx, cx_r, cy_r in region_stats[:200]:
                 txt = str(area)
                 (tw, th), _ = cv2.getTextSize(
                     txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
@@ -745,7 +745,7 @@ class RectWallDetector:
 
         # Collect all decompose params for logging
         _p_angle_steps   = getattr(cfg, "rect_angle_steps",          12)
-        _p_penalty       = getattr(cfg, "rect_penalty",              0.003)
+        _p_penalty       = getattr(cfg, "rect_penalty",              0.0)
         _p_max_grid      = getattr(cfg, "rect_max_grid_dim",         200)
         _p_cov_stop      = getattr(cfg, "rect_coverage_stop",        0.99)
         _p_bleed_w       = getattr(cfg, "rect_bleed_weight",         1.5)
