@@ -1329,7 +1329,7 @@ class FloorplanPipeline:
                 # Only numeric labels (e.g. "12.5", "8 м²") are kept —
                 # room names like "Кухня" are excluded so they cannot
                 # prevent structural cavities from being filled as wall.
-                #_ocr_bboxes_for_rect: list = []
+                _ocr_bboxes_for_rect: list = []
                 #for _src in (ocr_text_labels_early, rotated_ocr_labels):
                 #    for _item in _src:
                 #        if len(_item) >= 5 and _is_numeric_ocr_label(str(_item[0])):
