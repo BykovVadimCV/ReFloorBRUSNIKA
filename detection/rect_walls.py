@@ -369,13 +369,10 @@ def find_enclosed_spaces(
     Algorithm
     ---------
     1. Grayscale.
-    2. Otsu binarise: walls/dark features → 0, white regions → 255.
-    3. Cap step: morphological CLOSE on the *wall* mask (inverted binary)
-       to bridge small gaps in wall coverage, so interior rooms are
-       fully enclosed before labelling.
-    4. ``cv2.connectedComponents`` on the white (room/exterior) pixels.
+    2. Otsu binarise: walls/dark features -> 0, white regions -> 255.
+    3. ``scipy.ndimage.label`` on the white (room/exterior) pixels.
 
-    All white regions are returned — rooms, corridors, and the exterior.
+    All white regions are returned - rooms, corridors, and the exterior.
     The caller decides what to do with each region.
 
     Returns
@@ -383,25 +380,16 @@ def find_enclosed_spaces(
     labels : ndarray (H, W), int32
         0 = wall/dark pixels, 1..N = individual white regions.
     """
+    from scipy import ndimage as _ndimage
+
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Otsu: walls → 0, rooms/background → 255
+    # Otsu: walls -> 0, rooms/background -> 255
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Cap: close gaps in the wall structure so rooms are properly enclosed.
-    # We work on the inverted image (walls = 255) so MORPH_CLOSE thickens
-    # walls and bridges narrow breaks without permanently shrinking rooms.
-    if close_kernel_size > 1 and close_iters > 0:
-        k = np.ones((close_kernel_size, close_kernel_size), dtype=np.uint8)
-        walls = cv2.bitwise_not(binary)                          # walls = 255
-        walls_capped = cv2.morphologyEx(
-            walls, cv2.MORPH_CLOSE, k, iterations=close_iters
-        )
-        binary = cv2.bitwise_not(walls_capped)                   # rooms = 255
-
-    # Label all connected white regions (8-connectivity)
-    _, labels = cv2.connectedComponents(binary, connectivity=8)
-    return labels.astype(np.int32)
+    # Label all connected white regions using scipy (full connectivity)
+    labeled, _ = _ndimage.label(binary == 255)
+    return labeled.astype(np.int32)
 
 
 def refine_mask_by_enclosed_spaces(
