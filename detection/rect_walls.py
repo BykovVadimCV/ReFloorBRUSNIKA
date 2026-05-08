@@ -358,22 +358,23 @@ def rasterise_wall_segments(
 
 def find_enclosed_spaces(
     img_bgr: np.ndarray,
-    wall_mask: Optional[np.ndarray] = None,   # kept for API compat, unused
-    *,
-    close_kernel_size: int = 2,
-    close_iters: int = 2,
 ) -> np.ndarray:
     """
     Label every white connected region in the floor-plan image.
 
     Algorithm
     ---------
-    1. Grayscale.
-    2. Otsu binarise: walls/dark features -> 0, white regions -> 255.
+    1. Convert BGR → Grayscale.
+    2. Otsu binarise: walls/dark features → 0, white regions → 255.
     3. ``scipy.ndimage.label`` on the white (room/exterior) pixels.
 
     All white regions are returned - rooms, corridors, and the exterior.
     The caller decides what to do with each region.
+
+    Parameters
+    ----------
+    img_bgr : ndarray (H, W, 3)
+        Original BGR floor-plan image (NOT the wall mask).
 
     Returns
     -------
@@ -384,7 +385,7 @@ def find_enclosed_spaces(
 
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    # Otsu: walls -> 0, rooms/background -> 255
+    # Otsu: walls → 0, rooms/background → 255
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     # Label all connected white regions using scipy (full connectivity)
@@ -398,12 +399,10 @@ def refine_mask_by_enclosed_spaces(
     ocr_bboxes: Optional[List] = None,
     *,
     wall_overlap_threshold: float = 0.50,
-    close_kernel_size: int = 2,
-    close_iters: int = 2,
     debug_img_path: Optional[str] = None,
 ) -> np.ndarray:
     """
-    Refine *wall_mask* using enclosed-space analysis.
+    Refine *wall_mask* using enclosed-space analysis on the original image.
 
     For every enclosed region (a white space surrounded by walls):
 
@@ -415,10 +414,11 @@ def refine_mask_by_enclosed_spaces(
     Parameters
     ----------
     wall_mask  : H×W uint8, 255 = wall
-    img_bgr    : BGR image (text regions already erased)
+    img_bgr    : BGR image (original, text regions already erased)
     ocr_bboxes : list of ``(x1, y1, x2, y2)`` or ``(text, x1, y1, x2, y2)``
     wall_overlap_threshold : fraction of region pixels that must be wall
                              for the "fill as wall" branch to fire
+    debug_img_path : optional path to save colorized region visualization
 
     Returns
     -------
@@ -447,12 +447,8 @@ def refine_mask_by_enclosed_spaces(
     for (bx1, by1, bx2, by2) in boxes:
         ocr_centres.append(((bx1 + bx2) / 2.0, (by1 + by2) / 2.0))
 
-    # Get enclosed region labels
-    labels = find_enclosed_spaces(
-        img_bgr, wall_mask,
-        close_kernel_size=close_kernel_size,
-        close_iters=close_iters,
-    )
+    # Get enclosed region labels from the ORIGINAL image
+    labels = find_enclosed_spaces(img_bgr)
 
     n_labels = int(labels.max())
     if n_labels == 0:
@@ -523,39 +519,35 @@ def refine_mask_by_enclosed_spaces(
     )
 
     # ── Optional debug image ───────────────────────────────────────────────
-    # Each white connected region gets a unique colour (golden-angle HSV
-    # spacing for maximum visual separation), walls stay black, and the
-    # top-N largest regions get a pixel-area label at their centroid.
-    # OCR bboxes are overlaid in white so it is clear which regions have
-    # been identified as labelled rooms.
+    # Each white connected region gets a unique colour with enhanced diversity
+    # (golden-angle hue + varying saturation/value), walls are dark grey,
+    # and ALL regions >50px get labeled with their pixel area at their centroid.
+    # OCR bboxes are overlaid in white.
     if debug_img_path:
         try:
-            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-            # Otsu binarise (same as find_enclosed_spaces, but we need the
-            # binary to paint walls black in the output)
-            _, binary_dbg = cv2.threshold(
-                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )
-
-            # Build a colour LUT: one BGR colour per label
-            n_regions = int(labels.max())
-            lut = np.zeros((n_regions + 1, 3), dtype=np.uint8)
-            lut[0] = (0, 0, 0)   # label 0 = walls → black
-            for i in range(1, n_regions + 1):
-                hue = int((i * 137.508) % 360) // 2   # golden angle, max separation
-                hsv = np.uint8([[[hue, 220, 220]]])
+            # Build a colour LUT: one BGR colour per label (enhanced diversity)
+            lut = np.zeros((n_labels + 1, 3), dtype=np.uint8)
+            lut[0] = (40, 40, 40)   # label 0 = walls → dark grey
+            for i in range(1, n_labels + 1):
+                hue = int((i * 137.508) % 360) // 2  # golden angle, max separation
+                sat = 180 + (i * 37) % 75            # cycles 180–255
+                val = 180 + (i * 61) % 75            # cycles 180–255
+                hsv = np.uint8([[[hue, sat, val]]])
                 lut[i] = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
 
             # Map every pixel through the LUT
             colored = lut[labels]   # (H, W, 3)
 
-            # Stamp walls black so structure is always visible
-            colored[binary_dbg == 0] = (0, 0, 0)
+            # Stamp walls as dark grey (not black) so tiny colored regions remain visible
+            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            _, binary_dbg = cv2.threshold(
+                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            colored[binary_dbg == 0] = (40, 40, 40)
 
-            # Collect region stats for labelling — all non-empty regions
+            # Collect region stats for ALL non-empty regions
             region_stats = []
-            for i in range(1, n_regions + 1):
+            for i in range(1, n_labels + 1):
                 rmask = labels == i
                 area = int(np.count_nonzero(rmask))
                 if area == 0:
@@ -564,19 +556,22 @@ def refine_mask_by_enclosed_spaces(
                 region_stats.append((area, i, int(xs.mean()), int(ys.mean())))
             region_stats.sort(reverse=True)
 
-            # Label all regions (largest first, capped at 200 labels for readability)
-            for area, idx, cx_r, cy_r in region_stats[:200]:
-                txt = str(area)
-                (tw, th), _ = cv2.getTextSize(
-                    txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
-                )
-                # White shadow then black text for legibility on any colour
-                cv2.putText(colored, txt, (cx_r - tw // 2 + 1, cy_r + 1),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
-                            cv2.LINE_AA)
-                cv2.putText(colored, txt, (cx_r - tw // 2, cy_r),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1,
-                            cv2.LINE_AA)
+            # Label all regions with area > 50px
+            labeled_count = 0
+            for area, idx, cx_r, cy_r in region_stats:
+                if area > 50:
+                    txt = str(area)
+                    (tw, th), _ = cv2.getTextSize(
+                        txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+                    )
+                    # White shadow then black text for legibility on any colour
+                    cv2.putText(colored, txt, (cx_r - 15 + 1, cy_r + 6 + 1),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2,
+                                cv2.LINE_AA)
+                    cv2.putText(colored, txt, (cx_r - 15, cy_r + 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1,
+                                cv2.LINE_AA)
+                    labeled_count += 1
 
             # OCR bbox outlines
             for (bx1, by1, bx2, by2) in boxes:
@@ -584,9 +579,9 @@ def refine_mask_by_enclosed_spaces(
 
             cv2.imwrite(debug_img_path, colored)
             logger.info(
-                "Enclosed-space debug image saved → %s  (%d regions, "
-                "%d labelled)",
-                debug_img_path, n_regions, len(region_stats),
+                "Enclosed-space debug image saved → %s  (%d regions total, "
+                "%d labeled with area >50px)",
+                debug_img_path, n_labels, labeled_count,
             )
         except Exception as _dbe:
             logger.warning("Could not save enclosed-space debug image: %s", _dbe)
@@ -691,8 +686,8 @@ class RectWallDetector:
             )
 
         # ── 1b. Enclosed-space refinement ─────────────────────────────
-        # Identify enclosed white spaces in the image (rooms / structural
-        # cavities) and apply targeted fixes:
+        # Identify enclosed white spaces in the ORIGINAL image (rooms /
+        # structural cavities) and apply targeted fixes:
         #   • Spaces with an OCR label inside → labelled room; clear stray
         #     wall pixels so room boundaries are clean.
         #   • Spaces without OCR label AND ≥overlap_thr wall-mask overlap →
@@ -704,8 +699,6 @@ class RectWallDetector:
             wall_mask = refine_mask_by_enclosed_spaces(
                 wall_mask, img_bgr, ocr_bboxes,
                 wall_overlap_threshold=overlap_thr,
-                close_kernel_size=cap_k,
-                close_iters=cap_i,
                 debug_img_path=debug_img_path,
             )
         except Exception as _rme:
