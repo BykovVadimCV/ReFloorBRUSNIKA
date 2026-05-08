@@ -671,7 +671,11 @@ class RoomSizeAnalyzer:
                     if not words:
                         continue
 
-                    # Сохранение индивидуальных слов
+                    # Сохранение индивидуальных слов (only high-confidence)
+                    words = [w for w in words
+                             if getattr(w, 'confidence', 1.0) >= 0.70]
+                    if not words:
+                        continue
                     for word in words:
                         geom = word.geometry
                         x1 = int(geom[0][0] * w)

@@ -75,7 +75,7 @@ WALL_MASK_MIN_OVERLAP: float = 0.25     # fraction of quad on wall_mask to keep
 DIAG_PATCH_PAD_PX: int      = 30
 DIAG_MIN_COMPONENT_AREA: int = 60
 
-OCR_CONFIDENCE: float       = 0.30
+OCR_CONFIDENCE: float       = 0.70
 OCR_PADDING_PX: int         = 14
 
 UNET_DEFAULT_CKPT: str      = "weights/epoch_040.pth"

@@ -1325,13 +1325,15 @@ class FloorplanPipeline:
                     RectWallDetector, rasterise_wall_segments,
                 )
                 # Build OCR bbox list for enclosed-space refinement.
-                # Format accepted by refine_mask_by_enclosed_spaces:
-                # list of (x1, y1, x2, y2).
+                # Format: (text, x1, y1, x2, y2) — text preserved so that
+                # refine_mask_by_enclosed_spaces can apply _is_numeric_ocr_label
+                # and only treat numeric area labels as room markers.
                 _ocr_bboxes_for_rect: list = []
                 for _src in (ocr_text_labels_early, rotated_ocr_labels):
                     for _item in _src:
                         if len(_item) >= 5:
                             _ocr_bboxes_for_rect.append((
+                                str(_item[0]),
                                 int(_item[1]), int(_item[2]),
                                 int(_item[3]), int(_item[4]),
                             ))
@@ -1445,13 +1447,15 @@ class FloorplanPipeline:
         logger.info("[%s] Stage 2: Opening detection (gap priority + U-Net supplement)", base_name)
 
         # Build ocr_bboxes from the labels collected pre-deskew
-        # (no second OCR pass).  Format: list of (x1, y1, x2, y2).
+        # (no second OCR pass).  Format: (text, x1, y1, x2, y2) — text
+        # preserved so downstream numeric filtering works correctly.
         ocr_bboxes = []
         for _src in (ocr_text_labels_early, rotated_ocr_labels):
             for item in _src:
                 if len(item) < 5:
                     continue
                 ocr_bboxes.append((
+                    str(item[0]),
                     int(item[1]), int(item[2]),
                     int(item[3]), int(item[4]),
                 ))

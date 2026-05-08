@@ -374,6 +374,7 @@ class ColorBasedWallDetector:
         self,
         img: np.ndarray,
         bbox_expansion_px: int = Theme.OCR_BBOX_EXPANSION_DEFAULT,
+        confidence_threshold: float = 0.70,
     ) -> List[Tuple[int, int, int, int]]:
         if self.ocr_model is None:
             return []
@@ -391,6 +392,10 @@ class ColorBasedWallDetector:
                 for block in getattr(page, "blocks", []):
                     for line in getattr(block, "lines", []):
                         for word in getattr(line, "words", []):
+                            conf = getattr(word, "confidence", 1.0)
+                            if conf < confidence_threshold:
+                                continue
+
                             geom = getattr(word, "geometry", None)
                             if geom is None:
                                 continue
@@ -423,6 +428,7 @@ class ColorBasedWallDetector:
     def get_ocr_texts_with_coords(
         self,
         img: np.ndarray,
+        confidence_threshold: float = 0.70,
     ) -> List[Tuple[str, int, int, int, int]]:
         if self.ocr_model is None:
             return []
@@ -440,6 +446,10 @@ class ColorBasedWallDetector:
                 for block in getattr(page, "blocks", []):
                     for line in getattr(block, "lines", []):
                         for word in getattr(line, "words", []):
+                            conf = getattr(word, "confidence", 1.0)
+                            if conf < confidence_threshold:
+                                continue
+
                             geom = getattr(word, "geometry", None)
                             value = getattr(word, "value", None)
                             if geom is None or value is None:
