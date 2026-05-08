@@ -1323,15 +1323,16 @@ class FloorplanPipeline:
             try:
                 from detection.rect_walls import (
                     RectWallDetector, rasterise_wall_segments,
+                    _is_numeric_ocr_label,
                 )
                 # Build OCR bbox list for enclosed-space refinement.
-                # Format: (text, x1, y1, x2, y2) — text preserved so that
-                # refine_mask_by_enclosed_spaces can apply _is_numeric_ocr_label
-                # and only treat numeric area labels as room markers.
+                # Only numeric labels (e.g. "12.5", "8 м²") are kept —
+                # room names like "Кухня" are excluded so they cannot
+                # prevent structural cavities from being filled as wall.
                 _ocr_bboxes_for_rect: list = []
                 for _src in (ocr_text_labels_early, rotated_ocr_labels):
                     for _item in _src:
-                        if len(_item) >= 5:
+                        if len(_item) >= 5 and _is_numeric_ocr_label(str(_item[0])):
                             _ocr_bboxes_for_rect.append((
                                 str(_item[0]),
                                 int(_item[1]), int(_item[2]),
@@ -1447,12 +1448,18 @@ class FloorplanPipeline:
         logger.info("[%s] Stage 2: Opening detection (gap priority + U-Net supplement)", base_name)
 
         # Build ocr_bboxes from the labels collected pre-deskew
-        # (no second OCR pass).  Format: (text, x1, y1, x2, y2) — text
-        # preserved so downstream numeric filtering works correctly.
+        # (no second OCR pass).  Only numeric labels are kept so that
+        # non-numeric room names cannot suppress door/wall detection.
+        try:
+            from detection.rect_walls import _is_numeric_ocr_label as _num_chk
+        except ImportError:
+            _num_chk = None
         ocr_bboxes = []
         for _src in (ocr_text_labels_early, rotated_ocr_labels):
             for item in _src:
                 if len(item) < 5:
+                    continue
+                if _num_chk is not None and not _num_chk(str(item[0])):
                     continue
                 ocr_bboxes.append((
                     str(item[0]),
