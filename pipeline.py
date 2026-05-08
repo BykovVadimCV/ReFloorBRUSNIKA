@@ -1198,6 +1198,14 @@ class FloorplanPipeline:
         def _notify(stage: str) -> None:
             if progress_callback is not None:
                 progress_callback(stage)
+
+        # Import numeric label checker early so it's available for both
+        # text erasure and OCR bbox filtering
+        try:
+            from detection.rect_walls import _is_numeric_ocr_label
+        except ImportError:
+            _is_numeric_ocr_label = None
+
         if not self._initialized:
             self.initialize()
 
@@ -1273,27 +1281,28 @@ class FloorplanPipeline:
         h_img, w_img = img.shape[:2]
 
         # ── Pre-stage: text erasure (uses the OCR labels above) ───────
-        # Erase every text region from a copy of `img` so that text
-        # doesn't pollute wall detection.  No OCR pass — labels come
+        # Erase ONLY numeric text regions from a copy of `img` so that text
+        # doesn't pollute wall detection. Non-numeric labels (room names like
+        # "Кухня", "Ванная") are left in place.  No OCR pass — labels come
         # straight from the pre-processor.
         logger.info(
-            "[%s] Pre-stage: text erasure (using pre-collected labels)",
+            "[%s] Pre-stage: text erasure (numeric labels only)",
             base_name,
         )
         img_clean = img.copy()
         shrink = 3  # inset each OCR bbox by this many pixels before erasing
-        erased_count = 0
-
+        n_erased = 0
         for _src in (ocr_text_labels_early, rotated_ocr_labels):
             for item in _src:
                 if len(item) < 5:
                     continue
-
-                # Only erase if text is numeric (area/length measurement)
-                text = str(item[0]).strip()
-                if not _is_numeric_ocr_label(text):
-                    continue
-
+                # Only erase numeric labels (area measurements)
+                if _is_numeric_ocr_label is not None:
+                    if not _is_numeric_ocr_label(str(item[0])):
+                        continue
+                else:
+                    # Fallback: erase all if import failed
+                    pass
                 rx1, ry1 = int(item[1]) + shrink, int(item[2]) + shrink
                 rx2, ry2 = int(item[3]) - shrink, int(item[4]) - shrink
                 if rx2 <= rx1 or ry2 <= ry1:
@@ -1304,11 +1313,11 @@ class FloorplanPipeline:
                     (min(w_img, rx2), min(h_img, ry2)),
                     (255, 255, 255), -1,
                 )
-                erased_count += 1
+                n_erased += 1
 
         logger.info(
             "[%s] Erased %d numeric text regions before wall detection",
-            base_name, erased_count,
+            base_name, n_erased,
         )
 
         # ── Stage 0: Wall detection ─────────────────────────────────────
@@ -1328,7 +1337,6 @@ class FloorplanPipeline:
             try:
                 from detection.rect_walls import (
                     RectWallDetector, rasterise_wall_segments,
-                    _is_numeric_ocr_label,
                 )
                 # Build OCR bbox list for enclosed-space refinement.
                 # Only numeric labels (e.g. "12.5", "8 м²") are kept —
@@ -1455,17 +1463,15 @@ class FloorplanPipeline:
         # Build ocr_bboxes from the labels collected pre-deskew
         # (no second OCR pass).  Only numeric labels are kept so that
         # non-numeric room names cannot suppress door/wall detection.
-        try:
-            from detection.rect_walls import _is_numeric_ocr_label as _num_chk
-        except ImportError:
-            _num_chk = None
         ocr_bboxes = []
         for _src in (ocr_text_labels_early, rotated_ocr_labels):
             for item in _src:
                 if len(item) < 5:
                     continue
-                if _num_chk is not None and not _num_chk(str(item[0])):
-                    continue
+                # Use the _is_numeric_ocr_label imported at the top of process()
+                if _is_numeric_ocr_label is not None:
+                    if not _is_numeric_ocr_label(str(item[0])):
+                        continue
                 ocr_bboxes.append((
                     str(item[0]),
                     int(item[1]), int(item[2]),
