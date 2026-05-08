@@ -1282,10 +1282,18 @@ class FloorplanPipeline:
         )
         img_clean = img.copy()
         shrink = 3  # inset each OCR bbox by this many pixels before erasing
+        erased_count = 0
+
         for _src in (ocr_text_labels_early, rotated_ocr_labels):
             for item in _src:
                 if len(item) < 5:
                     continue
+
+                # Only erase if text is numeric (area/length measurement)
+                text = str(item[0]).strip()
+                if not _is_numeric_ocr_label(text):
+                    continue
+
                 rx1, ry1 = int(item[1]) + shrink, int(item[2]) + shrink
                 rx2, ry2 = int(item[3]) - shrink, int(item[4]) - shrink
                 if rx2 <= rx1 or ry2 <= ry1:
@@ -1296,14 +1304,11 @@ class FloorplanPipeline:
                     (min(w_img, rx2), min(h_img, ry2)),
                     (255, 255, 255), -1,
                 )
+                erased_count += 1
 
-        n_erased = (
-            len([i for i in ocr_text_labels_early if len(i) >= 5])
-            + len([i for i in rotated_ocr_labels if len(i) >= 5])
-        )
         logger.info(
-            "[%s] Erased %d text regions before wall detection",
-            base_name, n_erased,
+            "[%s] Erased %d numeric text regions before wall detection",
+            base_name, erased_count,
         )
 
         # ── Stage 0: Wall detection ─────────────────────────────────────
@@ -1330,14 +1335,14 @@ class FloorplanPipeline:
                 # room names like "Кухня" are excluded so they cannot
                 # prevent structural cavities from being filled as wall.
                 _ocr_bboxes_for_rect: list = []
-                #for _src in (ocr_text_labels_early, rotated_ocr_labels):
-                #    for _item in _src:
-                #        if len(_item) >= 5 and _is_numeric_ocr_label(str(_item[0])):
-                #            _ocr_bboxes_for_rect.append((
-                #                str(_item[0]),
-                #                int(_item[1]), int(_item[2]),
-                #                int(_item[3]), int(_item[4]),
-                #            ))
+                for _src in (ocr_text_labels_early, rotated_ocr_labels):
+                    for _item in _src:
+                        if len(_item) >= 5 and _is_numeric_ocr_label(str(_item[0])):
+                            _ocr_bboxes_for_rect.append((
+                                str(_item[0]),
+                                int(_item[1]), int(_item[2]),
+                                int(_item[3]), int(_item[4]),
+                            ))
                 _rect_det = RectWallDetector(self.config)
                 _rect_det.initialize()
                 _enclosed_dbg_path = os.path.join(
