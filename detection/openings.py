@@ -28,6 +28,25 @@ logger = logging.getLogger(__name__)
 # CONVERSION HELPERS
 # ============================================================
 
+def _ocr_bboxes_4(ocr_bboxes: Optional[List]) -> List[Tuple[int, int, int, int]]:
+    """
+    Normalise OCR bbox list to plain (x1, y1, x2, y2) 4-tuples.
+
+    Accepts both the old format (x1, y1, x2, y2) and the new format
+    (text, x1, y1, x2, y2).  The text token is silently dropped so legacy
+    detectors that unpack exactly four values do not crash.
+    """
+    if not ocr_bboxes:
+        return []
+    out: List[Tuple[int, int, int, int]] = []
+    for item in ocr_bboxes:
+        if len(item) == 4:
+            out.append((int(item[0]), int(item[1]), int(item[2]), int(item[3])))
+        elif len(item) >= 5:
+            out.append((int(item[1]), int(item[2]), int(item[3]), int(item[4])))
+    return out
+
+
 def gap_opening_to_unified(gap_op) -> Opening:
     """
     Convert a gap.Opening (from gap.py) to unified core.models.Opening.
@@ -427,7 +446,7 @@ class OpeningDetectionPipeline:
                     img=image,
                     wall_outline_mask=wall_mask,
                     exclude_bboxes=door_exclude,
-                    ocr_bboxes=ocr_bboxes,
+                    ocr_bboxes=_ocr_bboxes_4(ocr_bboxes),
                     known_windows=[w.bbox.to_xyxy() for w in yolo_windows],
                 )
                 algo_windows = [window_to_unified(w) for w in raw_windows]
@@ -459,7 +478,7 @@ class OpeningDetectionPipeline:
                     candidate_gaps=raw_gaps_for_arc,
                     yolo_doors=raw_yolo_doors,
                     pixel_scale=ps,
-                    ocr_boxes=ocr_bboxes,
+                    ocr_boxes=_ocr_bboxes_4(ocr_bboxes),
                     base_name=base_name,
                 )
 
