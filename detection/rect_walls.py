@@ -360,7 +360,7 @@ def find_enclosed_spaces(
     img_bgr: np.ndarray,
     wall_mask: Optional[np.ndarray] = None,   # kept for API compat, unused
     *,
-    close_kernel_size: int = 7,
+    close_kernel_size: int = 2,
     close_iters: int = 2,
 ) -> np.ndarray:
     """
