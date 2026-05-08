@@ -1329,15 +1329,15 @@ class FloorplanPipeline:
                 # Only numeric labels (e.g. "12.5", "8 м²") are kept —
                 # room names like "Кухня" are excluded so they cannot
                 # prevent structural cavities from being filled as wall.
-                _ocr_bboxes_for_rect: list = []
-                for _src in (ocr_text_labels_early, rotated_ocr_labels):
-                    for _item in _src:
-                        if len(_item) >= 5 and _is_numeric_ocr_label(str(_item[0])):
-                            _ocr_bboxes_for_rect.append((
-                                str(_item[0]),
-                                int(_item[1]), int(_item[2]),
-                                int(_item[3]), int(_item[4]),
-                            ))
+                #_ocr_bboxes_for_rect: list = []
+                #for _src in (ocr_text_labels_early, rotated_ocr_labels):
+                #    for _item in _src:
+                #        if len(_item) >= 5 and _is_numeric_ocr_label(str(_item[0])):
+                #            _ocr_bboxes_for_rect.append((
+                #                str(_item[0]),
+                #                int(_item[1]), int(_item[2]),
+                #                int(_item[3]), int(_item[4]),
+                #            ))
                 _rect_det = RectWallDetector(self.config)
                 _rect_det.initialize()
                 _enclosed_dbg_path = os.path.join(
