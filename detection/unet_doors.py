@@ -329,7 +329,7 @@ def _refine_door_mask_by_enclosed_spaces(
     Refined door_mask (a copy — the input is not modified).
     """
     try:
-        from detection.rect_walls import find_enclosed_spaces
+        from detection.rect_walls import find_enclosed_spaces, _is_numeric_ocr_label
     except ImportError:
         logger.debug("_refine_door_mask_by_enclosed_spaces: rect_walls unavailable, skipping")
         return door_mask
@@ -340,17 +340,16 @@ def _refine_door_mask_by_enclosed_spaces(
     refined = door_mask.copy()
     H, W = refined.shape[:2]
 
-    # Normalise ocr_bboxes to plain (x1, y1, x2, y2) int tuples
+    # Normalise ocr_bboxes — keep only boxes whose text is a numeric label
+    # (e.g. "12.5", "8 м²").  Non-numeric names and bare coordinate 4-tuples
+    # are ignored so they cannot block a door-opening region from being filled.
     boxes: List[Tuple[int, int, int, int]] = []
     if ocr_bboxes:
         for item in ocr_bboxes:
-            if len(item) == 4:
-                boxes.append((int(item[0]), int(item[1]),
-                               int(item[2]), int(item[3])))
-            elif len(item) >= 5:
-                # (text, x1, y1, x2, y2) — skip text token
-                boxes.append((int(item[1]), int(item[2]),
-                               int(item[3]), int(item[4])))
+            if len(item) >= 5:
+                if _is_numeric_ocr_label(str(item[0])):
+                    boxes.append((int(item[1]), int(item[2]),
+                                   int(item[3]), int(item[4])))
 
     # Precompute OCR bbox centres
     ocr_centres: List[Tuple[float, float]] = [

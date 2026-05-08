@@ -726,6 +726,30 @@ def _save_enclosed_debug_image(
         logger.warning("Could not save enclosed-space debug image: %s", exc)
 
 
+def _is_numeric_ocr_label(text: str) -> bool:
+    """
+    Return True only when *text* is a numeric area/measurement label.
+
+    Examples that pass:  "12.5", "12,5", "8", "12.50 м²", "15.3м2",
+                         "8.4 кв.м", "9.0 m²", "12.5M2"
+    Examples that fail:  "Кухня", "WC", "Ванная", "Коридор", ""
+
+    The check strips common area-unit suffixes then verifies the remainder
+    is a decimal/integer number (dot or comma as decimal separator).
+    """
+    import re
+    s = text.strip()
+    if not s:
+        return False
+    # Remove common area-unit suffixes (case-insensitive)
+    s = re.sub(
+        r"[\s ]*(м²|м2|кв\.?\s*м|m²|m2|sq\.?\s*m|кв\.м\.?)$",
+        "", s, flags=re.IGNORECASE,
+    ).strip()
+    # Accept integer or decimal (dot or comma separator), optional leading sign
+    return bool(re.fullmatch(r"[+\-]?\d+([.,]\d+)?", s))
+
+
 def refine_mask_by_enclosed_spaces(
     wall_mask: np.ndarray,
     img_bgr: np.ndarray,
@@ -772,16 +796,18 @@ def refine_mask_by_enclosed_spaces(
     refined = wall_mask.copy()
     H, W = refined.shape[:2]
 
-    # Normalise ocr_bboxes
+    # Normalise ocr_bboxes — keep only boxes whose text is a numeric label
+    # (e.g. room area "12.5", "8 м²").  Non-numeric text (room names like
+    # "Кухня", "WC") and coordinate-only 4-tuples are ignored so they do
+    # not prevent structural cavities from being filled as wall.
     boxes: List[Tuple[int, int, int, int]] = []
     if ocr_bboxes:
         for item in ocr_bboxes:
-            if len(item) == 4:
-                boxes.append((int(item[0]), int(item[1]),
-                               int(item[2]), int(item[3])))
-            elif len(item) >= 5:
-                boxes.append((int(item[1]), int(item[2]),
-                               int(item[3]), int(item[4])))
+            if len(item) >= 5:
+                # (text, x1, y1, x2, y2) — only keep if text is numeric
+                if _is_numeric_ocr_label(str(item[0])):
+                    boxes.append((int(item[1]), int(item[2]),
+                                   int(item[3]), int(item[4])))
 
     ocr_centres: List[Tuple[float, float]] = [
         ((bx1 + bx2) / 2.0, (by1 + by2) / 2.0)
