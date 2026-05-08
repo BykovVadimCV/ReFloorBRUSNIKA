@@ -346,7 +346,7 @@ class PipelineConfig:
     rect_initial_bleed_weight: float = 15.0
     rect_bleed_decay:          float = 0.0
     rect_axis_gap:             float = 0.0
-    rect_max_overlap:          float = 0.3
+    rect_max_overlap:          float = 1.0
 
     # Endpoint snapping (extends collinear walls to meet)
     rect_snap_gap_factor: float = 2.0    # gap ≤ factor × max_thickness

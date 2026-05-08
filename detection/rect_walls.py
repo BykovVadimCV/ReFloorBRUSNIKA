@@ -1080,6 +1080,25 @@ class RectWallDetector:
         log_lines.append(f"Extra (spill) px     : {_covered_total_px - _covered_wall_px} "
                          f"(outside wall mask)\n")
 
+        # ── Diagnostic overlay image ───────────────────────────────────
+        # WHITE  = wall ∩ rect
+        # GREEN  = wall pixel not covered by any rect
+        # RED    = rect pixel outside wall mask
+        # BLACK  = everything else
+        if debug_img_path:
+            try:
+                _wall_bin = mask01 > 0
+                _rect_bin = _covered > 0
+                _diag = np.zeros((H, W, 3), dtype=np.uint8)
+                _diag[_wall_bin & _rect_bin]  = (255, 255, 255)  # white
+                _diag[_wall_bin & ~_rect_bin] = (0,   255,   0)  # green
+                _diag[_rect_bin & ~_wall_bin] = (0,     0, 255)  # red
+                _diag_path = os.path.splitext(debug_img_path)[0] + "_wall_rect_diag.png"
+                cv2.imwrite(_diag_path, _diag)
+                logger.info("RectWallDetector: wall/rect diagnostic image → %s", _diag_path)
+            except Exception as _de:
+                logger.warning("RectWallDetector: could not save diagnostic image: %s", _de)
+
         if len(rects) > 0:
             _areas = []
             for _r in rects:
