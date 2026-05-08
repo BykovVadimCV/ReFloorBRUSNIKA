@@ -300,8 +300,6 @@ def _refine_door_mask_by_enclosed_spaces(
     ocr_bboxes: Optional[List] = None,
     *,
     door_overlap_threshold: float = 0.50,
-    close_kernel_size: int = 7,
-    close_iters: int = 2,
 ) -> np.ndarray:
     """
     Refine *door_mask* using the same enclosed-space logic applied to wall masks.
@@ -361,11 +359,7 @@ def _refine_door_mask_by_enclosed_spaces(
     ]
 
     # Label enclosed white regions in the image
-    labels = find_enclosed_spaces(
-        img_bgr,
-        close_kernel_size=close_kernel_size,
-        close_iters=close_iters,
-    )
+    labels = find_enclosed_spaces(img_bgr)
 
     n_labels = int(labels.max())
     if n_labels == 0:

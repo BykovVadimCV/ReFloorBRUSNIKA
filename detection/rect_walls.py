@@ -40,6 +40,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from skimage.morphology import skeletonize
+
 import cv2
 import numpy as np
 
@@ -353,30 +355,294 @@ def rasterise_wall_segments(
 
 
 # ---------------------------------------------------------------------------
-# Enclosed-space filtering
+# Enclosed-space filtering — skeleton-based pipe-end capping
 # ---------------------------------------------------------------------------
+
+def _trace_skel(skel: np.ndarray, r0: int, c0: int, max_steps: int):
+    """Walk a skeleton path from endpoint (r0, c0) for up to max_steps steps."""
+    H, W = skel.shape
+    visited = {(r0, c0)}
+    path    = [(r0, c0)]
+    cur     = (r0, c0)
+    for _ in range(max_steps):
+        cr, cc = cur
+        nbrs = [
+            (cr + dr, cc + dc)
+            for dr in (-1, 0, 1)
+            for dc in (-1, 0, 1)
+            if not (dr == 0 and dc == 0)
+            and 0 <= cr + dr < H
+            and 0 <= cc + dc < W
+            and skel[cr + dr, cc + dc]
+            and (cr + dr, cc + dc) not in visited
+        ]
+        if not nbrs or len(nbrs) > 1:
+            break
+        visited.add(nbrs[0])
+        path.append(nbrs[0])
+        cur = nbrs[0]
+    return path
+
+
+def _local_wall_dir(path, local_steps: int = 15):
+    """
+    Estimate wall direction from the first ``local_steps`` skeleton steps.
+
+    Returns a unit vector (dr, dc) pointing OUTWARD from the wall toward the
+    opening, or None if the path is too short.
+    """
+    n = min(local_steps, len(path) - 1)
+    if n < 2:
+        return None
+    d = np.array(path[0], float) - np.array(path[n], float)
+    norm = np.linalg.norm(d)
+    return d / norm if norm > 1e-6 else None
+
+
+def _ray_hit(
+    binary: np.ndarray,
+    dist_black: np.ndarray,
+    r0: int,
+    c0: int,
+    perp_r: float,
+    perp_c: float,
+    max_pipe_width: int,
+    min_pipe_r: float,
+    max_wall_skip: int = 12,
+):
+    """
+    Shoot a ray from (r0, c0) in direction (perp_r, perp_c).
+
+    Phases
+    ------
+    1. Skip source-wall white pixels (up to max_wall_skip).
+    2. Cross the black channel; require dist_transform ≥ min_pipe_r to confirm
+       a genuine interior.
+    3. Land on the opposing white wall → return (hit_r, hit_c).
+
+    Returns None if the sequence is not completed within max_pipe_width steps.
+    """
+    H, W = binary.shape
+    in_source  = True
+    white_skip = 0
+    traversed  = False
+
+    for step in range(1, max_pipe_width + 1):
+        nr = int(round(r0 + perp_r * step))
+        nc = int(round(c0 + perp_c * step))
+        if not (0 <= nr < H and 0 <= nc < W):
+            return None
+
+        is_white = binary[nr, nc] > 0
+
+        if in_source:
+            if is_white:
+                white_skip += 1
+                if white_skip > max_wall_skip:
+                    return None
+                continue
+            else:
+                in_source = False
+
+        if is_white:
+            return (nr, nc) if traversed else None
+
+        if dist_black[nr, nc] >= min_pipe_r:
+            traversed = True
+
+    return None
+
+
+def find_caps(
+    binary: np.ndarray,
+    *,
+    min_wall_len:   int   = 30,
+    max_pipe_width: int   = 50,
+    min_pipe_r:     float = 3.0,
+    look_ahead:     int   = 80,
+    local_steps:    int   = 15,
+    cap_thickness:  Optional[int] = None,
+    merge_radius:   int   = 6,
+    min_space_size: float = 0.0,
+) -> list:
+    """
+    Detect open pipe ends in a binary wall image and return cap segments.
+
+    Parameters
+    ----------
+    binary          : uint8 H×W, 255 = wall, 0 = open channel.
+    min_wall_len    : minimum skeleton-path length to qualify as a pipe wall.
+    max_pipe_width  : maximum channel width searched for the opposing wall.
+    min_pipe_r      : minimum distance-transform value needed to confirm a
+                      real channel interior.
+    look_ahead      : skeleton trace length used for path-length check.
+    local_steps     : first N skeleton steps used for direction estimation.
+    cap_thickness   : drawn line thickness (None → auto from segment length).
+    merge_radius    : suppress duplicate caps whose hit points are within this
+                      many pixels of an already-capped location.
+    min_space_size  : minimum open-channel area (fraction of image) required
+                      for a cap to be placed.  0.0 disables the check.
+
+    Returns
+    -------
+    List of dicts with keys ``'p1'``, ``'p2'`` (col, row) and ``'thickness'``.
+    """
+    dist_black = cv2.distanceTransform(
+        (binary == 0).astype(np.uint8) * 255, cv2.DIST_L2, 5
+    )
+
+    H_img, W_img = binary.shape[:2]
+    min_space_px = int(min_space_size * H_img * W_img) if min_space_size > 0.0 else 0
+    if min_space_px > 0:
+        channel_mask = (binary == 0).astype(np.uint8)
+        n_spaces, space_labels = cv2.connectedComponents(channel_mask, connectivity=8)
+        space_areas = np.bincount(space_labels.ravel(), minlength=n_spaces)
+    else:
+        space_labels = None
+        space_areas  = None
+
+    skel = skeletonize(binary > 0).astype(np.uint8)
+    k    = np.ones((3, 3), np.uint8)
+    k[1, 1] = 0
+    nc_       = cv2.filter2D(skel, -1, k)
+    endpoints = np.argwhere((skel > 0) & (nc_ == 1))
+
+    caps:         list                   = []
+    capped_exact: set                    = set()
+    capped_hits:  List[Tuple[int, int]]  = []
+
+    def _near_capped_hit(r: int, c: int) -> bool:
+        return any(
+            abs(r - hr) + abs(c - hc) <= merge_radius
+            for hr, hc in capped_hits
+        )
+
+    for r, c in endpoints:
+        if (r, c) in capped_exact or _near_capped_hit(r, c):
+            continue
+
+        path = _trace_skel(skel, r, c, look_ahead)
+        if len(path) < min_wall_len:
+            continue
+
+        d = _local_wall_dir(path, local_steps)
+        if d is None:
+            continue
+        dr, dc = d
+
+        for sign in (1, -1):
+            perp_r = sign * (-dc)
+            perp_c = sign *   dr
+
+            hit = _ray_hit(
+                binary, dist_black, r, c,
+                perp_r, perp_c,
+                max_pipe_width, min_pipe_r,
+            )
+            if hit is None:
+                continue
+
+            hr, hc = hit
+            if _near_capped_hit(hr, hc):
+                continue
+
+            seg_len = max(1, int(np.hypot(hr - r, hc - c)))
+
+            # ≥ 60% of the segment must be black (genuine channel, not bulge)
+            black_count = sum(
+                1
+                for t in range(1, seg_len)
+                if binary[
+                    int(round(r  + (hr - r)  * t / seg_len)),
+                    int(round(c  + (hc - c)  * t / seg_len)),
+                ] == 0
+            )
+            if black_count < seg_len * 0.6:
+                continue
+
+            if min_space_px > 0:
+                mid_r = int(round((r  + hr) / 2))
+                mid_c = int(round((c  + hc) / 2))
+                space_label = space_labels[mid_r, mid_c]
+                if space_label == 0 or space_areas[space_label] < min_space_px:
+                    continue
+
+            thick = cap_thickness if cap_thickness is not None \
+                    else max(2, seg_len // 6)
+
+            caps.append({"p1": (c, r), "p2": (hc, hr), "thickness": thick})
+            capped_exact.add((r, c))
+            capped_hits.append((r, c))
+            capped_hits.append((hr, hc))
+            break
+
+    logger.info("find_caps: %d open pipe end(s) capped", len(caps))
+    return caps
+
+
+def apply_caps(binary: np.ndarray, caps: list) -> np.ndarray:
+    """Draw white cap lines onto *binary* (copy) and return it."""
+    result = binary.copy()
+    for cap in caps:
+        cv2.line(result, cap["p1"], cap["p2"], 255, cap["thickness"])
+    return result
+
+
+def _cap_pipe_openings(
+    binary: np.ndarray,
+    *,
+    min_wall_len:   int   = 30,
+    max_pipe_width: int   = 50,
+    min_pipe_r:     float = 3.0,
+    look_ahead:     int   = 80,
+    local_steps:    int   = 15,
+    cap_thickness:  Optional[int] = None,
+    merge_radius:   int   = 6,
+    min_space_size: float = 0.0,
+) -> np.ndarray:
+    """
+    Close open pipe ends in *binary* (255 = open space, 0 = wall).
+
+    Inverts so walls are white, calls :func:`find_caps`, draws caps, then
+    inverts back.
+    """
+    wall_binary  = cv2.bitwise_not(binary)
+    caps         = find_caps(
+        wall_binary,
+        min_wall_len=min_wall_len,
+        max_pipe_width=max_pipe_width,
+        min_pipe_r=min_pipe_r,
+        look_ahead=look_ahead,
+        local_steps=local_steps,
+        cap_thickness=cap_thickness,
+        merge_radius=merge_radius,
+        min_space_size=min_space_size,
+    )
+    wall_capped = apply_caps(wall_binary, caps)
+    return cv2.bitwise_not(wall_capped)
+
 
 def find_enclosed_spaces(
     img_bgr: np.ndarray,
     wall_mask: Optional[np.ndarray] = None,   # kept for API compat, unused
     *,
-    close_kernel_size: int = 7,
-    close_iters: int = 2,
+    min_wall_len:   int   = 30,
+    max_pipe_width: int   = 50,
+    min_pipe_r:     float = 3.0,
+    look_ahead:     int   = 80,
+    local_steps:    int   = 15,
+    cap_thickness:  Optional[int] = None,
+    merge_radius:   int   = 6,
+    min_space_size: float = 0.0,
 ) -> np.ndarray:
     """
     Label every white connected region in the floor-plan image.
 
     Algorithm
     ---------
-    1. Grayscale.
-    2. Otsu binarise: walls/dark features → 0, white regions → 255.
-    3. Cap step: morphological CLOSE on the *wall* mask (inverted binary)
-       to bridge small gaps in wall coverage, so interior rooms are
-       fully enclosed before labelling.
-    4. ``cv2.connectedComponents`` on the white (room/exterior) pixels.
-
-    All white regions are returned — rooms, corridors, and the exterior.
-    The caller decides what to do with each region.
+    1. Grayscale + Otsu binarise: walls → 0, open space → 255.
+    2. Seal open pipe ends via skeleton-based capping (:func:`_cap_pipe_openings`).
+    3. ``cv2.connectedComponents`` on the capped binary.
 
     Returns
     -------
@@ -384,24 +650,80 @@ def find_enclosed_spaces(
         0 = wall/dark pixels, 1..N = individual white regions.
     """
     gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-    # Otsu: walls → 0, rooms/background → 255
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Cap: close gaps in the wall structure so rooms are properly enclosed.
-    # We work on the inverted image (walls = 255) so MORPH_CLOSE thickens
-    # walls and bridges narrow breaks without permanently shrinking rooms.
-    if close_kernel_size > 1 and close_iters > 0:
-        k = np.ones((close_kernel_size, close_kernel_size), dtype=np.uint8)
-        walls = cv2.bitwise_not(binary)                          # walls = 255
-        walls_capped = cv2.morphologyEx(
-            walls, cv2.MORPH_CLOSE, k, iterations=close_iters
-        )
-        binary = cv2.bitwise_not(walls_capped)                   # rooms = 255
+    binary = _cap_pipe_openings(
+        binary,
+        min_wall_len=min_wall_len,
+        max_pipe_width=max_pipe_width,
+        min_pipe_r=min_pipe_r,
+        look_ahead=look_ahead,
+        local_steps=local_steps,
+        cap_thickness=cap_thickness,
+        merge_radius=merge_radius,
+        min_space_size=min_space_size,
+    )
 
-    # Label all connected white regions (8-connectivity)
     _, labels = cv2.connectedComponents(binary, connectivity=8)
     return labels.astype(np.int32)
+
+
+def _save_enclosed_debug_image(
+    path: str,
+    img_bgr: np.ndarray,
+    labels: np.ndarray,
+    boxes: List[Tuple[int, int, int, int]],
+) -> None:
+    """
+    Write a colour-coded debug image: each enclosed region gets a unique hue
+    (golden-angle HSV spacing), walls stay dark grey, pixel counts are
+    annotated at centroids (up to 200 regions), OCR bboxes outlined in white.
+    """
+    try:
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+        _, binary_dbg = cv2.threshold(
+            gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )
+
+        n_regions = int(labels.max())
+        lut = np.zeros((n_regions + 1, 3), dtype=np.uint8)
+        lut[0] = (60, 60, 60)
+        for i in range(1, n_regions + 1):
+            hue = int((i * 137.508) % 360) // 2
+            hsv = np.uint8([[[hue, 220, 220]]])
+            lut[i] = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
+
+        colored = lut[labels]
+        colored[binary_dbg == 0] = (60, 60, 60)
+
+        region_stats = []
+        for i in range(1, n_regions + 1):
+            rmask = labels == i
+            area = int(np.count_nonzero(rmask))
+            if area == 0:
+                continue
+            ys, xs = np.where(rmask)
+            region_stats.append((area, i, int(xs.mean()), int(ys.mean())))
+        region_stats.sort(reverse=True)
+
+        for area, _idx, cx_r, cy_r in region_stats[:200]:
+            txt = str(area)
+            (tw, _th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+            cv2.putText(colored, txt, (cx_r - tw // 2 + 1, cy_r + 1),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(colored, txt, (cx_r - tw // 2, cy_r),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+
+        for (bx1, by1, bx2, by2) in boxes:
+            cv2.rectangle(colored, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
+
+        cv2.imwrite(path, colored)
+        logger.info(
+            "Enclosed-space debug image saved → %s  (%d regions, %d labelled)",
+            path, n_regions, len(region_stats),
+        )
+    except Exception as exc:
+        logger.warning("Could not save enclosed-space debug image: %s", exc)
 
 
 def refine_mask_by_enclosed_spaces(
@@ -410,31 +732,39 @@ def refine_mask_by_enclosed_spaces(
     ocr_bboxes: Optional[List] = None,
     *,
     wall_overlap_threshold: float = 0.50,
-    close_kernel_size: int = 7,
-    close_iters: int = 2,
+    min_wall_len:   int   = 30,
+    max_pipe_width: int   = 50,
+    min_pipe_r:     float = 3.0,
+    look_ahead:     int   = 80,
+    local_steps:    int   = 15,
+    cap_thickness:  Optional[int] = None,
+    merge_radius:   int   = 6,
+    min_space_size: float = 0.0,
     debug_img_path: Optional[str] = None,
 ) -> np.ndarray:
     """
     Refine *wall_mask* using enclosed-space analysis.
 
-    For every enclosed region (a white space surrounded by walls):
+    Open pipe ends are sealed with the skeleton-based cap algorithm before
+    region labelling, so partially-open rooms are treated as enclosed.
 
-    * **No OCR label inside + ≥ wall_overlap_threshold wall-mask overlap**
-      → structural cavity; fill the whole region as wall (255).
-    * **OCR label centre inside**
-      → labelled room; clear any stray wall pixels (set to 0).
+    For every enclosed region:
+    * No OCR label inside + ≥ wall_overlap_threshold wall-mask overlap
+      → structural cavity; fill entirely as wall (255).
+    * OCR label inside or sparse wall coverage → clear to 0.
 
     Parameters
     ----------
-    wall_mask  : H×W uint8, 255 = wall
-    img_bgr    : BGR image (text regions already erased)
-    ocr_bboxes : list of ``(x1, y1, x2, y2)`` or ``(text, x1, y1, x2, y2)``
-    wall_overlap_threshold : fraction of region pixels that must be wall
-                             for the "fill as wall" branch to fire
+    wall_mask              : H×W uint8, 255 = wall.
+    img_bgr                : BGR image (text regions already erased).
+    ocr_bboxes             : list of (x1,y1,x2,y2) or (text,x1,y1,x2,y2).
+    wall_overlap_threshold : fraction of region pixels that must be wall.
+    min_wall_len … min_space_size : forwarded to :func:`find_enclosed_spaces`.
+    debug_img_path         : optional path for colour-coded debug image.
 
     Returns
     -------
-    Refined wall_mask (a copy — the input is not modified).
+    Refined wall_mask (copy — input not modified).
     """
     if wall_mask is None:
         return wall_mask
@@ -442,7 +772,7 @@ def refine_mask_by_enclosed_spaces(
     refined = wall_mask.copy()
     H, W = refined.shape[:2]
 
-    # Normalise ocr_bboxes to plain (x1, y1, x2, y2) int tuples
+    # Normalise ocr_bboxes
     boxes: List[Tuple[int, int, int, int]] = []
     if ocr_bboxes:
         for item in ocr_bboxes:
@@ -450,26 +780,32 @@ def refine_mask_by_enclosed_spaces(
                 boxes.append((int(item[0]), int(item[1]),
                                int(item[2]), int(item[3])))
             elif len(item) >= 5:
-                # (text, x1, y1, x2, y2) — skip text token
                 boxes.append((int(item[1]), int(item[2]),
                                int(item[3]), int(item[4])))
 
-    # Precompute OCR bbox centres once
-    ocr_centres: List[Tuple[float, float]] = []
-    for (bx1, by1, bx2, by2) in boxes:
-        ocr_centres.append(((bx1 + bx2) / 2.0, (by1 + by2) / 2.0))
+    ocr_centres: List[Tuple[float, float]] = [
+        ((bx1 + bx2) / 2.0, (by1 + by2) / 2.0)
+        for (bx1, by1, bx2, by2) in boxes
+    ]
 
-    # Get enclosed region labels
     labels = find_enclosed_spaces(
         img_bgr, wall_mask,
-        close_kernel_size=close_kernel_size,
-        close_iters=close_iters,
+        min_wall_len=min_wall_len,
+        max_pipe_width=max_pipe_width,
+        min_pipe_r=min_pipe_r,
+        look_ahead=look_ahead,
+        local_steps=local_steps,
+        cap_thickness=cap_thickness,
+        merge_radius=merge_radius,
+        min_space_size=min_space_size,
     )
 
     n_labels = int(labels.max())
     if n_labels == 0:
-        logger.info("refine_mask_by_enclosed_spaces: no enclosed regions found "
-                    "(find_enclosed_spaces returned 0 labels)")
+        logger.info(
+            "refine_mask_by_enclosed_spaces: no enclosed regions found "
+            "(find_enclosed_spaces returned 0 labels)"
+        )
         return refined
 
     logger.info(
@@ -487,7 +823,6 @@ def refine_mask_by_enclosed_spaces(
         if region_area == 0:
             continue
 
-        # Check if any OCR bbox centre falls inside this region
         has_ocr = False
         for (cx, cy) in ocr_centres:
             xi, yi = int(round(cx)), int(round(cy))
@@ -495,13 +830,10 @@ def refine_mask_by_enclosed_spaces(
                 has_ocr = True
                 break
 
-        # Always check wall-mask overlap so both branches can use it
         overlap = int(np.count_nonzero(wall_mask[region_mask] > 0))
         overlap_frac = overlap / region_area
 
         if not has_ocr and overlap_frac >= wall_overlap_threshold:
-            # Structural cavity: no room label and mostly wall already →
-            # fill the whole region solid so the decomposer sees it as wall.
             refined[region_mask] = 255
             filled_count += 1
             logger.info(
@@ -511,10 +843,6 @@ def refine_mask_by_enclosed_spaces(
                 wall_overlap_threshold * 100,
             )
         else:
-            # Exclude from wall mask: region is either a labelled room
-            # (has_ocr) or a white space with sparse wall coverage
-            # (overlap < threshold).  Both should be clear of wall pixels
-            # so rect_decompose doesn't fragment them into spurious walls.
             refined[region_mask] = 0
             cleared_count += 1
             reason = (
@@ -534,74 +862,8 @@ def refine_mask_by_enclosed_spaces(
         filled_count, cleared_count, n_labels,
     )
 
-    # ── Optional debug image ───────────────────────────────────────────────
-    # Each white connected region gets a unique colour (golden-angle HSV
-    # spacing for maximum visual separation), walls stay black, and the
-    # top-N largest regions get a pixel-area label at their centroid.
-    # OCR bboxes are overlaid in white so it is clear which regions have
-    # been identified as labelled rooms.
     if debug_img_path:
-        try:
-            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-            # Otsu binarise (same as find_enclosed_spaces, but we need the
-            # binary to paint walls black in the output)
-            _, binary_dbg = cv2.threshold(
-                gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
-            )
-
-            # Build a colour LUT: one BGR colour per label
-            n_regions = int(labels.max())
-            lut = np.zeros((n_regions + 1, 3), dtype=np.uint8)
-            lut[0] = (0, 0, 0)   # label 0 = walls → black
-            for i in range(1, n_regions + 1):
-                hue = int((i * 137.508) % 360) // 2   # golden angle, max separation
-                hsv = np.uint8([[[hue, 220, 220]]])
-                lut[i] = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)[0, 0]
-
-            # Map every pixel through the LUT
-            colored = lut[labels]   # (H, W, 3)
-
-            # Stamp walls black so structure is always visible
-            colored[binary_dbg == 0] = (0, 0, 0)
-
-            # Collect region stats for labelling — all non-empty regions
-            region_stats = []
-            for i in range(1, n_regions + 1):
-                rmask = labels == i
-                area = int(np.count_nonzero(rmask))
-                if area == 0:
-                    continue
-                ys, xs = np.where(rmask)
-                region_stats.append((area, i, int(xs.mean()), int(ys.mean())))
-            region_stats.sort(reverse=True)
-
-            # Label all regions (largest first, capped at 200 labels for readability)
-            for area, idx, cx_r, cy_r in region_stats[:200]:
-                txt = str(area)
-                (tw, th), _ = cv2.getTextSize(
-                    txt, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2
-                )
-                # White shadow then black text for legibility on any colour
-                cv2.putText(colored, txt, (cx_r - tw // 2 + 1, cy_r + 1),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2,
-                            cv2.LINE_AA)
-                cv2.putText(colored, txt, (cx_r - tw // 2, cy_r),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1,
-                            cv2.LINE_AA)
-
-            # OCR bbox outlines
-            for (bx1, by1, bx2, by2) in boxes:
-                cv2.rectangle(colored, (bx1, by1), (bx2, by2), (255, 255, 255), 1)
-
-            cv2.imwrite(debug_img_path, colored)
-            logger.info(
-                "Enclosed-space debug image saved → %s  (%d regions, "
-                "%d labelled)",
-                debug_img_path, n_regions, len(region_stats),
-            )
-        except Exception as _dbe:
-            logger.warning("Could not save enclosed-space debug image: %s", _dbe)
+        _save_enclosed_debug_image(debug_img_path, img_bgr, labels, boxes)
 
     return refined
 
@@ -716,8 +978,6 @@ class RectWallDetector:
             wall_mask = refine_mask_by_enclosed_spaces(
                 wall_mask, img_bgr, ocr_bboxes,
                 wall_overlap_threshold=overlap_thr,
-                close_kernel_size=cap_k,
-                close_iters=cap_i,
                 debug_img_path=debug_img_path,
             )
         except Exception as _rme:
