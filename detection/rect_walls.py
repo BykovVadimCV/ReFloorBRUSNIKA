@@ -410,7 +410,7 @@ def refine_mask_by_enclosed_spaces(
     ocr_bboxes: Optional[List] = None,
     *,
     wall_overlap_threshold: float = 0.50,
-    close_kernel_size: int = 7,
+    close_kernel_size: int = 2,
     close_iters: int = 2,
     debug_img_path: Optional[str] = None,
 ) -> np.ndarray:
