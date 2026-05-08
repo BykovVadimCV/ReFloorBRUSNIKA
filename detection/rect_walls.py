@@ -688,7 +688,7 @@ class RectWallDetector:
         # applied directly to wall_mask (not just to the enclosed-space
         # analysis mask).
         cap_k = max(1, int(getattr(cfg, "rect_cap_kernel_size", 2)))
-        cap_i = max(1, int(getattr(cfg, "rect_cap_iters", 1)))
+        cap_i = max(1, int(getattr(cfg, "rect_cap_iters", 2)))
         if cap_k > 1 and cap_i > 0:
             kernel = np.ones((cap_k, cap_k), dtype=np.uint8)
             wall_mask = cv2.morphologyEx(
