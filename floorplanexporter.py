@@ -429,6 +429,7 @@ class Opening:
     hinge: Optional[Tuple[int, int]] = None
     swing_clockwise: bool = True
     wall_normal_deg: float = 0.0
+    source: str = ''
 
 
 @dataclass
