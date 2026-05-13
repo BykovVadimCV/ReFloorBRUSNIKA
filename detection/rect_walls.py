@@ -1,4 +1,4 @@
-"""
+﻿"""
 detection/rect_walls.py — rectangle-decomposition wall detector.
 
 The new wall-detection pipeline:
@@ -726,29 +726,10 @@ def _save_enclosed_debug_image(
         logger.warning("Could not save enclosed-space debug image: %s", exc)
 
 
-def _is_numeric_ocr_label(text: str) -> bool:
-    """
-    Return True only when *text* is a numeric area/measurement label.
-
-    Examples that pass:  "12.5", "12,5", "8", "12.50 м²", "15.3м2",
-                         "8.4 кв.м", "9.0 m²", "12.5M2"
-    Examples that fail:  "Кухня", "WC", "Ванная", "Коридор", ""
-
-    The check strips common area-unit suffixes then verifies the remainder
-    is a decimal/integer number (dot or comma as decimal separator).
-    """
-    import re
-    s = text.strip()
-    if not s:
-        return False
-    # Remove common area-unit suffixes (case-insensitive)
-    s = re.sub(
-        r"[\s ]*(м²|м2|кв\.?\s*м|m²|m2|sq\.?\s*m|кв\.м\.?)$",
-        "", s, flags=re.IGNORECASE,
-    ).strip()
-    # Accept integer or decimal (dot or comma separator), optional leading sign
-    return bool(re.fullmatch(r"[+\-]?\d+([.,]\d+)?", s))
-
+# Re-export canonical implementation from core.ocr_utils.
+# All callers that import _is_numeric_ocr_label from this module continue
+# to work; the logic lives in one place.
+from core.ocr_utils import is_numeric_ocr_label as _is_numeric_ocr_label  # noqa: E402
 
 def refine_mask_by_enclosed_spaces(
     wall_mask: np.ndarray,
@@ -763,7 +744,7 @@ def refine_mask_by_enclosed_spaces(
     local_steps:    int   = 15,
     cap_thickness:  Optional[int] = None,
     merge_radius:   int   = 6,
-    min_space_size: float = 0.0,
+    min_space_size: float = 0.001,
     debug_img_path: Optional[str] = None,
 ) -> np.ndarray:
     """

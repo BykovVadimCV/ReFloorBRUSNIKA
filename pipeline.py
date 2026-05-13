@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 import math
 import os
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -27,6 +26,11 @@ import numpy as np
 
 from core.config import PipelineConfig
 from core.geometry import iou_xyxy
+from core.ocr_utils import (
+    is_numeric_ocr_label as _is_numeric_ocr_label,
+    parse_area_m2 as _parse_ocr_area_m2,
+    parse_length_m as _parse_ocr_length_m,
+)
 from core.models import (
     BBox,
     DetectionResult,
@@ -51,16 +55,8 @@ logger = logging.getLogger(__name__)
 # ============================================================
 # SCALE CALIBRATION HELPERS  (ported from legacy main.py)
 # ============================================================
-
-_AREA_PATTERN = re.compile(
-    r'^(\d{1,3}[.,]\d{1,2})\s*(?:m²|м²|m2|м2|кв\.?\s*м\.?)?$',
-    re.IGNORECASE,
-)
-
-_LENGTH_PATTERN = re.compile(
-    r'^(\d{1,3}[.,]\d{1,2})$',
-)
-
+# _parse_ocr_area_m2 / _parse_ocr_length_m are imported from core.ocr_utils
+# above so they are available as module-level names throughout this file.
 
 def _deskew_image(img: np.ndarray, max_angle: float = 5.0) -> np.ndarray:
     """Rotate image so that dominant lines snap to X/Y axes.
@@ -200,35 +196,6 @@ def _crop_to_floorplan(
         w_img, h_img, cropped.shape[1], cropped.shape[0], x, y, w, h,
     )
     return cropped
-
-
-def _parse_ocr_area_m2(text: str) -> Optional[float]:
-    """
-    Parse an OCR word to a room area in m².
-
-    Accepts formats: '12,4', '12.4', '12,4 м²', '52.0 m2', etc.
-    Returns None if the text does not match.
-    """
-    match = _AREA_PATTERN.match(text.strip())
-    if match:
-        try:
-            return float(match.group(1).replace(',', '.'))
-        except ValueError:
-            pass
-    return None
-
-
-def _parse_ocr_length_m(text: str) -> Optional[float]:
-    """Parse an OCR word as a wall length in metres (e.g. '3.92', '2,55')."""
-    match = _LENGTH_PATTERN.match(text.strip())
-    if match:
-        try:
-            val = float(match.group(1).replace(',', '.'))
-            if 0.3 <= val <= 30.0:          # sane wall length range
-                return val
-        except ValueError:
-            pass
-    return None
 
 
 def _calibrate_scale_from_wall_lengths(
@@ -948,6 +915,10 @@ class PipelineResult:
     # Room area validation reports
     room_area_reports: List[Any] = field(default_factory=list)
 
+    # Openings dropped because their nearest wall was diagonal; exposed so
+    # callers can investigate without digging into logs.
+    dropped_diagonal_openings: List[Opening] = field(default_factory=list)
+
     # Legacy raw results (for backward compat)
     raw_measurements: Optional[Any] = None
     raw_yolo_results: Optional[Any] = None
@@ -1199,12 +1170,7 @@ class FloorplanPipeline:
             if progress_callback is not None:
                 progress_callback(stage)
 
-        # Import numeric label checker early so it's available for both
-        # text erasure and OCR bbox filtering
-        try:
-            from detection.rect_walls import _is_numeric_ocr_label
-        except ImportError:
-            _is_numeric_ocr_label = None
+        # _is_numeric_ocr_label is imported at module level from core.ocr_utils
 
         if not self._initialized:
             self.initialize()
@@ -1297,12 +1263,8 @@ class FloorplanPipeline:
                 if len(item) < 5:
                     continue
                 # Only erase numeric labels (area measurements)
-                if _is_numeric_ocr_label is not None:
-                    if not _is_numeric_ocr_label(str(item[0])):
-                        continue
-                else:
-                    # Fallback: erase all if import failed
-                    pass
+                if not _is_numeric_ocr_label(str(item[0])):
+                    continue
                 rx1, ry1 = int(item[1]) + shrink, int(item[2]) + shrink
                 rx2, ry2 = int(item[3]) - shrink, int(item[4]) - shrink
                 if rx2 <= rx1 or ry2 <= ry1:
@@ -1353,11 +1315,13 @@ class FloorplanPipeline:
                             ))
                 _rect_det = RectWallDetector(self.config)
                 _rect_det.initialize()
-                _enclosed_dbg_path = os.path.join(
-                    output_dir, f"{base_name}_enclosed_spaces.png"
+                _enclosed_dbg_path = (
+                    os.path.join(output_dir, f"{base_name}_enclosed_spaces.png")
+                    if self.config.debug_mode else None
                 )
-                _rectdecompose_log = os.path.join(
-                    output_dir, f"{base_name}_rectdecompose.log"
+                _rectdecompose_log = (
+                    os.path.join(output_dir, f"{base_name}_rectdecompose.log")
+                    if self.config.debug_mode else None
                 )
                 _rd_res = _rect_det.detect(
                     img_clean,
@@ -1468,10 +1432,8 @@ class FloorplanPipeline:
             for item in _src:
                 if len(item) < 5:
                     continue
-                # Use the _is_numeric_ocr_label imported at the top of process()
-                if _is_numeric_ocr_label is not None:
-                    if not _is_numeric_ocr_label(str(item[0])):
-                        continue
+                if not _is_numeric_ocr_label(str(item[0])):
+                    continue
                 ocr_bboxes.append((
                     str(item[0]),
                     int(item[1]), int(item[2]),
@@ -1538,14 +1500,16 @@ class FloorplanPipeline:
         # is removed entirely — relocating them onto axis walls would be
         # wrong and the YOLO/arc detectors are themselves axis-strict.
         if self.config.use_rect_walls and result.openings:
-            _drop_n = self._drop_diagonal_openings(
+            _drop_n, _dropped = self._drop_diagonal_openings(
                 openings=result.openings,
                 walls=result.walls,
                 tol_deg=self.config.opening_axis_tol_deg,
             )
             if _drop_n:
+                result.dropped_diagonal_openings = _dropped
                 logger.info(
-                    "[%s] Stage 2b: dropped %d opening(s) on diagonal walls",
+                    "[%s] Stage 2b: dropped %d opening(s) on diagonal walls "
+                    "(see result.dropped_diagonal_openings for details)",
                     base_name, _drop_n,
                 )
 
@@ -1701,6 +1665,31 @@ class FloorplanPipeline:
                 scale_factor=self.config.sh3d_scale_factor,
                 tolerance_ratio=self.config.room_area_tolerance_ratio,
             )
+            if result.room_area_reports:
+                _n_mismatch = sum(
+                    1 for r in result.room_area_reports
+                    if r.get("status") == "mismatch"
+                )
+                _mismatch_ratio = _n_mismatch / len(result.room_area_reports)
+                if _mismatch_ratio >= 0.30:
+                    logger.error(
+                        "[%s] Stage 4c: %d/%d rooms fail area validation "
+                        "(≥30%% threshold) — scale calibration may be wrong. "
+                        "Renaming output to *.LOW_CONFIDENCE.sh3d",
+                        base_name, _n_mismatch, len(result.room_area_reports),
+                    )
+                    if result.sh3d_path and os.path.exists(result.sh3d_path):
+                        _lc_path = result.sh3d_path.replace(
+                            ".sh3d", ".LOW_CONFIDENCE.sh3d"
+                        )
+                        try:
+                            os.rename(result.sh3d_path, _lc_path)
+                            result.sh3d_path = _lc_path
+                        except OSError as _re:
+                            logger.warning(
+                                "[%s] Could not rename SH3D to low-confidence: %s",
+                                base_name, _re,
+                            )
 
         # ── Stage 5: Visualization ─────────────────────────────────────
         _notify("rendering")
@@ -1898,13 +1887,14 @@ class FloorplanPipeline:
     @staticmethod
     def _drop_diagonal_openings(
         openings: list, walls: List[WallSegment], tol_deg: float = 3.0,
-    ) -> int:
+    ) -> Tuple[int, List[Opening]]:
         """
         Mutate ``openings`` in place: remove every opening whose nearest
         wall is diagonal (angle deviates from 0°/90° by more than tol_deg).
         Distance is measured center-to-centerline.
 
-        Returns the number of removed openings.
+        Returns ``(n_dropped, dropped_openings)`` so callers can expose the
+        dropped list for diagnostics without re-running the filter.
         """
         if not openings or not walls:
             return 0
@@ -1933,8 +1923,8 @@ class FloorplanPipeline:
                 p2 = (float(p2[0]), float(p2[1]))
             wall_geo.append((w.is_diagonal, p1, p2))
 
-        kept = []
-        dropped = 0
+        kept: List[Opening] = []
+        dropped_list: List[Opening] = []
         for op in openings:
             cx, cy = op.bbox.center
             best_d = float('inf'); best_diag = False
@@ -1944,14 +1934,14 @@ class FloorplanPipeline:
                     best_d = d
                     best_diag = is_diag
             if best_diag:
-                dropped += 1
+                dropped_list.append(op)
             else:
                 kept.append(op)
 
-        if dropped:
+        if dropped_list:
             openings.clear()
             openings.extend(kept)
-        return dropped
+        return len(dropped_list), dropped_list
 
     def _run_wall_detection(self, img: np.ndarray) -> tuple:
         """
@@ -2291,6 +2281,7 @@ class FloorplanPipeline:
                 output_dir,
                 wall_mask=outline_mask,
                 original_image=img,
+                save_debug=self.config.debug_mode,
             )
 
             if measurements:

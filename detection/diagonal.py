@@ -754,22 +754,6 @@ def preprocess_floorplan(
     }
 
 
-# ---------------------------------------------------------------------------
-# Backward-compat shims
-# ---------------------------------------------------------------------------
-
-def compute_deskew(*args, **kwargs):   # pragma: no cover
-    raise NotImplementedError(
-        "compute_deskew has been replaced by preprocess_floorplan(); "
-        "update pipeline.py to call preprocess_floorplan() instead.")
-
-
 def transform_ocr_labels(labels, M):
     """Public wrapper retained for callers that already have an M matrix."""
     return _transform_labels(labels, M)
-
-
-def detect_diagonal_walls(*args, **kwargs):   # pragma: no cover
-    """Removed — diagonal walls are now baked into the deskewed image as
-    grey filled rectangles by ``preprocess_floorplan``."""
-    return []

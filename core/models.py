@@ -8,11 +8,17 @@ redundant class definitions and ensures consistent data representation.
 
 from __future__ import annotations
 
+import itertools
 import math
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
+
+# Stable, process-wide monotonic ID counter for Opening objects.
+# Using id(object()) was broken: the temp object is freed immediately so its
+# address can be reused, and the value does not survive JSON round-trips.
+_opening_id_counter = itertools.count(1)
 
 import numpy as np
 
@@ -250,8 +256,8 @@ class Opening:
     # Source tracking
     source: str = "unknown"  # "yolo", "geometric", "segmentation", "algorithmic"
 
-    # Unique identifier
-    id: int = field(default_factory=lambda: id(object()))
+    # Unique identifier — stable monotonic counter, safe across JSON round-trips
+    id: int = field(default_factory=lambda: next(_opening_id_counter))
 
     @property
     def center(self) -> Tuple[float, float]:

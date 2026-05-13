@@ -976,7 +976,8 @@ class RoomSizeAnalyzer:
                 output_dir: str,
                 wall_mask: np.ndarray = None,
                 original_image: np.ndarray = None,
-                known_area_m2: float = None) -> Optional[RoomMeasurements]:
+                known_area_m2: float = None,
+                save_debug: bool = True) -> Optional[RoomMeasurements]:
         """
         Полный пайплайн анализа размеров помещения.
 
@@ -1081,14 +1082,15 @@ class RoomSizeAnalyzer:
         # Этап 6: Измерение стен
         measured_walls = self.measure_walls(wall_segments, pixel_scale, outer_crust)
 
-        # Этап 7: Сохранение визуализаций
-        self._save_debug_images(
-            output_dir, img_path, image,
-            outer_crust, apartment_boundary, wall_mask,
-            living_mask, room_areas, measured_walls, pixel_scale,
-            exterior_mask, interior_mask, inner_corners,
-            apartment_area_pixels, living_space_pixels
-        )
+        # Этап 7: Сохранение визуализаций (только в debug-режиме)
+        if save_debug:
+            self._save_debug_images(
+                output_dir, img_path, image,
+                outer_crust, apartment_boundary, wall_mask,
+                living_mask, room_areas, measured_walls, pixel_scale,
+                exterior_mask, interior_mask, inner_corners,
+                apartment_area_pixels, living_space_pixels
+            )
 
         return RoomMeasurements(
             area_m2=total_m2,

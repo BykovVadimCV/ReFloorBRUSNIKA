@@ -1,10 +1,13 @@
 import cv2
+import logging
 import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Set
 import math
 import os
 from collections import defaultdict
+
+logger = logging.getLogger(__name__)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -119,7 +122,7 @@ class DebugVisualizer:
         path = os.path.join(self.output_dir, subdir, f"{self.step_counter:02d}_{name}.png")
         cv2.imwrite(path, image)
         self._saved.append((name, path))
-        print(f"  [DEBUG] {path}")
+        logger.debug("  [DEBUG] %s", path)
 
     def save_log(self, filename: str, lines: List[str]):
         if not self.enabled:
@@ -197,7 +200,7 @@ class DebugVisualizer:
 
         out_path = os.path.join(self.output_dir, output_filename)
         cv2.imwrite(out_path, grid)
-        print(f"\n  [DEBUG GRID] {out_path}  ({cols}×{rows}, {n} images)")
+        logger.debug("  [DEBUG GRID] %s  (%d×%d, %d images)", out_path, cols, rows, n)
         return out_path
 
 
@@ -490,7 +493,8 @@ class FloorplanDetector:
         }
         self._dominant_thickness = normal_t
 
-        print(f"  Thickness clusters: thin={thin_t:.1f}, normal={normal_t:.1f}, thick={thick_t:.1f}")
+        logger.debug("  Thickness clusters: thin=%.1f, normal=%.1f, thick=%.1f",
+                     thin_t, normal_t, thick_t)
         return self._thickness_clusters
 
     def _classify_wall_thickness(self, thickness: float) -> str:
@@ -562,7 +566,7 @@ class FloorplanDetector:
                 used.add(i)
                 used.add(j)
 
-        print(f"  Paired {len(walls)} walls from {len(valid_segments)} segments")
+        logger.debug("  Paired %d walls from %d segments", len(walls), len(valid_segments))
 
         vis = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
         for wall in walls:
@@ -754,10 +758,10 @@ class FloorplanDetector:
         filtered = [w for i, w in enumerate(walls) if i in structural]
 
         if len(filtered) < len(walls) * 0.4 and len(walls) > 3:
-            print(f"  Warning: filter too aggressive, keeping all {len(walls)} walls")
+            logger.warning("  filter too aggressive, keeping all %d walls", len(walls))
             filtered = walls
 
-        print(f"  Network filter: {len(walls)} → {len(filtered)} walls")
+        logger.debug("  Network filter: %d → %d walls", len(walls), len(filtered))
 
         vis = np.zeros((binary.shape[0], binary.shape[1], 3), dtype=np.uint8)
         for i, wall in enumerate(walls):
@@ -894,7 +898,7 @@ class FloorplanDetector:
             cv2.putText(vis, label, (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.3, color, 1)
         self.dbg.save("doors_detected", vis)
 
-        print(f"  Detected {len(doors)} doors")
+        logger.debug("  Detected %d doors", len(doors))
         return doors
 
     def _measure_gap_width_correct(self, binary: np.ndarray, x: int, y: int, wall: WallSegment) -> float:
@@ -1138,50 +1142,49 @@ class FloorplanDetector:
     # ════════════════════════════════════════════════════════════
 
     def process(self, image_path: str, output_path: str = None) -> dict:
-        print(f"{'=' * 60}")
-        print(f"FLOORPLAN DETECTOR v4.2 — {image_path}")
-        print(f"{'=' * 60}")
+        logger.info("FLOORPLAN DETECTOR v4.2 — %s", image_path)
 
-        print("\n[1] Loading and binarizing...")
+        logger.info("[1] Loading and binarizing...")
         img, gray, binary = self._load_and_binarize(image_path)
-        print(f"  Size: {img.shape[1]}×{img.shape[0]}")
+        logger.info("  Size: %d×%d", img.shape[1], img.shape[0])
 
-        print("\n[2] Deskewing...")
+        logger.info("[2] Deskewing...")
         img, gray, binary, skew = self._deskew(img, gray, binary)
 
-        print("\n[3] Detecting line segments...")
+        logger.info("[3] Detecting line segments...")
         segments = self._detect_segments(gray, binary)
-        print(f"  Found {len(segments)} segments")
+        logger.info("  Found %d segments", len(segments))
 
-        print("\n[4] Aggregating segments...")
+        logger.info("[4] Aggregating segments...")
         aggregated = self._aggregate_with_gaps(segments, binary)
-        print(f"  {len(aggregated)} segments, {sum(len(s.gap_positions) for s in aggregated)} gaps")
+        logger.info("  %d segments, %d gaps",
+                    len(aggregated), sum(len(s.gap_positions) for s in aggregated))
 
-        print("\n[5] Estimating wall thickness (bimodal)...")
+        logger.info("[5] Estimating wall thickness (bimodal)...")
         self._estimate_thickness_bimodal(aggregated, binary)
 
-        print("\n[6] Pairing walls...")
+        logger.info("[6] Pairing walls...")
         walls = self._pair_walls_optimal(aggregated, binary)
 
-        print("\n[7] Filtering wall network...")
+        logger.info("[7] Filtering wall network...")
         walls = self._filter_walls_network(walls, binary)
 
-        print("\n[8] Generating masks...")
+        logger.info("[8] Generating masks...")
         wall_mask = self._generate_wall_masks(walls, binary)
 
-        print("\n[9] Detecting doors...")
+        logger.info("[9] Detecting doors...")
         doors = self._detect_doors(walls, binary)
 
-        print("\n[10] Creating annotation...")
+        logger.info("[10] Creating annotation...")
         annotated = self._annotate(img, walls, doors, wall_mask)
 
         if output_path is None:
             output_path = image_path.rsplit('.', 1)[0] + '_annotated.png'
         cv2.imwrite(output_path, annotated)
-        print(f"\n  Saved: {output_path}")
+        logger.info("  Saved: %s", output_path)
 
         # ── Compile all debug images into one grid ──────────────
-        print("\n[11] Compiling debug grid...")
+        logger.info("[11] Compiling debug grid...")
         self.dbg.compile_grid(
             output_filename="debug_grid.png",
             thumb_w=400,
@@ -1189,9 +1192,7 @@ class FloorplanDetector:
             cols=4,
         )
 
-        print(f"\n{'=' * 60}")
-        print(f"RESULTS: {len(walls)} walls, {len(doors)} doors")
-        print(f"{'=' * 60}")
+        logger.info("RESULTS: %d walls, %d doors", len(walls), len(doors))
 
         return {'walls': walls, 'doors': doors, 'annotated_image': annotated, 'wall_mask': wall_mask}
 

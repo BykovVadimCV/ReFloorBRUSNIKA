@@ -1167,32 +1167,23 @@ def display_results(
 # Reusable pipeline entry point (called from pipeline.py)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-_cached_model = None
-_cached_ckpt_path = None
-_cached_device = None
+# Dict-based cache: key = (checkpoint_path, str(device))
+# Allows epoch_20 and epoch_040 to coexist without evicting each other.
+_model_cache: dict = {}
 
 
 def _get_or_load_model(checkpoint_path: str, device: torch.device):
     """Load model once and cache it for subsequent calls."""
-    global _cached_model, _cached_ckpt_path, _cached_device
-    if (_cached_model is not None
-            and _cached_ckpt_path == checkpoint_path
-            and _cached_device == device):
-        return _cached_model
-    model, _num_classes = build_model_from_checkpoint(checkpoint_path, device)
-    model = model.to(device)
-    _cached_model = model
-    _cached_ckpt_path = checkpoint_path
-    _cached_device = device
-    return model
+    key = (checkpoint_path, str(device))
+    if key not in _model_cache:
+        model, _num_classes = build_model_from_checkpoint(checkpoint_path, device)
+        _model_cache[key] = model.to(device)
+    return _model_cache[key]
 
 
 def release_model():
-    """Free the cached U-Net model to reclaim RAM."""
-    global _cached_model, _cached_ckpt_path, _cached_device
-    _cached_model = None
-    _cached_ckpt_path = None
-    _cached_device = None
+    """Free all cached U-Net models to reclaim RAM."""
+    _model_cache.clear()
     import gc
     gc.collect()
     if torch.cuda.is_available():

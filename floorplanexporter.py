@@ -575,14 +575,18 @@ class DebugVisualizer:
 
     @staticmethod
     def _is_numeric(text: str) -> bool:
-        cleaned = text.strip().replace(',', '.').replace(' ', '')
-        if not cleaned:
-            return False
         try:
-            float(cleaned)
-            return True
-        except ValueError:
-            return False
+            from core.ocr_utils import is_numeric_ocr_label
+            return is_numeric_ocr_label(text)
+        except ImportError:
+            cleaned = text.strip().replace(',', '.').replace(' ', '')
+            if not cleaned:
+                return False
+            try:
+                float(cleaned)
+                return True
+            except ValueError:
+                return False
 
 
 # ============================================================
@@ -1469,10 +1473,24 @@ class SweetHome3DExporter:
         self._door_placement_debug: List[dict] = []
         to_remove: set = set()
 
+        # Sources that were already precisely snapped upstream — skip re-snapping
+        # to avoid fighting with the gap-based placement from UNetDoorDetector
+        # or AlgorithmicDoorArcDetector.
+        _confident_sources: frozenset = frozenset({"unet_door", "arc"})
+
+        # Build a quick lookup: opening_wall id → source string
+        _ow_sources: dict = {}
+        for op in openings:
+            if op.parent_wall_id:
+                _ow_sources.setdefault(op.parent_wall_id, op.source or "")
+
         # Proximity limit: 50 image-pixels converted to cm
         PROXIMITY_CM = 50.0 * s
 
         for ow in opening_walls:
+            # Skip walls whose opening was already placed by a confident source
+            if _ow_sources.get(ow.wall_id, "") in _confident_sources:
+                continue
             if ow.length < 0.1:
                 continue
             _orig = (ow.start.x, ow.start.y, ow.end.x, ow.end.y)
