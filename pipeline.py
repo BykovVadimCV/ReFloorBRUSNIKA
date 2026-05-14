@@ -1656,7 +1656,7 @@ class FloorplanPipeline:
                 result.rooms = rooms
                 result.sh3d_path = sh3d_path if os.path.exists(sh3d_path) else None
 
-        # ── Stage 4c: Room area validation ────────────────────────────────
+        # ── Stage 4c: Room area validation (diagnostic only) ──────────────
         if result.rooms and ocr_text_labels:
             result.room_area_reports = _validate_room_areas(
                 rooms=result.rooms,
@@ -1670,26 +1670,11 @@ class FloorplanPipeline:
                     1 for r in result.room_area_reports
                     if r.get("status") == "mismatch"
                 )
-                _mismatch_ratio = _n_mismatch / len(result.room_area_reports)
-                if _mismatch_ratio >= 0.30:
-                    logger.error(
-                        "[%s] Stage 4c: %d/%d rooms fail area validation "
-                        "(≥30%% threshold) — scale calibration may be wrong. "
-                        "Renaming output to *.LOW_CONFIDENCE.sh3d",
+                if _n_mismatch:
+                    logger.info(
+                        "[%s] Stage 4c: %d/%d rooms have area mismatch",
                         base_name, _n_mismatch, len(result.room_area_reports),
                     )
-                    if result.sh3d_path and os.path.exists(result.sh3d_path):
-                        _lc_path = result.sh3d_path.replace(
-                            ".sh3d", ".LOW_CONFIDENCE.sh3d"
-                        )
-                        try:
-                            os.rename(result.sh3d_path, _lc_path)
-                            result.sh3d_path = _lc_path
-                        except OSError as _re:
-                            logger.warning(
-                                "[%s] Could not rename SH3D to low-confidence: %s",
-                                base_name, _re,
-                            )
 
         # ── Stage 5: Visualization ─────────────────────────────────────
         _notify("rendering")
