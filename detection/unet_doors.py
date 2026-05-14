@@ -522,7 +522,7 @@ class UNetDoorDetector:
         ckpt_path: str = "weights/epoch_040.pth",
         img_size: int = 1024,
         confidence: float = 0.5,
-        min_door_area: int = 300,
+        min_door_area: int = 600,
         match_margin: int = 40,
         device: Optional[str] = None,
         # Rect decomposition
@@ -540,8 +540,8 @@ class UNetDoorDetector:
         wall_band_ratio: float = 0.50,
         min_wall_band_px: int = 5,
         # Post-decompose validity
-        min_piece_area: int = 200,
-        min_piece_thickness_px: int = 12,
+        min_piece_area: int = 400,
+        min_piece_thickness_px: int = 18,
     ) -> None:
         self.ckpt_path = ckpt_path
         self.img_size = img_size
@@ -650,7 +650,7 @@ class UNetDoorDetector:
         # spurious predictions inside rooms are suppressed.
         door_mask = _refine_door_mask_by_enclosed_spaces(
             door_mask, img_bgr, ocr_bboxes,
-            door_overlap_threshold=0.50,
+            door_overlap_threshold=0.75,
         )
 
         blobs = _extract_door_blobs(door_mask, min_area=self.min_door_area)

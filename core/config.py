@@ -248,7 +248,7 @@ class PipelineConfig:
 
     # Minimum areas for U-Net bbox extraction
     unet_min_wall_area: int = 100
-    unet_min_door_area: int = 300
+    unet_min_door_area: int = 600
     unet_min_window_area: int = 300
 
     # Gap-snap search margin for U-Net door bboxes (pixels)

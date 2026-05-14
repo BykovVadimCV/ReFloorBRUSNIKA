@@ -1062,15 +1062,15 @@ class RoomDetector:
     # ---- flood-fill exterior, then interior = rooms ----
     def _extract_interior(self, mask: np.ndarray) -> np.ndarray:
         h, w = mask.shape
-        # Aggressively close micro-gaps before flood-fill so that small breaks
-        # in wall rasters don't leak exterior into room interiors.
-        # Two passes: a small close (single-pixel gaps) then a larger one
-        # (2-pixel gaps at junction corners) with the original subtracted back
-        # so we don't over-shrink rooms.
-        k3 = np.ones((3, 3), dtype=np.uint8)
+        # Close wall-raster gaps before flood-fill so exterior doesn't leak in.
+        # Two passes: medium close (2-px gaps), then larger close (3-px gaps at
+        # junctions).  Union with original preserves existing wall pixels.
+        # min_room_area_cm2 in _components_to_rooms filters any false rooms
+        # that survive after the larger close.
         k5 = np.ones((5, 5), dtype=np.uint8)
-        sealed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k3, iterations=1)
-        sealed = cv2.morphologyEx(sealed, cv2.MORPH_CLOSE, k5, iterations=2)
+        k7 = np.ones((7, 7), dtype=np.uint8)
+        sealed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k5, iterations=1)
+        sealed = cv2.morphologyEx(sealed, cv2.MORPH_CLOSE, k7, iterations=2)
         # Union with original so no wall pixels are lost
         sealed = cv2.bitwise_or(sealed, mask)
 
