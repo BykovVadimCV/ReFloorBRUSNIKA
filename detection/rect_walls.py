@@ -214,34 +214,45 @@ def _dist(p: Tuple[float, float], q: Tuple[float, float]) -> float:
 def snap_collinear_endpoints(
     infos: List[_RectInfo],
     *,
-    snap_gap_factor: float = DEFAULT_SNAP_GAP_FACTOR,
-    snap_gap_floor:  float = DEFAULT_SNAP_GAP_FLOOR,
-    snap_angle_deg:  float = DEFAULT_SNAP_ANGLE_DEG,
+    snap_gap_factor:    float = DEFAULT_SNAP_GAP_FACTOR,
+    snap_gap_floor:     float = DEFAULT_SNAP_GAP_FLOOR,
+    snap_angle_deg:     float = DEFAULT_SNAP_ANGLE_DEG,
+    max_extend_frac:    float = 0.10,
 ) -> None:
     """
-    For every pair of rectangles whose centerline angles agree to within
-    ``snap_angle_deg`` and whose nearest endpoints are within a small gap,
-    move both endpoints to their lines' intersection.  Modifies ``infos``
-    in place — widths are NOT changed, only endpoints are shifted.
+    Extend wall endpoints at corners / T-junctions to close the perimeter.
 
-    Handles:
-        - Parallel walls that don't quite touch  →  meet at common point
-        - T-junctions where one wall's tip lands on the other's centerline
-        - Corners where two walls meet at ~90°
+    Rules
+    -----
+    * Each rect_decompose rectangle remains its own independent wall — parallel
+      walls (angle difference ≤ snap_angle_deg) are NEVER merged or moved
+      toward each other.
+    * Only walls that meet at a genuine angle (corner / T-junction) are
+      eligible for snapping.
+    * Even then, each endpoint may only move by at most ``max_extend_frac``
+      of that wall's own length (default 10%).  Larger shifts are rejected.
+    * Only endpoints whose raw gap is already within the threshold are touched;
+      the threshold is small (factor × thickness, floor-capped) so only
+      near-misses at real junctions qualify.
+
+    Modifies ``infos`` in place — only endpoint coordinates are shifted,
+    wall thickness is never changed.
     """
     n = len(infos)
     for i in range(n):
-        a = infos[i]
+        a     = infos[i]
+        len_a = _dist(a.p1, a.p2)
         gap_a = max(snap_gap_floor, snap_gap_factor * a.thickness)
 
         for j in range(n):
             if i == j:
                 continue
-            b = infos[j]
+            b     = infos[j]
+            len_b = _dist(b.p1, b.p2)
             gap_b = max(snap_gap_floor, snap_gap_factor * b.thickness)
             gap_thr = max(gap_a, gap_b)
 
-            # Find the closest endpoint pair (a_endpoint, b_endpoint)
+            # Find the closest endpoint pair
             pairs = [
                 ('p1', a.p1, 'p1', b.p1),
                 ('p1', a.p1, 'p2', b.p2),
@@ -249,25 +260,35 @@ def snap_collinear_endpoints(
                 ('p2', a.p2, 'p2', b.p2),
             ]
             ka, pa, kb, pb = min(pairs, key=lambda t: _dist(t[1], t[3]))
-            d = _dist(pa, pb)
-            if d > gap_thr:
+            if _dist(pa, pb) > gap_thr:
                 continue
 
             adiff = _angle_dist(a.angle_deg, b.angle_deg)
 
+            # Parallel walls → merging is forbidden; skip entirely.
             if adiff <= snap_angle_deg:
-                # Nearly parallel — snap both to the midpoint of pa,pb
-                meet = ((pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0)
-            else:
-                # Different angles — find true line intersection
-                meet = _line_intersection(a.p1, a.p2, b.p1, b.p2)
-                if meet is None:
-                    continue
-                # Sanity: the intersection must be near both endpoints,
-                # otherwise we'd snap to a point far from where the walls
-                # actually live.
-                if _dist(meet, pa) > gap_thr * 2.5 or _dist(meet, pb) > gap_thr * 2.5:
-                    continue
+                continue
+
+            # Corner / T-junction: extend both endpoints to the line
+            # intersection so the perimeter closes cleanly.
+            meet = _line_intersection(a.p1, a.p2, b.p1, b.p2)
+            if meet is None:
+                continue
+
+            # The intersection must sit near both endpoints (not far away on
+            # the infinite line extension).
+            if _dist(meet, pa) > gap_thr * 2.5 or _dist(meet, pb) > gap_thr * 2.5:
+                continue
+
+            # Hard limit: each wall may be extended by at most
+            # max_extend_frac of its own length (default 10%).
+            # This prevents long-range endpoint teleportation.
+            ext_a = _dist(pa, meet)
+            ext_b = _dist(pb, meet)
+            if len_a > 0 and ext_a > max_extend_frac * len_a:
+                continue
+            if len_b > 0 and ext_b > max_extend_frac * len_b:
+                continue
 
             # Apply the shift
             if ka == 'p1':
@@ -1143,6 +1164,29 @@ class RectWallDetector:
             except Exception as _fe:
                 logger.warning("apply_door_text_filter failed (%s) — skipping", _fe)
 
+        # ── 1d. Skeleton-based pipe-end capping on filtered wall mask ─────
+        # Mirrors test_cap.py: after the door/text filter, run the same
+        # find_caps → apply_caps pass on the final wall mask so open pipe
+        # ends are sealed before rect_decompose.
+        try:
+            _sk_caps = find_caps(
+                wall_mask,
+                min_wall_len   = 30,
+                max_pipe_width = 50,
+                min_pipe_r     = 3.0,
+                look_ahead     = 80,
+                local_steps    = 15,
+                merge_radius   = 6,
+            )
+            if _sk_caps:
+                wall_mask = apply_caps(wall_mask, _sk_caps)
+                logger.info(
+                    "Skeleton cap step: %d open pipe end(s) sealed on filtered mask",
+                    len(_sk_caps),
+                )
+        except Exception as _sce:
+            logger.warning("Skeleton cap step failed (%s) — skipping", _sce)
+
         # ── 2. Diagonal-presence test ──────────────────────────────────
         axis_tol  = getattr(cfg, "rect_axis_tol_deg",      DEFAULT_AXIS_TOL_DEG)
         diag_thr  = getattr(cfg, "rect_diag_lsd_ratio",    DEFAULT_DIAG_LSD_RATIO)
@@ -1310,9 +1354,10 @@ class RectWallDetector:
 
         snap_collinear_endpoints(
             infos,
-            snap_gap_factor = getattr(cfg, "rect_snap_gap_factor", DEFAULT_SNAP_GAP_FACTOR),
-            snap_gap_floor  = getattr(cfg, "rect_snap_gap_floor",  DEFAULT_SNAP_GAP_FLOOR),
-            snap_angle_deg  = getattr(cfg, "rect_snap_angle_deg",  DEFAULT_SNAP_ANGLE_DEG),
+            snap_gap_factor  = getattr(cfg, "rect_snap_gap_factor",      DEFAULT_SNAP_GAP_FACTOR),
+            snap_gap_floor   = getattr(cfg, "rect_snap_gap_floor",        DEFAULT_SNAP_GAP_FLOOR),
+            snap_angle_deg   = getattr(cfg, "rect_snap_angle_deg",        DEFAULT_SNAP_ANGLE_DEG),
+            max_extend_frac  = getattr(cfg, "rect_snap_max_extend_frac",  0.10),
         )
 
         # ── 5. WallSegments ────────────────────────────────────────────

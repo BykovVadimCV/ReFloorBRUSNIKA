@@ -341,10 +341,11 @@ class PipelineConfig:
     rect_axis_gap:             float = 0.0
     rect_max_overlap:          float = 1.0
 
-    # Endpoint snapping (extends collinear walls to meet)
-    rect_snap_gap_factor: float = 2.0    # gap ≤ factor × max_thickness
-    rect_snap_gap_floor:  float = 6.0    # but never below this many pixels
-    rect_snap_angle_deg:  float = 5.0    # rectangles must agree within this angle
+    # Endpoint snapping (tiny nudge to close perimeter — NOT wall merging)
+    rect_snap_gap_factor:       float = 0.3   # gap ≤ factor × thickness (was 2.0)
+    rect_snap_gap_floor:        float = 5.0   # but never below this many pixels
+    rect_snap_angle_deg:        float = 5.0   # walls within this angle are "parallel" → skip
+    rect_snap_max_extend_frac:  float = 0.10  # max endpoint shift as fraction of wall length
 
     # Hard spill cap: any candidate rect whose non-wall-pixel fraction exceeds
     # this is rejected regardless of its score.  0.02 = max 2% bleed (noise only).
@@ -358,8 +359,8 @@ class PipelineConfig:
 
     # Enclosed-space refinement: fraction of an enclosed region's pixels that
     # must overlap the wall mask for the region to be filled as wall.
-    # 0.50 = at least half the enclosed region must already be wall pixels.
-    rect_enclosed_overlap_threshold: float = 0.50
+    # 0.25 matches test_cap.py default (was 0.50).
+    rect_enclosed_overlap_threshold: float = 0.25
 
     # Door + OCR-text wall-mask filter (mirrors test_cap.py)
     # When True, after the cap step the wall mask is filtered to remove
