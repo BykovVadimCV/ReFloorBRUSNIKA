@@ -312,13 +312,6 @@ class PipelineConfig:
     room_area_tolerance_ratio: float = 0.30
     room_gap_close_max_cm: float = 15.0
 
-    # Fraction of U-Net wall mask pixels that must be non-white in the
-    # original image to classify walls as "solid" (filled) rather than
-    # "hollow" (double-line outlines).  When the fraction exceeds this
-    # threshold the grey-fill pipeline is skipped and direct color
-    # detection is used instead.  Range 0.0–1.0.
-    solid_wall_threshold: float = 0.50
-
     # ============================================================
     # RECTANGLE-DECOMPOSITION WALL DETECTION  (new pipeline)
     # ============================================================

@@ -625,19 +625,6 @@ def find_unenclosed_wall_rects(
     return results
 
 
-def paint_wall_rects_grey(
-    img_bgr: np.ndarray,
-    wall_rects: list,
-    grey_value: int = 180,
-) -> np.ndarray:
-    """Paint the wall rectangles grey on a copy of the image."""
-    result = img_bgr.copy()
-    for wr in wall_rects:
-        x1, y1, x2, y2 = wr["bbox"]
-        result[y1:y2, x1:x2] = grey_value
-    return result
-
-
 # ─────────────────────────────────────────────────────────────
 # Visualization
 # ─────────────────────────────────────────────────────────────
@@ -731,13 +718,11 @@ def process(
     n_after, labels_after = find_enclosed_regions_from_mask(bridged)
     print(f"  Enclosed regions after bridging: {n_after - 1}")
 
-    # 6. Find uncovered wall rectangles → grey
+    # 6. Find uncovered wall rectangles
     print("Extracting unenclosed wall rectangles (greedy largest-rect)...")
     wall_rects = find_unenclosed_wall_rects(
         wall_mask, bridged, min_area=min_blob_area,
         merge_gap=merge_gap, min_merged_area=min_merged_area)
-    grey_img = paint_wall_rects_grey(img_bgr, wall_rects, grey_value=180)
-    grey_rgb = cv2.cvtColor(grey_img, cv2.COLOR_BGR2RGB)
     total_grey_px = sum(wr["area"] for wr in wall_rects)
     print(f"  Found {len(wall_rects)} wall rectangles "
           f"({total_grey_px} px total)")
@@ -751,7 +736,7 @@ def process(
     fig.suptitle(
         f"Gap Bridging: {Path(input_path).name}\n"
         f"Before: {n_before-1} regions | After: {n_after-1} regions | "
-        f"{len(bridges)} bridge(s) | {len(wall_rects)} grey wall(s)",
+        f"{len(bridges)} bridge(s) | {len(wall_rects)} unenclosed wall rect(s)",
         fontsize=14, fontweight="bold"
     )
 
@@ -793,9 +778,9 @@ def process(
     axes[1, 2].imshow(blend(img_rgb, regions_after_rgb, 0.55))
     axes[1, 2].set_title(f"Enclosed — After ({n_after-1})")
 
-    # Row 3: Grey walls on image | Grey wall blobs highlighted | Final composite
-    axes[2, 0].imshow(grey_rgb)
-    axes[2, 0].set_title(f"Unenclosed Walls → Grey ({len(wall_rects)})")
+    # Row 3: Unenclosed wall rects | Highlighted | Final composite
+    axes[2, 0].imshow(img_rgb)
+    axes[2, 0].set_title(f"Original ({len(wall_rects)} unenclosed wall rects)")
 
     # Highlight the wall rects in magenta on original
     highlight = np.zeros((h, w, 3), dtype=np.uint8)
@@ -805,13 +790,11 @@ def process(
     axes[2, 1].imshow(blend(img_rgb, highlight, 0.7))
     axes[2, 1].set_title(f"Wall Rects (magenta, {len(wall_rects)})")
 
-    # Final composite: enclosed regions + grey walls + bridges
-    final = grey_rgb.copy()
-    # Draw bridges on the final image
+    # Final composite: enclosed regions + bridges on original
+    final = img_rgb.copy()
     for x1, y1, x2, y2 in bridges:
         cv2.line(final, (x1, y1), (x2, y2), (0, 0, 0),
                  thickness, cv2.LINE_AA)
-    # Overlay enclosed regions
     regions_after_rgb2 = colorize_regions(n_after, labels_after)
     final = blend(final, regions_after_rgb2, 0.35)
     axes[2, 2].imshow(final)

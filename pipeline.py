@@ -1199,11 +1199,9 @@ class FloorplanPipeline:
         del _raw_img
 
         # ── Pre-stage 0b: diagonal pre-processor ──────────────────────
-        # Receives the already-cropped image so it does not need to crop
-        # again.  Handles small-skew correction, OCR, U-Net, LSD
-        # clustering, deskewing, and painting diagonal walls grey.
-        # Writes the result to <input_dir>/deskewed/<basename>.
-        _notify("diagonal pre-processor (OCR + U-Net + deskew + paint)")
+        # Handles small-skew correction, OCR, U-Net, LSD clustering, and
+        # deskewing.  Writes the result to <input_dir>/deskewed/<basename>.
+        _notify("diagonal pre-processor (OCR + U-Net + deskew)")
         try:
             from detection.diagonal import preprocess_floorplan
         except Exception as _imp_exc:
@@ -1228,14 +1226,12 @@ class FloorplanPipeline:
         ocr_text_labels_early = list(diag.get("normal_labels")  or [])
         rotated_ocr_labels    = list(diag.get("rotated_labels") or [])
         deskew_angle          = diag.get("deskew_angle")
-        n_diag_painted        = int(diag.get("n_diagonal_painted") or 0)
 
         logger.info(
             "[%s] Pre-stage 0: deskewed_path=%s deskew=%s "
-            "diagonals_painted=%d normal_labels=%d rotated_labels=%d",
+            "normal_labels=%d rotated_labels=%d",
             base_name, deskewed_path,
             f"{deskew_angle:.3f}deg" if deskew_angle is not None else "none",
-            n_diag_painted,
             len(ocr_text_labels_early), len(rotated_ocr_labels),
         )
 
@@ -1393,15 +1389,15 @@ class FloorplanPipeline:
             unet_wall_mask, unet_door_bboxes, unet_window_bboxes = unet_detection
 
             # U-Net door/window bboxes are ALWAYS used for opening detection
-            # regardless of --enable-unet.  The wall pipeline (grey/hollow path)
-            # is only activated when --enable-unet is explicitly set.
+            # regardless of --enable-unet.  Wall detection from U-Net is only
+            # activated when --enable-unet is explicitly set.
             if not self.config.enable_unet:
                 logger.info(
                     "[%s] U-Net doors collected (%d doors, %d windows); "
-                    "grey-wall pipeline skipped (--enable-unet not set)",
+                    "U-Net wall pipeline skipped (--enable-unet not set)",
                     base_name, len(unet_door_bboxes), len(unet_window_bboxes),
                 )
-                unet_detection = None  # skip grey wall pipeline, keep door bboxes
+                unet_detection = None
 
         if _legacy_walls_active:
             # ── Stage 1 (fallback): colour-based wall detection ──────────
@@ -1414,11 +1410,6 @@ class FloorplanPipeline:
             result.wall_mask = detection.wall_mask
             result.outline_mask = detection.outline_mask
 
-        # Stage 1c (residual diagonal wall detection) is no longer needed:
-        # Pre-stage 0b (preprocess_floorplan) paints any non-axis-aligned
-        # walls / windows / doors as filled grey quads on the deskewed image
-        # before Stage 1 runs, so the colour / U-Net wall detector picks them
-        # up as ordinary axis-aligned walls.
 
         # ── Stage 2: Opening Detection (UNIFIED: gap + U-Net with deduplication) ─────
         _notify("detecting openings")

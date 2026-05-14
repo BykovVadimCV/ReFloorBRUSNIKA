@@ -26,7 +26,7 @@ from matplotlib.colors import hsv_to_rgb
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from detection.walls import _build_enclosed_regions, build_grey_wall_image
+from detection.walls import _build_enclosed_regions
 
 
 def make_region_colormap(num_labels: int, labels: np.ndarray,
@@ -183,25 +183,6 @@ def main():
 
     plt.tight_layout()
     plt.show()
-
-    # 4. Generate grey wall image if U-Net was run
-    if has_unet:
-        grey_img = build_grey_wall_image(
-            img_bgr, labels, num_labels, wall_mask,
-            black_threshold=args.black_threshold,
-        )
-        out_path = os.path.splitext(args.image)[0] + "_grey_walls.png"
-        cv2.imwrite(out_path, grey_img)
-        print(f"Grey wall image saved: {out_path}")
-
-        # Show it
-        fig2, ax2 = plt.subplots(1, 1, figsize=(8, 10))
-        ax2.imshow(cv2.cvtColor(grey_img, cv2.COLOR_BGR2RGB))
-        ax2.set_title("Grey Wall Image (input for color-based detector)")
-        ax2.axis("off")
-        plt.tight_layout()
-        plt.show()
-
 
 if __name__ == "__main__":
     main()

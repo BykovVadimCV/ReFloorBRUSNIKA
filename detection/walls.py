@@ -118,61 +118,6 @@ def refine_wall_mask_by_enclosed_regions(
     return refined
 
 
-def build_grey_wall_image(
-    original_bgr: np.ndarray,
-    labels: np.ndarray,
-    num_labels: int,
-    wall_mask: np.ndarray,
-    coverage_threshold: float = 0.50,
-    min_region_area: int = 50,
-    grey_value: int = 160,
-    black_threshold: int = 60,
-    expand_px: int = 2,
-) -> np.ndarray:
-    """Build a clean grey image: wall regions filled grey, rest white.
-
-    For each enclosed region, checks U-Net wall mask coverage.
-    If >= threshold, the entire region is marked as wall.
-    Result: white canvas with grey wall fills + original black outlines.
-    Ready for VersatileWallDetector in color mode.
-    """
-    h, w = original_bgr.shape[:2]
-    wall_bin = wall_mask > 0
-
-    # Vote per region
-    wall_region_mask = np.zeros((h, w), dtype=np.uint8)
-    for label_id in range(1, num_labels):
-        region = labels == label_id
-        area = int(np.sum(region))
-        if area < min_region_area:
-            continue
-        coverage = int(np.sum(wall_bin & region)) / area
-        if coverage >= coverage_threshold:
-            wall_region_mask[region] = 255
-
-    # Expand wall regions to cover outline edges
-    if expand_px > 0:
-        kernel = np.ones((2 * expand_px + 1, 2 * expand_px + 1), np.uint8)
-        wall_region_mask = cv2.dilate(wall_region_mask, kernel, iterations=1)
-
-    # White canvas, fill walls grey
-    out = np.full((h, w, 3), 255, dtype=np.uint8)
-    out[wall_region_mask > 0] = grey_value
-
-    # Re-draw original black outlines on top
-    if len(original_bgr.shape) == 3:
-        gray = cv2.cvtColor(original_bgr, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = original_bgr
-    black_pixels = gray < black_threshold
-    if len(original_bgr.shape) == 3:
-        out[black_pixels] = original_bgr[black_pixels]
-    else:
-        out[black_pixels] = gray[black_pixels][:, None]
-
-    return out
-
-
 def debug_enclosed_regions(
     original_img: np.ndarray,
     wall_mask: np.ndarray,
@@ -633,29 +578,6 @@ def find_unenclosed_wall_rects(
     return merged
 
 
-def paint_unenclosed_walls_grey(
-    grey_img: np.ndarray,
-    rects: List[Tuple[int, int, int, int]],
-    grey_value: int = 160,
-    black_threshold: int = 60,
-) -> np.ndarray:
-    """Paint unenclosed wall rectangles grey, preserving black outlines."""
-    result = grey_img.copy()
-    if len(result.shape) == 3:
-        gray = cv2.cvtColor(result, cv2.COLOR_BGR2GRAY)
-    else:
-        gray = result
-    for x1, y1, x2, y2 in rects:
-        # Fill grey, but preserve existing black outline pixels
-        roi = gray[y1:y2, x1:x2]
-        not_black = roi >= black_threshold
-        if len(result.shape) == 3:
-            result[y1:y2, x1:x2][not_black] = grey_value
-        else:
-            result[y1:y2, x1:x2][not_black] = grey_value
-    return result
-
-
 def detect_dominant_wall_color(image: np.ndarray) -> Tuple[int, int, int]:
     """
     Detect the dominant wall color in a floorplan image using K-means
@@ -799,31 +721,6 @@ class ColorWallDetector(WallDetector):
             wall_mask=wall_mask,
             outline_mask=outline_mask,
             source=self.name,
-        )
-
-    def detect_with_color(
-        self,
-        image: np.ndarray,
-        wall_rgb: Tuple[int, int, int],
-    ) -> DetectionResult:
-        """Run wall detection with a forced wall color (no auto-detection).
-
-        Used for the grey-image pipeline where wall color is known (160,160,160).
-        """
-        inner = self._ensure_inner()
-        inner.wall_rgb = wall_rgb
-        inner.auto_wall_color = True  # use wider-tolerance path
-
-        wall_mask, rectangles, outline_mask = inner.process(image)
-        self._last_rectangles = rectangles
-        walls = [wall_rectangle_to_segment(r) for r in rectangles]
-
-        return DetectionResult(
-            walls=walls,
-            openings=[],
-            wall_mask=wall_mask,
-            outline_mask=outline_mask,
-            source="unet_grey_wall_detector",
         )
 
     @property

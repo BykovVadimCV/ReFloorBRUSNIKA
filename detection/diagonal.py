@@ -61,8 +61,6 @@ logger = logging.getLogger(__name__)
 # Tunable constants
 # ---------------------------------------------------------------------------
 
-GREY_BGR: Tuple[int, int, int] = (180, 180, 180)   # painted-diagonal colour
-
 LSD_MIN_LEN_PX: float       = 30.0
 AXIS_TOL_DEG: float         = 15.0      # |dev from H/V| ≥ this ⇒ diagonal
 CLUSTER_TOL_DEG: float      = 5.0       # angular merge threshold
@@ -492,94 +490,6 @@ def _transform_labels(labels: List[Tuple], M: np.ndarray) -> List[Tuple]:
 
 
 # ---------------------------------------------------------------------------
-# Diagonal painting
-# ---------------------------------------------------------------------------
-
-def _paint_diagonal_clusters(
-    img: np.ndarray,
-    pred_mask: np.ndarray,
-    clusters: List[Dict],
-    grey: Tuple[int, int, int] = GREY_BGR,
-    padding: int = DIAG_PATCH_PAD_PX,
-    min_area: int = DIAG_MIN_COMPONENT_AREA,
-) -> int:
-    """
-    Paint each diagonal cluster's wall / window / door region as a filled
-    grey quadrilateral on `img`, in place.
-
-    Returns the number of quads painted.
-    """
-    if pred_mask is None or img is None or not clusters:
-        return 0
-    H, W = img.shape[:2]
-    n_painted = 0
-    DIAG_CLASSES = (1, 2, 3)   # 1 wall, 2 window, 3 door — all become grey
-
-    for cluster in clusters:
-        if not cluster.get('is_diagonal', False):
-            continue
-        members = cluster.get('members') or []
-        if not members:
-            continue
-
-        xs: List[float] = []
-        ys: List[float] = []
-        for s in members:
-            xs.extend([s['x1'], s['x2']])
-            ys.extend([s['y1'], s['y2']])
-        bx1 = max(0, int(min(xs)) - padding)
-        by1 = max(0, int(min(ys)) - padding)
-        bx2 = min(W, int(max(xs)) + padding)
-        by2 = min(H, int(max(ys)) + padding)
-        if bx2 - bx1 < 4 or by2 - by1 < 4:
-            continue
-
-        crop = pred_mask[by1:by2, bx1:bx2]
-        ch, cw = crop.shape[:2]
-
-        rot_angle = float(cluster['cluster_angle'])
-        cx, cy = cw / 2.0, ch / 2.0
-        Mr = cv2.getRotationMatrix2D((cx, cy), rot_angle, 1.0)
-        cos_a = abs(math.cos(math.radians(rot_angle)))
-        sin_a = abs(math.sin(math.radians(rot_angle)))
-        new_w = int(math.ceil(ch * sin_a + cw * cos_a))
-        new_h = int(math.ceil(ch * cos_a + cw * sin_a))
-        Mr[0, 2] += (new_w - cw) / 2.0
-        Mr[1, 2] += (new_h - ch) / 2.0
-        rot = cv2.warpAffine(crop, Mr, (new_w, new_h),
-                              flags=cv2.INTER_NEAREST,
-                              borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        Mr_inv = cv2.invertAffineTransform(Mr)
-
-        for cls in DIAG_CLASSES:
-            class_mask = (rot == cls).astype(np.uint8)
-            if class_mask.sum() == 0:
-                continue
-            n_cc, _lbls, stats, _ = cv2.connectedComponentsWithStats(class_mask, 8)
-            for i in range(1, n_cc):
-                area = int(stats[i, cv2.CC_STAT_AREA])
-                if area < min_area:
-                    continue
-                rx = int(stats[i, cv2.CC_STAT_LEFT])
-                ry = int(stats[i, cv2.CC_STAT_TOP])
-                rw = int(stats[i, cv2.CC_STAT_WIDTH])
-                rh = int(stats[i, cv2.CC_STAT_HEIGHT])
-
-                corners_rot = np.array([
-                    [rx,      ry     ],
-                    [rx + rw, ry     ],
-                    [rx + rw, ry + rh],
-                    [rx,      ry + rh],
-                ], dtype=np.float32)
-                corners_crop = _transform_pts(Mr_inv, corners_rot)
-                corners_img  = corners_crop + np.array([bx1, by1], dtype=np.float32)
-
-                cv2.fillPoly(img, [corners_img.astype(np.int32)], grey)
-                n_painted += 1
-    return n_painted
-
-
-# ---------------------------------------------------------------------------
 # U-Net wrapper
 # ---------------------------------------------------------------------------
 
@@ -611,14 +521,13 @@ def preprocess_floorplan(
     image_path: str,
     unet_ckpt_path: str = UNET_DEFAULT_CKPT,
     output_dir: Optional[str] = None,
-    grey: Tuple[int, int, int] = GREY_BGR,
     *,
     _preloaded_img: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Run the full pre-processing pipeline on the floorplan at *image_path*.
 
-    Output: writes a deskewed / text-erased / diagonal-painted PNG to
+    Output: writes a deskewed / text-erased PNG to
     ``<output_dir>/<basename>`` (defaults to ``<input_dir>/deskewed/``)
     and returns:
 
@@ -627,7 +536,6 @@ def preprocess_floorplan(
           "normal_labels": [(text,x1,y1,x2,y2), ...],   # in deskewed coords
           "rotated_labels": [(text,x1,y1,x2,y2), ...],  # in deskewed coords
           "deskew_angle":  Optional[float],  # CCW degrees, or None
-          "n_diagonal_painted": int,
           "image_shape":   (H, W),
         }
 
@@ -669,12 +577,11 @@ def preprocess_floorplan(
                        base)
         cv2.imwrite(out_path, img)
         return {
-            "deskewed_path":      out_path,
-            "normal_labels":      normal_labels,
-            "rotated_labels":     rotated_labels,
-            "deskew_angle":       None,
-            "n_diagonal_painted": 0,
-            "image_shape":        (img.shape[0], img.shape[1]),
+            "deskewed_path":  out_path,
+            "normal_labels":  normal_labels,
+            "rotated_labels": rotated_labels,
+            "deskew_angle":   None,
+            "image_shape":    (img.shape[0], img.shape[1]),
         }
 
     wall_mask = unet['wall_mask']
@@ -702,20 +609,15 @@ def preprocess_floorplan(
                     base, deskew, angle_source)
 
     if deskew is None:
-        # No tilt detected — still scan for residual diagonals to paint.
         out_img = img.copy()
-        n_painted = _paint_diagonal_clusters(out_img, pred_mask, clusters,
-                                              grey=grey)
         cv2.imwrite(out_path, out_img)
-        logger.info("[diagonal:%s] no deskew needed; %d diagonal patches painted",
-                    base, n_painted)
+        logger.info("[diagonal:%s] no deskew needed", base)
         return {
-            "deskewed_path":      out_path,
-            "normal_labels":      normal_labels,
-            "rotated_labels":     rotated_labels,
-            "deskew_angle":       None,
-            "n_diagonal_painted": n_painted,
-            "image_shape":        (out_img.shape[0], out_img.shape[1]),
+            "deskewed_path":  out_path,
+            "normal_labels":  normal_labels,
+            "rotated_labels": rotated_labels,
+            "deskew_angle":   None,
+            "image_shape":    (out_img.shape[0], out_img.shape[1]),
         }
 
     # 9. Rotate everything through M
@@ -727,30 +629,17 @@ def preprocess_floorplan(
     normal_labels  = _transform_labels(normal_labels,  M)
     rotated_labels = _transform_labels(rotated_labels, M)
 
-    # 10. Find residual diagonals on the rotated image
-    img_desk_clean = _erase_text(img_desk, [normal_labels, rotated_labels])
-    gray_desk = cv2.cvtColor(img_desk_clean, cv2.COLOR_BGR2GRAY)
-    segs_d = _run_lsd(gray_desk)
-    segs_d = _filter_segments_by_mask(segs_d, wall_desk)
-    clusters_d = _cluster_segments(segs_d)
-
-    # 11. Paint residual diagonals on the rotated image
-    n_painted = _paint_diagonal_clusters(img_desk, pred_desk, clusters_d,
-                                          grey=grey)
-
-    # 12. Save
+    # 10. Save deskewed image
     cv2.imwrite(out_path, img_desk)
-    logger.info("[diagonal:%s] deskewed by %.3f deg (from %s), "
-                "%d diagonal patches painted → %s",
-                base, deskew, angle_source, n_painted, out_path)
+    logger.info("[diagonal:%s] deskewed by %.3f deg (from %s) → %s",
+                base, deskew, angle_source, out_path)
 
     return {
-        "deskewed_path":      out_path,
-        "normal_labels":      normal_labels,
-        "rotated_labels":     rotated_labels,
-        "deskew_angle":       deskew,
-        "n_diagonal_painted": n_painted,
-        "image_shape":        (img_desk.shape[0], img_desk.shape[1]),
+        "deskewed_path":  out_path,
+        "normal_labels":  normal_labels,
+        "rotated_labels": rotated_labels,
+        "deskew_angle":   deskew,
+        "image_shape":    (img_desk.shape[0], img_desk.shape[1]),
     }
 
 
