@@ -353,7 +353,7 @@ class PipelineConfig:
     # Cap (morph-close) kernel size applied to the raw U-Net wall mask
     # before enclosed-space analysis and rect decomposition.  Bridges small
     # gaps in wall coverage so the decomposer sees a connected mask.
-    rect_cap_kernel_size: int = 5
+    rect_cap_kernel_size: int = 9
     rect_cap_iters:       int = 2
 
     # Enclosed-space refinement: fraction of an enclosed region's pixels that
