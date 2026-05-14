@@ -32,6 +32,7 @@ have ``is_diagonal=True`` and carry their two centerline endpoints in
 from __future__ import annotations
 
 import contextlib
+import datetime
 import io
 import logging
 import math
@@ -1070,86 +1071,176 @@ class RectWallDetector:
         log_file_path: Optional[str] = None,
     ) -> DetectionResult:
         """
-        Detect walls in ``img_bgr``.  If ``wall_mask`` is supplied it is used
-        directly; otherwise the binary U-Net is invoked.
+        Detect walls in ``img_bgr``.
 
-        Parameters
-        ----------
-        img_bgr       : BGR image (text regions ideally already erased).
-        wall_mask     : optional pre-computed binary wall mask; if None the
-                        U-Net checkpoint is used.
-        ocr_bboxes    : list of ``(x1, y1, x2, y2)`` or ``(text, x1, y1, x2, y2)``
-                        bounding boxes for OCR text regions.  Used by the
-                        enclosed-space refinement step to distinguish rooms
-                        (labelled) from structural cavities (unlabelled).
-        log_file_path : optional path for an exhaustive rect-decompose log
-                        file.  All decompose parameters, rd.decompose verbose
-                        output, per-rect stats, and final coverage are written
-                        there.  Does not affect any return values.
+        A full pipeline log is always written to a file.  The path is chosen
+        as (in priority order):
+
+            1. ``log_file_path`` if explicitly given
+            2. Stem of ``debug_img_path`` + ``_rect_walls.log``
+            3. ``rect_walls_detect.log`` in the current working directory
         """
-        cfg = self.config
-        H, W = img_bgr.shape[:2]
+        cfg   = self.config
+        H, W  = img_bgr.shape[:2]
+        total_px = H * W
 
-        # ── 1. Raw wall mask (U-Net) ───────────────────────────────────
+        # ── Logging helpers ────────────────────────────────────────────
+        _ts  = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _LL: List[str] = []
+
+        def _L(msg: str, *args) -> None:
+            line = (msg % args) if args else msg
+            _LL.append(line + "\n")
+            logger.info(line)
+
+        def _LS(title: str) -> None:
+            bar = "─" * 68
+            _LL.append(f"\n{bar}\n  {title}\n{bar}\n")
+
+        def _write_log() -> None:
+            lf = log_file_path
+            if not lf and debug_img_path:
+                lf = os.path.splitext(debug_img_path)[0] + "_rect_walls.log"
+            if not lf:
+                lf = "rect_walls_detect.log"
+            try:
+                with open(lf, "w", encoding="utf-8") as _f:
+                    _f.writelines(_LL)
+                logger.info("RectWallDetector: pipeline log → %s", lf)
+            except Exception as _we:
+                logger.warning("RectWallDetector: could not write log: %s", _we)
+
+        # ── Header ────────────────────────────────────────────────────
+        _LL.append("=" * 70 + "\n")
+        _LL.append("RECT WALL DETECTOR — FULL PIPELINE LOG\n")
+        _LL.append(f"  Run time  : {_ts}\n")
+        _LL.append(f"  Image     : {W} x {H} px  ({total_px:,} total pixels)\n")
+        _LL.append("=" * 70 + "\n")
+
+        # ── Config dump ───────────────────────────────────────────────
+        _LS("Configuration")
+        _L("  U-Net checkpoint (walls)   : %s",
+           getattr(cfg, "rect_unet_ckpt_path", "weights/epoch_20.pth"))
+        _L("  U-Net confidence threshold : %.2f",
+           getattr(cfg, "unet_confidence", 0.5))
+        _L("  enclosed_overlap_threshold : %.2f",
+           getattr(cfg, "rect_enclosed_overlap_threshold", 0.25))
+        _L("  morph-close cap            : k=%d  iters=%d",
+           getattr(cfg, "rect_cap_kernel_size", 9),
+           getattr(cfg, "rect_cap_iters", 2))
+        _L("  door+text filter           : enabled=%s  door_ckpt=%s",
+           getattr(cfg, "enable_wall_door_text_filter", True),
+           getattr(cfg, "unet_checkpoint_path", "weights/epoch_040.pth"))
+        _L("  rect_max_spill             : %.2f  (%.0f%% outside-mask tolerance)",
+           getattr(cfg, "rect_max_spill", 0.15),
+           getattr(cfg, "rect_max_spill", 0.15) * 100)
+        _L("  rect_coverage_stop         : %.2f  (stop at %.0f%% wall-px covered)",
+           getattr(cfg, "rect_coverage_stop", 0.93),
+           getattr(cfg, "rect_coverage_stop", 0.93) * 100)
+        _L("  rect_max_overlap           : %.2f",
+           getattr(cfg, "rect_max_overlap", 1.0))
+        _L("  bleed_weight / initial     : %.1f / %.1f  decay=%.1f",
+           getattr(cfg, "rect_bleed_weight", 15.0),
+           getattr(cfg, "rect_initial_bleed_weight", 15.0),
+           getattr(cfg, "rect_bleed_decay", 0.0))
+        _L("  snap  gap_factor=%.2f  floor=%.1f px  max_extend=%.0f%%",
+           getattr(cfg, "rect_snap_gap_factor", 0.3),
+           getattr(cfg, "rect_snap_gap_floor", 5.0),
+           getattr(cfg, "rect_snap_max_extend_frac", 0.10) * 100)
+        _L("  OCR bboxes supplied        : %d",
+           len(ocr_bboxes) if ocr_bboxes else 0)
+
+        # ── Stage 1: Raw wall mask ─────────────────────────────────────
+        _LS("Stage 1 — Raw wall mask (epoch_20 binary U-Net)")
         if wall_mask is None:
+            _L("  Source : running binary U-Net (%s)",
+               getattr(cfg, "rect_unet_ckpt_path", "weights/epoch_20.pth"))
             wall_mask = self._run_binary_unet(img_bgr)
+            if wall_mask is not None:
+                _n = int(np.count_nonzero(wall_mask))
+                _L("  Output : %d wall px / %d  (%.1f%%)",
+                   _n, total_px, 100.0 * _n / total_px)
+            else:
+                _L("  Output : None — U-Net failed to load or run")
+        else:
+            _n = int(np.count_nonzero(wall_mask))
+            _L("  Source : pre-supplied wall_mask  (%d px, %.1f%%)",
+               _n, 100.0 * _n / total_px)
 
         if wall_mask is None or int(np.count_nonzero(wall_mask)) == 0:
+            if wall_mask is None:
+                _L("  STOP: wall mask is None (U-Net checkpoint missing or inference error)")
+            else:
+                _L("  STOP: wall mask is entirely zero (U-Net found no wall pixels)")
+            _L("  → returning empty DetectionResult with 0 walls")
+            _write_log()
             logger.warning("RectWallDetector: empty wall mask — no walls returned")
             return DetectionResult(
                 walls=[], openings=[], wall_mask=wall_mask,
-                raw_wall_mask=wall_mask,
-                outline_mask=None, source="rect_walls",
+                raw_wall_mask=wall_mask, outline_mask=None, source="rect_walls",
             )
 
-        # Preserve the raw U-Net output for diagnostics / downstream code
-        # that may want to compare against post-processed masks.
         raw_wall_mask = wall_mask.copy()
+        _px_raw = int(np.count_nonzero(raw_wall_mask))
 
-        # ── 1a. Enclosed-space refinement ─────────────────────────────
-        # Identify enclosed white spaces in the image (rooms / structural
-        # cavities) and apply targeted fixes:
-        #   • Spaces with an OCR label inside → labelled room; clear stray
-        #     wall pixels so room boundaries are clean.
-        #   • Spaces without OCR label AND ≥overlap_thr wall-mask overlap →
-        #     structural cavity; fill entirely as wall.
-        overlap_thr = float(
-            getattr(cfg, "rect_enclosed_overlap_threshold", 0.50)
+        # ── Stage 1a: Enclosed-space refinement ───────────────────────
+        _LS("Stage 1a — Enclosed-space refinement")
+        overlap_thr = float(getattr(cfg, "rect_enclosed_overlap_threshold", 0.25))
+        _L("  overlap_threshold = %.2f", overlap_thr)
+        _L("  Logic: enclosed region with NO OCR label AND ≥%.0f%% wall overlap"
+           " → FILL as wall", overlap_thr * 100)
+        _L("         enclosed region with OCR label OR <%.0f%% wall overlap"
+           " → CLEAR to 0", overlap_thr * 100)
+        _ocr_numeric = sum(
+            1 for b in (ocr_bboxes or [])
+            if len(b) >= 5 and str(b[0]).replace(".", "").replace(",", "")
+                                      .replace(" ", "").replace("м²", "")
+                                      .replace("m²", "").strip().isdigit()
         )
+        _L("  OCR numeric labels (potential room markers): %d", _ocr_numeric)
         try:
+            _px_pre_refine = int(np.count_nonzero(wall_mask))
             wall_mask = refine_mask_by_enclosed_spaces(
                 wall_mask, img_bgr, ocr_bboxes,
                 wall_overlap_threshold=overlap_thr,
                 debug_img_path=debug_img_path,
             )
+            _px_post_refine = int(np.count_nonzero(wall_mask))
+            _delta_refine = _px_post_refine - _px_pre_refine
+            _L("  Before: %d px  →  After: %d px  (Δ %+d px)",
+               _px_pre_refine, _px_post_refine, _delta_refine)
+            if _delta_refine > 0:
+                _L("  Net GAIN: structural cavities enclosed by walls were filled")
+            elif _delta_refine < 0:
+                _L("  Net LOSS: open rooms / labelled regions were cleared")
+            else:
+                _L("  No change")
         except Exception as _rme:
-            logger.warning(
-                "refine_mask_by_enclosed_spaces failed (%s) — skipping", _rme
-            )
+            _L("  WARNING: refine_mask_by_enclosed_spaces FAILED (%s) — step skipped", _rme)
+            logger.warning("refine_mask_by_enclosed_spaces failed (%s) — skipping", _rme)
 
-        # ── 1b. Cap step — morphological close on the refined mask ────
-        # Bridges any remaining small gaps after enclosed-space refinement
-        # so rect_decompose sees connected wall material.
-        cap_k = max(1, int(getattr(cfg, "rect_cap_kernel_size", 5)))
+        # ── Stage 1b: Morphological close ─────────────────────────────
+        _LS("Stage 1b — Morphological close (bridge small gaps)")
+        cap_k = max(1, int(getattr(cfg, "rect_cap_kernel_size", 9)))
         cap_i = max(1, int(getattr(cfg, "rect_cap_iters", 2)))
         if cap_k > 1 and cap_i > 0:
+            _px_pre_morph = int(np.count_nonzero(wall_mask))
             kernel = np.ones((cap_k, cap_k), dtype=np.uint8)
             wall_mask = cv2.morphologyEx(
                 wall_mask, cv2.MORPH_CLOSE, kernel, iterations=cap_i,
             )
-            logger.info(
-                "Cap step (MORPH_CLOSE k=%d iters=%d): "
-                "%.1f%% wall pixels (was %.1f%% raw)",
-                cap_k, cap_i,
-                100.0 * int(np.count_nonzero(wall_mask)) / wall_mask.size,
-                100.0 * int(np.count_nonzero(raw_wall_mask)) / raw_wall_mask.size,
-            )
+            _px_post_morph = int(np.count_nonzero(wall_mask))
+            _L("  MORPH_CLOSE k=%d iters=%d: %d → %d px  (Δ +%d px)",
+               cap_k, cap_i, _px_pre_morph, _px_post_morph,
+               _px_post_morph - _px_pre_morph)
+            _L("  Effect: bridges gaps up to ~%d px wide inside wall regions", cap_k // 2)
+        else:
+            _L("  SKIPPED — cap_kernel_size=%d or cap_iters=%d too small", cap_k, cap_i)
 
-        # ── 1c. Door + OCR-text filter ────────────────────────────────
-        # Mirrors test_cap.py: removes door/window pixels (epoch_040, dilated,
-        # wall-pixels preserved) and OCR text bbox regions from the wall mask
-        # so rect_decompose does not chase walls through openings or text.
+        # ── Stage 1c: Door + OCR-text filter ──────────────────────────
+        _LS("Stage 1c — Door + OCR-text pixel exclusion")
         if getattr(cfg, "enable_wall_door_text_filter", True):
+            _px_pre_filt = int(np.count_nonzero(wall_mask))
             try:
                 wall_mask = apply_door_text_filter(
                     wall_mask, img_bgr, ocr_bboxes,
@@ -1161,112 +1252,129 @@ class RectWallDetector:
                     text_margin     = getattr(cfg, "wall_filter_text_margin", 5),
                     include_windows = getattr(cfg, "wall_filter_include_windows", True),
                 )
+                _px_post_filt = int(np.count_nonzero(wall_mask))
+                _L("  Door ckpt   : %s",
+                   getattr(cfg, "unet_checkpoint_path", "weights/epoch_040.pth"))
+                _L("  Margins     : door=%d px  text=%d px  include_windows=%s",
+                   getattr(cfg, "wall_filter_door_margin", 10),
+                   getattr(cfg, "wall_filter_text_margin", 5),
+                   getattr(cfg, "wall_filter_include_windows", True))
+                _L("  Before: %d px  →  After: %d px  (removed %d px)",
+                   _px_pre_filt, _px_post_filt, _px_pre_filt - _px_post_filt)
+                _L("  Removed pixels correspond to door/window openings and OCR text regions")
             except Exception as _fe:
+                _L("  WARNING: apply_door_text_filter FAILED (%s) — step skipped", _fe)
                 logger.warning("apply_door_text_filter failed (%s) — skipping", _fe)
+        else:
+            _L("  SKIPPED — enable_wall_door_text_filter=False in config")
 
-        # ── 1d. Skeleton-based pipe-end capping + enclosed-space fill ─────
-        # Mirrors test_cap.py: after the door/text filter, run the same
-        # find_caps → apply_caps pass on the final wall mask so open pipe
-        # ends are sealed before rect_decompose.
-        # After capping, any background region now fully enclosed by wall
-        # pixels (i.e. no longer reachable from the image border) is filled
-        # as wall — these are the gaps the cap algorithm just closed.
+        # ── Stage 1d: Skeleton cap + enclosed fill ─────────────────────
+        _LS("Stage 1d — Skeleton pipe-end capping + enclosed-space fill")
+        _L("  Params: min_wall_len=30  max_pipe_width=50 px  min_pipe_r=3.0"
+           "  look_ahead=80  merge_radius=6")
         try:
             _sk_caps = find_caps(
                 wall_mask,
-                min_wall_len   = 30,
-                max_pipe_width = 50,
-                min_pipe_r     = 3.0,
-                look_ahead     = 80,
-                local_steps    = 15,
-                merge_radius   = 6,
+                min_wall_len=30, max_pipe_width=50, min_pipe_r=3.0,
+                look_ahead=80, local_steps=15, merge_radius=6,
             )
+            _L("  Skeleton endpoints found and evaluated; caps placed: %d", len(_sk_caps))
+            for _ci, _cap in enumerate(_sk_caps):
+                _cx1, _cy1 = _cap["p1"]; _cx2, _cy2 = _cap["p2"]
+                _clen = int(math.hypot(_cx2 - _cx1, _cy2 - _cy1))
+                _orient = "H" if abs(_cx2 - _cx1) >= abs(_cy2 - _cy1) else "V"
+                _L("    cap[%d]  (%d,%d)→(%d,%d)  len=%d px  %s  thick=%d px",
+                   _ci, _cx1, _cy1, _cx2, _cy2, _clen, _orient, _cap["thickness"])
+
             if _sk_caps:
                 wall_mask = apply_caps(wall_mask, _sk_caps)
-                logger.info(
-                    "Skeleton cap step: %d open pipe end(s) sealed on filtered mask",
-                    len(_sk_caps),
-                )
+                _L("  Cap lines drawn — now scanning for newly-enclosed background regions")
 
-                # Fill newly-enclosed background regions as wall.
-                # Connected-component label background pixels; any component
-                # that does not touch the image border is now an interior
-                # cavity created by the cap lines → fill it as wall.
                 _cap_bg = (wall_mask == 0).astype(np.uint8)
-                _cap_n, _cap_labels = cv2.connectedComponents(
-                    _cap_bg, connectivity=4
-                )
+                _cap_nc, _cap_labels = cv2.connectedComponents(_cap_bg, connectivity=4)
                 _ext_labels: set = set()
                 _ext_labels.update(np.unique(_cap_labels[0,  :]).tolist())
                 _ext_labels.update(np.unique(_cap_labels[-1, :]).tolist())
                 _ext_labels.update(np.unique(_cap_labels[:,  0]).tolist())
                 _ext_labels.update(np.unique(_cap_labels[:, -1]).tolist())
-                _ext_labels.discard(0)  # 0 = wall pixels in connectedComponents
-                _enclosed_px = (_cap_bg > 0) & ~np.isin(_cap_labels,
-                                                         list(_ext_labels))
+                _ext_labels.discard(0)
+                _enclosed_px = (_cap_bg > 0) & ~np.isin(_cap_labels, list(_ext_labels))
+                _n_bg_total   = _cap_nc - 1
+                _n_bg_ext     = len(_ext_labels)
+                _n_bg_encl    = max(0, _n_bg_total - _n_bg_ext)
                 _n_filled_cap = int(np.count_nonzero(_enclosed_px))
+                _L("  Background components: %d total  |  %d touch border (exterior)"
+                   "  |  %d interior (newly enclosed by caps)",
+                   _n_bg_total, _n_bg_ext, _n_bg_encl)
                 if _n_filled_cap > 0:
                     wall_mask[_enclosed_px] = 255
-                    logger.info(
-                        "Skeleton cap step: filled %d newly-enclosed background "
-                        "pixel(s) as wall",
-                        _n_filled_cap,
-                    )
+                    _L("  Filled %d newly-enclosed pixel(s) as wall", _n_filled_cap)
+                else:
+                    _L("  No newly-enclosed regions — nothing to fill")
+            else:
+                _L("  No caps placed (no qualifying open pipe ends found)")
+                _L("  Why caps may be skipped: wall endpoint not on long-enough skeleton"
+                   " (min_wall_len=30), no opposing wall within 50 px, or"
+                   " gap was not ≥60%% black pixels")
         except Exception as _sce:
+            _L("  WARNING: skeleton cap step FAILED (%s) — step skipped", _sce)
             logger.warning("Skeleton cap step failed (%s) — skipping", _sce)
 
-        # ── 2. Diagonal-presence test ──────────────────────────────────
-        axis_tol  = getattr(cfg, "rect_axis_tol_deg",      DEFAULT_AXIS_TOL_DEG)
-        diag_thr  = getattr(cfg, "rect_diag_lsd_ratio",    DEFAULT_DIAG_LSD_RATIO)
-        diag_minl = getattr(cfg, "rect_diag_lsd_min_len",  DEFAULT_DIAG_LSD_MIN_LEN)
+        _px_final_mask = int(np.count_nonzero(wall_mask))
+        _L("  Final wall mask: %d px  (%.1f%% of image;  raw U-Net was %d px)",
+           _px_final_mask, 100.0 * _px_final_mask / total_px, _px_raw)
 
+        # ── Stage 2: Diagonal-presence test ───────────────────────────
+        _LS("Stage 2 — Diagonal-presence test (LSD on wall mask)")
+        axis_tol  = getattr(cfg, "rect_axis_tol_deg",     DEFAULT_AXIS_TOL_DEG)
+        diag_thr  = getattr(cfg, "rect_diag_lsd_ratio",   DEFAULT_DIAG_LSD_RATIO)
+        diag_minl = getattr(cfg, "rect_diag_lsd_min_len", DEFAULT_DIAG_LSD_MIN_LEN)
+        _L("  axis_tol=%.1f°  diag_ratio_thr=%.1f%%  min_segment_len=%.0f px",
+           axis_tol, diag_thr * 100, diag_minl)
         has_diagonals = detect_has_diagonals(
             wall_mask,
-            axis_tol_deg    = axis_tol,
-            diag_ratio_thr  = diag_thr,
-            min_segment_len = diag_minl,
+            axis_tol_deg=axis_tol, diag_ratio_thr=diag_thr,
+            min_segment_len=diag_minl,
         )
         force_axis_only = not has_diagonals
+        _L("  Result: diagonals_present=%s  →  axis_only=%s",
+           has_diagonals, force_axis_only)
+        if force_axis_only:
+            _L("  Decomposer restricted to 0°/90° only (no diagonal rectangles)")
+        else:
+            _L("  Decomposer will try all %d angle steps (diagonal walls detected)",
+               getattr(cfg, "rect_angle_steps", 12))
 
-        # ── 3. Rect decomposition ──────────────────────────────────────
-        mask01 = (wall_mask > 0).astype(np.uint8)
+        # ── Stage 3: Rect decomposition ───────────────────────────────
+        _LS("Stage 3 — Rectangle decomposition (rd.decompose)")
+        mask01        = (wall_mask > 0).astype(np.uint8)
         total_wall_px = int(np.count_nonzero(mask01))
-        total_px      = mask01.size
 
-        # Collect all decompose params for logging
-        _p_angle_steps   = getattr(cfg, "rect_angle_steps",          12)
-        _p_penalty       = getattr(cfg, "rect_penalty",              0.0)
-        _p_max_grid      = getattr(cfg, "rect_max_grid_dim",         200)
-        _p_cov_stop      = getattr(cfg, "rect_coverage_stop",        0.99)
-        _p_bleed_w       = getattr(cfg, "rect_bleed_weight",         1.5)
-        _p_init_bleed    = getattr(cfg, "rect_initial_bleed_weight", 10.0)
-        _p_bleed_decay   = getattr(cfg, "rect_bleed_decay",          1.0)
-        _p_axis_gap      = getattr(cfg, "rect_axis_gap",             0.0)
-        _p_max_overlap   = getattr(cfg, "rect_max_overlap",          0.3)
-        _p_max_spill     = getattr(cfg, "rect_max_spill",            0.15)
+        _p_angle_steps = getattr(cfg, "rect_angle_steps",          12)
+        _p_penalty     = getattr(cfg, "rect_penalty",              0.0)
+        _p_max_grid    = getattr(cfg, "rect_max_grid_dim",         200)
+        _p_cov_stop    = getattr(cfg, "rect_coverage_stop",        0.93)
+        _p_bleed_w     = getattr(cfg, "rect_bleed_weight",         15.0)
+        _p_init_bleed  = getattr(cfg, "rect_initial_bleed_weight", 15.0)
+        _p_bleed_decay = getattr(cfg, "rect_bleed_decay",          0.0)
+        _p_axis_gap    = getattr(cfg, "rect_axis_gap",             0.0)
+        _p_max_overlap = getattr(cfg, "rect_max_overlap",          1.0)
+        _p_max_spill   = getattr(cfg, "rect_max_spill",            0.15)
 
-        log_lines: List[str] = []
-        log_lines.append("=" * 70 + "\n")
-        log_lines.append("RECT DECOMPOSE EXHAUSTIVE LOG\n")
-        log_lines.append("=" * 70 + "\n\n")
-        log_lines.append(f"Image size          : {W} x {H} px  ({total_px} total)\n")
-        log_lines.append(f"Wall pixels (input) : {total_wall_px} / {total_px}  "
-                         f"({100.0*total_wall_px/max(1,total_px):.2f}%)\n")
-        log_lines.append("\nDecompose parameters:\n")
-        log_lines.append(f"  coverage_stop        = {_p_cov_stop}  (target: "
-                         f"{_p_cov_stop*100:.1f}% of wall pixels covered)\n")
-        log_lines.append(f"  rect_penalty         = {_p_penalty}\n")
-        log_lines.append(f"  max_overlap          = {_p_max_overlap}\n")
-        log_lines.append(f"  max_spill_fraction   = {_p_max_spill}\n")
-        log_lines.append(f"  bleed_weight         = {_p_bleed_w}\n")
-        log_lines.append(f"  initial_bleed_weight = {_p_init_bleed}\n")
-        log_lines.append(f"  bleed_decay          = {_p_bleed_decay}\n")
-        log_lines.append(f"  angle_steps          = {_p_angle_steps}\n")
-        log_lines.append(f"  axis_only            = {force_axis_only}\n")
-        log_lines.append(f"  axis_gap             = {_p_axis_gap}\n")
-        log_lines.append(f"  max_grid_dim         = {_p_max_grid}\n")
-        log_lines.append(f"  has_diagonals        = {has_diagonals}\n")
-        log_lines.append("\n--- rd.decompose verbose output ---\n")
+        _L("  Wall pixels entering decompose: %d / %d  (%.2f%%)",
+           total_wall_px, total_px, 100.0 * total_wall_px / max(1, total_px))
+        _L("  coverage_stop      = %.2f → stop when ≥%.0f%% of wall px covered",
+           _p_cov_stop, _p_cov_stop * 100)
+        _L("  max_spill_fraction = %.2f → reject rect if >%.0f%% pixels outside mask",
+           _p_max_spill, _p_max_spill * 100)
+        _L("  max_overlap        = %.2f → reject rect if >%.0f%% already covered",
+           _p_max_overlap, _p_max_overlap * 100)
+        _L("  bleed_weight=%.1f  initial=%.1f  decay=%.1f",
+           _p_bleed_w, _p_init_bleed, _p_bleed_decay)
+        _L("  rect_penalty=%.2f  angle_steps=%d  axis_only=%s  axis_gap=%.1f"
+           "  max_grid_dim=%d",
+           _p_penalty, _p_angle_steps, force_axis_only, _p_axis_gap, _p_max_grid)
+        _LL.append("\n--- rd.decompose verbose output (start) ---\n")
 
         _verbose_buf = io.StringIO()
         with contextlib.redirect_stdout(_verbose_buf):
@@ -1287,119 +1395,155 @@ class RectWallDetector:
                 verbose              = True,
             )
         _verbose_text = _verbose_buf.getvalue()
-        log_lines.append(_verbose_text if _verbose_text else "(no verbose output from rd.decompose)\n")
+        _LL.append(_verbose_text if _verbose_text
+                   else "(no verbose output from rd.decompose)\n")
+        _LL.append("--- rd.decompose verbose output (end) ---\n\n")
 
-        # ── Post-decompose coverage analysis ──────────────────────────
-        log_lines.append("\n--- Post-decompose analysis ---\n")
-        log_lines.append(f"Rectangles placed    : {len(rects)}\n")
-
-        # Rasterise all rects to measure actual covered wall pixels
+        # Coverage analysis + stop-reason explanation
         _covered = np.zeros((H, W), dtype=np.uint8)
         for _r in rects:
-            _corners = _r.corners().astype(np.int32)
-            cv2.fillPoly(_covered, [_corners], 1)
-        _covered_wall_px   = int(np.count_nonzero((_covered > 0) & (mask01 > 0)))
-        _covered_total_px  = int(np.count_nonzero(_covered > 0))
-        _coverage_frac     = _covered_wall_px / max(1, total_wall_px)
-        _gap_px            = total_wall_px - _covered_wall_px
-        log_lines.append(f"Wall px covered      : {_covered_wall_px} / {total_wall_px}  "
-                         f"({_coverage_frac*100:.2f}%)\n")
-        log_lines.append(f"Target coverage      : {_p_cov_stop*100:.1f}%\n")
-        log_lines.append(f"Gap to target        : {(_p_cov_stop - _coverage_frac)*100:.2f}pp\n")
-        log_lines.append(f"Uncovered wall px    : {_gap_px}\n")
-        log_lines.append(f"Extra (spill) px     : {_covered_total_px - _covered_wall_px} "
-                         f"(outside wall mask)\n")
+            cv2.fillPoly(_covered, [_r.corners().astype(np.int32)], 1)
+        _covered_wall_px  = int(np.count_nonzero((_covered > 0) & (mask01 > 0)))
+        _covered_total_px = int(np.count_nonzero(_covered > 0))
+        _coverage_frac    = _covered_wall_px / max(1, total_wall_px)
+        _spill_px         = _covered_total_px - _covered_wall_px
 
-        # ── Diagnostic overlay image ───────────────────────────────────
-        # WHITE  = wall ∩ rect
-        # GREEN  = wall pixel not covered by any rect
-        # RED    = rect pixel outside wall mask
-        # BLACK  = everything else
-        if debug_img_path:
-            try:
-                _wall_bin = mask01 > 0
-                _rect_bin = _covered > 0
-                _diag = np.zeros((H, W, 3), dtype=np.uint8)
-                _diag[_wall_bin & _rect_bin]  = (255, 255, 255)  # white
-                _diag[_wall_bin & ~_rect_bin] = (0,   255,   0)  # green
-                _diag[_rect_bin & ~_wall_bin] = (0,     0, 255)  # red
-                _diag_path = os.path.splitext(debug_img_path)[0] + "_wall_rect_diag.png"
-                cv2.imwrite(_diag_path, _diag)
-                logger.info("RectWallDetector: wall/rect diagnostic image → %s", _diag_path)
-            except Exception as _de:
-                logger.warning("RectWallDetector: could not save diagnostic image: %s", _de)
+        _L("  Rectangles placed      : %d", len(rects))
+        _L("  Wall px covered        : %d / %d  (%.2f%%)",
+           _covered_wall_px, total_wall_px, _coverage_frac * 100)
+        _L("  Target coverage        : %.1f%%", _p_cov_stop * 100)
+        _L("  Uncovered wall px      : %d  (%.2f pp below target)",
+           total_wall_px - _covered_wall_px,
+           max(0.0, _p_cov_stop - _coverage_frac) * 100)
+        _L("  Spill px (outside mask): %d  (%.1f%% of placed rect area)",
+           _spill_px, 100.0 * _spill_px / max(1, _covered_total_px))
 
-        if len(rects) > 0:
+        if _coverage_frac >= _p_cov_stop:
+            _L("  STOP REASON: Coverage target reached"
+               " (%.2f%% ≥ %.1f%%) — decomposition complete",
+               _coverage_frac * 100, _p_cov_stop * 100)
+        elif total_wall_px == 0:
+            _L("  STOP REASON: Wall mask was empty before decompose")
+        else:
+            _uncov = total_wall_px - _covered_wall_px
+            _L("  STOP REASON: No more valid rectangles could be placed")
+            _L("    ~%d wall px remain uncovered but every candidate rect was rejected:", _uncov)
+            _L("    • Exceeded max_spill_fraction=%.2f"
+               " (>%.0f%% of rect pixels landed outside the wall mask)",
+               _p_max_spill, _p_max_spill * 100)
+            _L("    • OR exceeded max_overlap=%.2f"
+               " (>%.0f%% of rect area was already covered)", _p_max_overlap,
+               _p_max_overlap * 100)
+            _L("    • OR scored negative after bleed penalty (weight=%.1f)", _p_bleed_w)
+            _L("    Possible remedies: raise rect_coverage_stop, lower"
+               " rect_max_spill, or improve the wall mask quality")
+
+        if rects:
             _areas = []
             for _r in rects:
-                _c = _r.corners()
-                _xs, _ys = _c[:, 0], _c[:, 1]
-                _areas.append(float((_xs.max()-_xs.min()) * (_ys.max()-_ys.min())))
-            log_lines.append(f"\nPer-rect area stats (px²):\n")
-            log_lines.append(f"  min={min(_areas):.0f}  max={max(_areas):.0f}  "
-                             f"mean={sum(_areas)/len(_areas):.0f}\n")
-            log_lines.append("\nAll rects (x1,y1,x2,y2  angle_deg  area_px²):\n")
+                _c = _r.corners(); _xs, _ys = _c[:, 0], _c[:, 1]
+                _areas.append(float((_xs.max() - _xs.min()) * (_ys.max() - _ys.min())))
+            _L("  Per-rect AABB area (px²): min=%.0f  max=%.0f  mean=%.0f",
+               min(_areas), max(_areas), sum(_areas) / len(_areas))
+            _LL.append("\n  All rects (AABB x1,y1–x2,y2 | angle° | AABB area):\n")
             for _idx, _r in enumerate(rects):
-                _c = _r.corners()
-                _xs, _ys = _c[:, 0], _c[:, 1]
-                _ang = getattr(_r, 'angle', 0.0)
-                _a   = (_xs.max()-_xs.min()) * (_ys.max()-_ys.min())
-                log_lines.append(
-                    f"  rect[{_idx:3d}]: "
-                    f"({_xs.min():.0f},{_ys.min():.0f})-"
-                    f"({_xs.max():.0f},{_ys.max():.0f})  "
-                    f"angle={_ang:.1f}°  area={_a:.0f}\n"
+                _c = _r.corners(); _xs, _ys = _c[:, 0], _c[:, 1]
+                _ang = getattr(_r, "angle", 0.0)
+                _a   = (_xs.max() - _xs.min()) * (_ys.max() - _ys.min())
+                _LL.append(
+                    f"    rect[{_idx:3d}]: "
+                    f"({_xs.min():.0f},{_ys.min():.0f})–"
+                    f"({_xs.max():.0f},{_ys.max():.0f})"
+                    f"  angle={_ang:.1f}°  area={_a:.0f}\n"
                 )
 
-        log_lines.append("\n" + "=" * 70 + "\n")
-
-        # Write log file (always; path derived from debug_img_path if not given)
-        _lf_path = log_file_path
-        if not _lf_path and debug_img_path:
-            _lf_path = os.path.splitext(debug_img_path)[0] + "_rectdecompose.log"
-        if _lf_path:
+        if debug_img_path:
             try:
-                with open(_lf_path, "w", encoding="utf-8") as _lf:
-                    _lf.writelines(log_lines)
-                logger.info("RectWallDetector: exhaustive decompose log → %s", _lf_path)
-            except Exception as _le:
-                logger.warning("RectWallDetector: could not write log file: %s", _le)
+                _wall_bin = mask01 > 0; _rect_bin = _covered > 0
+                _diag = np.zeros((H, W, 3), dtype=np.uint8)
+                _diag[_wall_bin & _rect_bin]  = (255, 255, 255)  # white  = hit
+                _diag[_wall_bin & ~_rect_bin] = (0,   255,   0)  # green  = missed wall
+                _diag[_rect_bin & ~_wall_bin] = (0,     0, 255)  # red    = spill
+                _diag_path = os.path.splitext(debug_img_path)[0] + "_wall_rect_diag.png"
+                cv2.imwrite(_diag_path, _diag)
+                _L("  Diagnostic overlay → %s  (white=hit, green=missed, red=spill)",
+                   _diag_path)
+            except Exception as _de:
+                _L("  WARNING: could not save diagnostic image: %s", _de)
 
-        logger.info(
-            "RectWallDetector: %d rectangles, coverage=%.2f%% / target %.1f%%  "
-            "(axis_only=%s, diagonals=%s)",
-            len(rects), _coverage_frac * 100, _p_cov_stop * 100,
-            force_axis_only, has_diagonals,
-        )
-
-        # ── 4. Snap collinear endpoints ────────────────────────────────
+        # ── Stage 4: Snap endpoints ────────────────────────────────────
+        _LS("Stage 4 — Endpoint snapping (corner/T-junction only)")
         infos: List[_RectInfo] = []
         for r in rects:
             p1, p2, thick, wall_ang = rect_centerline(r)
-            infos.append(_RectInfo(
-                p1=p1, p2=p2, thickness=thick, angle_deg=wall_ang, rect=r,
-            ))
+            infos.append(_RectInfo(p1=p1, p2=p2, thickness=thick,
+                                   angle_deg=wall_ang, rect=r))
 
+        _snap_gf  = getattr(cfg, "rect_snap_gap_factor",     DEFAULT_SNAP_GAP_FACTOR)
+        _snap_fl  = getattr(cfg, "rect_snap_gap_floor",       DEFAULT_SNAP_GAP_FLOOR)
+        _snap_ang = getattr(cfg, "rect_snap_angle_deg",       DEFAULT_SNAP_ANGLE_DEG)
+        _snap_ext = getattr(cfg, "rect_snap_max_extend_frac", 0.10)
+        _L("  Parallel walls (angle_diff ≤ %.1f°) → NEVER merged", _snap_ang)
+        _L("  Gap threshold: max(%.1f px, %.2f × thickness)", _snap_fl, _snap_gf)
+        _L("  Max extension per wall: %.0f%% of its own length", _snap_ext * 100)
+
+        _before_pts = [(tuple(i.p1), tuple(i.p2)) for i in infos]
         snap_collinear_endpoints(
             infos,
-            snap_gap_factor  = getattr(cfg, "rect_snap_gap_factor",      DEFAULT_SNAP_GAP_FACTOR),
-            snap_gap_floor   = getattr(cfg, "rect_snap_gap_floor",        DEFAULT_SNAP_GAP_FLOOR),
-            snap_angle_deg   = getattr(cfg, "rect_snap_angle_deg",        DEFAULT_SNAP_ANGLE_DEG),
-            max_extend_frac  = getattr(cfg, "rect_snap_max_extend_frac",  0.10),
+            snap_gap_factor = _snap_gf,
+            snap_gap_floor  = _snap_fl,
+            snap_angle_deg  = _snap_ang,
+            max_extend_frac = _snap_ext,
         )
+        _after_pts = [(tuple(i.p1), tuple(i.p2)) for i in infos]
+        _snapped = sum(1 for b, a in zip(_before_pts, _after_pts) if b != a)
+        _L("  Walls with ≥1 endpoint moved: %d / %d", _snapped, len(infos))
+        if _snapped == 0:
+            _L("  No snapping — all endpoint gaps exceeded threshold or"
+               " only parallel walls were close enough")
 
-        # ── 5. WallSegments ────────────────────────────────────────────
+        # ── Stage 5: WallSegments + output ────────────────────────────
+        _LS("Stage 5 — WallSegment conversion + output")
         walls = [_rect_to_wall_segment(info, idx, axis_tol_deg=axis_tol)
                  for idx, info in enumerate(infos)]
+        _n_diag = sum(1 for w in walls if w.is_diagonal)
+        _L("  Total wall segments : %d  (%d axis-aligned, %d diagonal)",
+           len(walls), len(walls) - _n_diag, _n_diag)
+        if walls:
+            _thk = [w.thickness for w in walls]
+            _L("  Thickness (px)      : min=%.1f  max=%.1f  mean=%.1f",
+               min(_thk), max(_thk), sum(_thk) / len(_thk))
+            _lens = [
+                _dist(tuple(w.outline[0]), tuple(w.outline[1]))
+                for w in walls if w.outline and len(w.outline) >= 2
+            ]
+            if _lens:
+                _L("  Length (px)         : min=%.1f  max=%.1f  mean=%.1f",
+                   min(_lens), max(_lens), sum(_lens) / len(_lens))
 
-        # ── 6. Build outline_mask (raster of placed rect walls), used
-        #      later to OR with the U-Net mask for room finding.
-        outline_mask = rasterise_wall_segments(walls, (H, W))
-
-        # Store raw rect corners for the overlay debug image.
-        # Captured before endpoint snapping so the polygons reflect exactly
-        # what rect_decompose placed, without post-hoc adjustments.
+        outline_mask       = rasterise_wall_segments(walls, (H, W))
         wall_rect_polygons = [r.corners().astype(np.float32) for r in rects]
+
+        # ── Summary ───────────────────────────────────────────────────
+        _LS("Pipeline summary")
+        _L("  Image                  : %d × %d px", W, H)
+        _L("  Raw U-Net wall px      : %d  (%.1f%%)",
+           _px_raw, 100.0 * _px_raw / total_px)
+        _L("  Final filtered mask px : %d  (%.1f%%)",
+           _px_final_mask, 100.0 * _px_final_mask / total_px)
+        _L("  Rects from decompose   : %d  (coverage %.2f%% / target %.1f%%)",
+           len(rects), _coverage_frac * 100, _p_cov_stop * 100)
+        _L("  Wall segments output   : %d  (%d snapped)", len(walls), _snapped)
+        _LL.append("=" * 70 + "\n")
+
+        _write_log()
+
+        logger.info(
+            "RectWallDetector: %d walls, coverage=%.2f%%/target %.1f%%"
+            "  axis_only=%s  diagonals=%s",
+            len(walls), _coverage_frac * 100, _p_cov_stop * 100,
+            force_axis_only, has_diagonals,
+        )
 
         return DetectionResult(
             walls=walls,
