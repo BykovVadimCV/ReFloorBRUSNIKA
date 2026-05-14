@@ -282,8 +282,8 @@ class PipelineConfig:
     door_rect_coverage_stop: float = 0.70
 
     # Maximum fraction of a door rect's pixels that may bleed outside the
-    # door mask (tight: 5% vs 15% for walls).
-    door_rect_max_spill: float = 0.05
+    # door mask (tight: 2% noise-only tolerance).
+    door_rect_max_spill: float = 0.02
 
     # Number of angle steps tested per greedy iteration.
     # Doors are always axis-aligned, so we only need 0°/90°.
@@ -347,8 +347,8 @@ class PipelineConfig:
     rect_snap_angle_deg:  float = 5.0    # rectangles must agree within this angle
 
     # Hard spill cap: any candidate rect whose non-wall-pixel fraction exceeds
-    # this is rejected regardless of its score.  0.15 = max 15% bleed.
-    rect_max_spill: float = 0.15
+    # this is rejected regardless of its score.  0.02 = max 2% bleed (noise only).
+    rect_max_spill: float = 0.02
 
     # Cap (morph-close) kernel size applied to the raw U-Net wall mask
     # before enclosed-space analysis and rect decomposition.  Bridges small
