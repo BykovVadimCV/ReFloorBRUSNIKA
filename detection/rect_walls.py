@@ -1164,10 +1164,13 @@ class RectWallDetector:
             except Exception as _fe:
                 logger.warning("apply_door_text_filter failed (%s) — skipping", _fe)
 
-        # ── 1d. Skeleton-based pipe-end capping on filtered wall mask ─────
+        # ── 1d. Skeleton-based pipe-end capping + enclosed-space fill ─────
         # Mirrors test_cap.py: after the door/text filter, run the same
         # find_caps → apply_caps pass on the final wall mask so open pipe
         # ends are sealed before rect_decompose.
+        # After capping, any background region now fully enclosed by wall
+        # pixels (i.e. no longer reachable from the image border) is filled
+        # as wall — these are the gaps the cap algorithm just closed.
         try:
             _sk_caps = find_caps(
                 wall_mask,
@@ -1184,6 +1187,31 @@ class RectWallDetector:
                     "Skeleton cap step: %d open pipe end(s) sealed on filtered mask",
                     len(_sk_caps),
                 )
+
+                # Fill newly-enclosed background regions as wall.
+                # Connected-component label background pixels; any component
+                # that does not touch the image border is now an interior
+                # cavity created by the cap lines → fill it as wall.
+                _cap_bg = (wall_mask == 0).astype(np.uint8)
+                _cap_n, _cap_labels = cv2.connectedComponents(
+                    _cap_bg, connectivity=4
+                )
+                _ext_labels: set = set()
+                _ext_labels.update(np.unique(_cap_labels[0,  :]).tolist())
+                _ext_labels.update(np.unique(_cap_labels[-1, :]).tolist())
+                _ext_labels.update(np.unique(_cap_labels[:,  0]).tolist())
+                _ext_labels.update(np.unique(_cap_labels[:, -1]).tolist())
+                _ext_labels.discard(0)  # 0 = wall pixels in connectedComponents
+                _enclosed_px = (_cap_bg > 0) & ~np.isin(_cap_labels,
+                                                         list(_ext_labels))
+                _n_filled_cap = int(np.count_nonzero(_enclosed_px))
+                if _n_filled_cap > 0:
+                    wall_mask[_enclosed_px] = 255
+                    logger.info(
+                        "Skeleton cap step: filled %d newly-enclosed background "
+                        "pixel(s) as wall",
+                        _n_filled_cap,
+                    )
         except Exception as _sce:
             logger.warning("Skeleton cap step failed (%s) — skipping", _sce)
 

@@ -348,8 +348,8 @@ class PipelineConfig:
     rect_snap_max_extend_frac:  float = 0.10  # max endpoint shift as fraction of wall length
 
     # Hard spill cap: any candidate rect whose non-wall-pixel fraction exceeds
-    # this is rejected regardless of its score.  0.02 = max 2% bleed (noise only).
-    rect_max_spill: float = 0.02
+    # this is rejected regardless of its score.  0.15 = max 15% bleed.
+    rect_max_spill: float = 0.15
 
     # Cap (morph-close) kernel size applied to the raw U-Net wall mask
     # before enclosed-space analysis and rect decomposition.  Bridges small
