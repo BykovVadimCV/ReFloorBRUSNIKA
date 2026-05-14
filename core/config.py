@@ -362,6 +362,13 @@ class PipelineConfig:
     # 0.25 matches test_cap.py default (was 0.50).
     rect_enclosed_overlap_threshold: float = 0.25
 
+    # Skeleton cap enclosed-space fill: maximum area (pixels) of a background
+    # region that the cap algorithm is allowed to fill as wall.
+    # Rooms are 5 000–100 000+ px; genuine construction gaps are tiny.
+    # The fill also requires the region to be NEWLY enclosed (not pre-existing
+    # room interior) and to contain no numeric OCR label.
+    cap_fill_max_area_px: int = 5000
+
     # Door + OCR-text wall-mask filter (mirrors test_cap.py)
     # When True, after the cap step the wall mask is filtered to remove
     # door/window pixel regions (from epoch_040, dilated by door_margin and

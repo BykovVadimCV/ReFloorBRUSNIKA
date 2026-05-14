@@ -1268,54 +1268,208 @@ class RectWallDetector:
         else:
             _L("  SKIPPED — enable_wall_door_text_filter=False in config")
 
-        # ── Stage 1d: Skeleton cap + enclosed fill ─────────────────────
-        _LS("Stage 1d — Skeleton pipe-end capping + enclosed-space fill")
+        # ── Stage 1d: Skeleton cap + directional conservative fill ────────
+        #
+        # Four guards before any background pixel is filled as wall:
+        #
+        #   Guard A — pre-cap snapshot
+        #     Record which background pixels were already "exterior" (touching
+        #     the image border) BEFORE drawing cap lines.  A region whose pixels
+        #     were <5% exterior before caps is a pre-existing room enclosure —
+        #     it was already enclosed and was NOT created by the cap.  Skip it.
+        #
+        #   Guard B — size limit (cap_fill_max_area_px, default 5 000 px)
+        #     Rooms are 5 000–100 000+ px; genuine pipe/corner gaps are tiny.
+        #
+        #   Guard C — OCR numeric label
+        #     Any component containing the centre of a numeric OCR label is a
+        #     labelled room interior — never fill.
+        #
+        #   Guard D — directional / smaller-side
+        #     For each cap line we sample both perpendicular sides and identify
+        #     which background component sits on each side.  We only fill the
+        #     SMALLER of the two sides.  This ensures the algorithm always fills
+        #     towards the pipe/corner interior, never towards the open room.
+        #     Components that are not on the smaller side of any cap are skipped.
+        _LS("Stage 1d — Skeleton pipe-end capping + directional conservative fill")
         _L("  Params: min_wall_len=30  max_pipe_width=50 px  min_pipe_r=3.0"
            "  look_ahead=80  merge_radius=6")
+        _max_fill_px = int(getattr(cfg, "cap_fill_max_area_px", 5000))
+        _L("  Guards: A=pre-existing-room  B=size≤%d px"
+           "  C=no-OCR-label  D=smaller-side-of-cap", _max_fill_px)
         try:
             _sk_caps = find_caps(
                 wall_mask,
                 min_wall_len=30, max_pipe_width=50, min_pipe_r=3.0,
                 look_ahead=80, local_steps=15, merge_radius=6,
             )
-            _L("  Skeleton endpoints found and evaluated; caps placed: %d", len(_sk_caps))
+            _L("  Caps placed: %d", len(_sk_caps))
             for _ci, _cap in enumerate(_sk_caps):
                 _cx1, _cy1 = _cap["p1"]; _cx2, _cy2 = _cap["p2"]
-                _clen = int(math.hypot(_cx2 - _cx1, _cy2 - _cy1))
+                _clen_i = int(math.hypot(_cx2 - _cx1, _cy2 - _cy1))
                 _orient = "H" if abs(_cx2 - _cx1) >= abs(_cy2 - _cy1) else "V"
                 _L("    cap[%d]  (%d,%d)→(%d,%d)  len=%d px  %s  thick=%d px",
-                   _ci, _cx1, _cy1, _cx2, _cy2, _clen, _orient, _cap["thickness"])
+                   _ci, _cx1, _cy1, _cx2, _cy2, _clen_i, _orient, _cap["thickness"])
 
             if _sk_caps:
-                wall_mask = apply_caps(wall_mask, _sk_caps)
-                _L("  Cap lines drawn — now scanning for newly-enclosed background regions")
+                # ── Guard A: snapshot pre-cap exterior state ──────────────
+                _pre_bg = (wall_mask == 0).astype(np.uint8)
+                _pre_nc, _pre_lbl = cv2.connectedComponents(_pre_bg, connectivity=4)
+                _pre_ext: set = set()
+                _pre_ext.update(np.unique(_pre_lbl[0,  :]).tolist())
+                _pre_ext.update(np.unique(_pre_lbl[-1, :]).tolist())
+                _pre_ext.update(np.unique(_pre_lbl[:,  0]).tolist())
+                _pre_ext.update(np.unique(_pre_lbl[:, -1]).tolist())
+                _pre_ext.discard(0)
+                _was_ext = np.isin(_pre_lbl, list(_pre_ext))
+                _L("  Pre-cap interior components (rooms, will be blocked by Guard A): %d",
+                   max(0, (_pre_nc - 1) - len(_pre_ext)))
 
+                # ── Apply all cap lines ────────────────────────────────────
+                wall_mask = apply_caps(wall_mask, _sk_caps)
+
+                # ── Post-cap background components ────────────────────────
                 _cap_bg = (wall_mask == 0).astype(np.uint8)
-                _cap_nc, _cap_labels = cv2.connectedComponents(_cap_bg, connectivity=4)
-                _ext_labels: set = set()
-                _ext_labels.update(np.unique(_cap_labels[0,  :]).tolist())
-                _ext_labels.update(np.unique(_cap_labels[-1, :]).tolist())
-                _ext_labels.update(np.unique(_cap_labels[:,  0]).tolist())
-                _ext_labels.update(np.unique(_cap_labels[:, -1]).tolist())
-                _ext_labels.discard(0)
-                _enclosed_px = (_cap_bg > 0) & ~np.isin(_cap_labels, list(_ext_labels))
-                _n_bg_total   = _cap_nc - 1
-                _n_bg_ext     = len(_ext_labels)
-                _n_bg_encl    = max(0, _n_bg_total - _n_bg_ext)
-                _n_filled_cap = int(np.count_nonzero(_enclosed_px))
-                _L("  Background components: %d total  |  %d touch border (exterior)"
-                   "  |  %d interior (newly enclosed by caps)",
-                   _n_bg_total, _n_bg_ext, _n_bg_encl)
-                if _n_filled_cap > 0:
-                    wall_mask[_enclosed_px] = 255
-                    _L("  Filled %d newly-enclosed pixel(s) as wall", _n_filled_cap)
-                else:
-                    _L("  No newly-enclosed regions — nothing to fill")
+                _cap_nc, _cap_lbl = cv2.connectedComponents(_cap_bg, connectivity=4)
+                _ext_lbl: set = set()
+                _ext_lbl.update(np.unique(_cap_lbl[0,  :]).tolist())
+                _ext_lbl.update(np.unique(_cap_lbl[-1, :]).tolist())
+                _ext_lbl.update(np.unique(_cap_lbl[:,  0]).tolist())
+                _ext_lbl.update(np.unique(_cap_lbl[:, -1]).tolist())
+                _ext_lbl.discard(0)
+
+                # Fast per-label area lookup via bincount
+                _area_arr = np.bincount(_cap_lbl.ravel(), minlength=_cap_nc)
+
+                # ── Guard D: for each cap, mark the smaller perpendicular side
+                # p1/p2 are (col, row); _cap_lbl is indexed [row, col].
+                _fillable_labels: set = set()
+                for _cap in _sk_caps:
+                    _ccx1, _ccy1 = _cap["p1"]   # col, row
+                    _ccx2, _ccy2 = _cap["p2"]
+                    _cdx  = _ccx2 - _ccx1        # col direction
+                    _cdy  = _ccy2 - _ccy1        # row direction
+                    _cclen = math.hypot(_cdx, _cdy)
+                    if _cclen < 1:
+                        continue
+                    # Perpendicular unit vector (col, row)
+                    _pn_col = -_cdy / _cclen
+                    _pn_row =  _cdx / _cclen
+                    _mid_col = (_ccx1 + _ccx2) / 2.0
+                    _mid_row = (_ccy1 + _ccy2) / 2.0
+
+                    # Sample both perpendicular sides; walk outward until we
+                    # hit a background pixel (label > 0) or wall.
+                    _side_lbl = [None, None]
+                    for _si, _sign in enumerate((1, -1)):
+                        for _step in range(2, 20):
+                            _sc = int(round(_mid_col + _sign * _pn_col * _step))
+                            _sr = int(round(_mid_row + _sign * _pn_row * _step))
+                            if not (0 <= _sr < H and 0 <= _sc < W):
+                                break
+                            _lv = int(_cap_lbl[_sr, _sc])
+                            if _lv > 0:           # background component found
+                                _side_lbl[_si] = _lv
+                                break
+
+                    _la, _lb = _side_lbl
+                    if _la is not None and _lb is not None and _la != _lb:
+                        # Both sides: fill the smaller one
+                        if _area_arr[_la] <= _area_arr[_lb]:
+                            _fillable_labels.add(_la)
+                            _L("  Guard D cap: side_a label=%d area=%d"
+                               " ≤ side_b label=%d area=%d → mark A as fillable",
+                               _la, _area_arr[_la], _lb, _area_arr[_lb])
+                        else:
+                            _fillable_labels.add(_lb)
+                            _L("  Guard D cap: side_b label=%d area=%d"
+                               " < side_a label=%d area=%d → mark B as fillable",
+                               _lb, _area_arr[_lb], _la, _area_arr[_la])
+                    elif _la is not None and _lb is None:
+                        _fillable_labels.add(_la)   # one side is wall — fill bg side
+                        _L("  Guard D cap: only side_a label=%d area=%d"
+                           " (other side is wall) → mark as fillable",
+                           _la, _area_arr[_la])
+                    elif _lb is not None and _la is None:
+                        _fillable_labels.add(_lb)
+                        _L("  Guard D cap: only side_b label=%d area=%d"
+                           " (other side is wall) → mark as fillable",
+                           _lb, _area_arr[_lb])
+                    else:
+                        _L("  Guard D cap: both sides are wall — no fill")
+
+                # ── Guard C: numeric OCR centre list ─────────────────────
+                _ocr_num_ctrs = []
+                for _ob in (ocr_bboxes or []):
+                    if len(_ob) >= 5 and _is_numeric_ocr_label(str(_ob[0])):
+                        _ocr_num_ctrs.append((
+                            int((_ob[1] + _ob[3]) // 2),   # cx (col)
+                            int((_ob[2] + _ob[4]) // 2),   # cy (row)
+                        ))
+
+                # ── Evaluate each interior component ──────────────────────
+                _n_filled_total = 0
+                _skip_preexist  = 0
+                _skip_size      = 0
+                _skip_ocr       = 0
+                _skip_direction = 0
+
+                for _lid in range(1, _cap_nc):
+                    if _lid in _ext_lbl:
+                        continue   # exterior — never fill
+
+                    _area = int(_area_arr[_lid])
+
+                    # Guard A
+                    _rgn = (_cap_lbl == _lid)
+                    _ext_frac = float(np.count_nonzero(_was_ext[_rgn])) / max(1, _area)
+                    if _ext_frac < 0.05:
+                        _skip_preexist += 1
+                        _L("    SKIP label=%d area=%d ext_frac=%.1f%%"
+                           " → pre-existing room (Guard A)",
+                           _lid, _area, _ext_frac * 100)
+                        continue
+
+                    # Guard B
+                    if _area > _max_fill_px:
+                        _skip_size += 1
+                        _L("    SKIP label=%d area=%d > %d px (Guard B)",
+                           _lid, _area, _max_fill_px)
+                        continue
+
+                    # Guard C
+                    _has_ocr = any(
+                        0 <= _cy < H and 0 <= _cx < W and _rgn[_cy, _cx]
+                        for _cx, _cy in _ocr_num_ctrs
+                    )
+                    if _has_ocr:
+                        _skip_ocr += 1
+                        _L("    SKIP label=%d area=%d → OCR label inside (Guard C)",
+                           _lid, _area)
+                        continue
+
+                    # Guard D
+                    if _lid not in _fillable_labels:
+                        _skip_direction += 1
+                        _L("    SKIP label=%d area=%d → not smaller side of any cap"
+                           " (Guard D)", _lid, _area)
+                        continue
+
+                    # All guards passed — fill as wall
+                    wall_mask[_rgn] = 255
+                    _n_filled_total += _area
+                    _L("    FILL  label=%d area=%d px ext_frac=%.1f%%",
+                       _lid, _area, _ext_frac * 100)
+
+                _n_post_int = (_cap_nc - 1) - len(_ext_lbl)
+                _L("  Summary: post-cap interior=%d  skip A=%d B=%d C=%d D=%d"
+                   "  filled_px=%d",
+                   _n_post_int, _skip_preexist, _skip_size, _skip_ocr,
+                   _skip_direction, _n_filled_total)
             else:
-                _L("  No caps placed (no qualifying open pipe ends found)")
-                _L("  Why caps may be skipped: wall endpoint not on long-enough skeleton"
-                   " (min_wall_len=30), no opposing wall within 50 px, or"
-                   " gap was not ≥60%% black pixels")
+                _L("  No caps placed — no qualifying open pipe ends found")
+                _L("  Reasons: skeleton path < min_wall_len=30, no opposing wall"
+                   " within 50 px, or gap not ≥60%% black pixels")
         except Exception as _sce:
             _L("  WARNING: skeleton cap step FAILED (%s) — step skipped", _sce)
             logger.warning("Skeleton cap step failed (%s) — skipping", _sce)
