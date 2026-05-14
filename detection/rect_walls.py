@@ -876,6 +876,140 @@ def refine_mask_by_enclosed_spaces(
 
 
 # ---------------------------------------------------------------------------
+# Door + OCR-text exclusion for the wall mask
+# (mirrors test_cap.py exactly so both pipelines produce identical masks)
+# ---------------------------------------------------------------------------
+
+def _run_door_window_pixel_mask(
+    img_bgr: np.ndarray,
+    ckpt_path: str = "weights/epoch_040.pth",
+    img_size: int = 1024,
+    confidence: float = 0.5,
+    include_windows: bool = True,
+) -> Optional[np.ndarray]:
+    """
+    Run the 4-class U-Net (epoch_040.pth) and return a uint8 mask of door
+    pixels (class 3) and optionally window pixels (class 2).
+    Returns None on failure.
+    """
+    h, w = img_bgr.shape[:2]
+    if not os.path.exists(ckpt_path):
+        logger.warning("Door-mask checkpoint not found: %s", ckpt_path)
+        return None
+
+    try:
+        import torch
+        from detect_unet import build_model_from_checkpoint, get_val_transform
+
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model, num_classes = build_model_from_checkpoint(ckpt_path, dev)
+        model = model.to(dev).eval()
+
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        transform = get_val_transform(img_size)
+        inp = transform(image=img_rgb)["image"].unsqueeze(0).to(dev)
+
+        with torch.no_grad():
+            logits = model(inp)
+            probs  = torch.softmax(logits, dim=1)
+            conf_map, pred_idx = probs.max(dim=1)
+
+        conf_np = conf_map.squeeze(0).cpu().numpy()
+        pred_np = pred_idx.squeeze(0).cpu().numpy().copy()
+        pred_np[conf_np < confidence] = 0
+
+        pred_full = cv2.resize(pred_np.astype(np.uint8), (w, h),
+                               interpolation=cv2.INTER_NEAREST)
+        door_px = (pred_full == 3) if num_classes >= 4 else np.zeros((h, w), bool)
+        win_px  = (pred_full == 2) if (include_windows and num_classes >= 3) \
+                  else np.zeros((h, w), bool)
+        return (door_px | win_px).astype(np.uint8) * 255
+
+    except Exception as exc:
+        logger.warning("Door-mask U-Net failed: %s", exc)
+        return None
+
+
+def apply_door_text_filter(
+    wall_mask: np.ndarray,
+    img_bgr: np.ndarray,
+    ocr_bboxes: Optional[List] = None,
+    *,
+    door_ckpt_path: str = "weights/epoch_040.pth",
+    img_size: int = 1024,
+    confidence: float = 0.5,
+    door_margin: int = 10,
+    text_margin: int = 5,
+    include_windows: bool = True,
+    door_pixel_mask: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Apply the same door + OCR-text exclusion to *wall_mask* that test_cap.py
+    builds for its cap-detection input.  Returns a filtered copy.
+
+    Pipeline (matches test_cap.py):
+      1. Compute door+window pixel mask via epoch_040 (or use *door_pixel_mask*).
+      2. Dilate by *door_margin* px so thin predictions cover full opening.
+      3. Subtract wall pixels — wall U-Net takes priority over door U-Net.
+      4. Build text mask by dilating each OCR word bbox by *text_margin* px.
+      5. Zero out (door ∪ text) regions in wall_mask.
+    """
+    h, w = wall_mask.shape[:2]
+    refined = wall_mask.copy()
+
+    # ── 1-3. Door / window exclusion ───────────────────────────────────
+    if door_pixel_mask is None:
+        door_pixel_mask = _run_door_window_pixel_mask(
+            img_bgr,
+            ckpt_path       = door_ckpt_path,
+            img_size        = img_size,
+            confidence      = confidence,
+            include_windows = include_windows,
+        )
+
+    door_mask = np.zeros((h, w), dtype=np.uint8)
+    if door_pixel_mask is not None and np.any(door_pixel_mask > 0):
+        door_mask = door_pixel_mask.copy()
+        if door_margin > 0:
+            k = np.ones((door_margin * 2 + 1, door_margin * 2 + 1), dtype=np.uint8)
+            door_mask = cv2.dilate(door_mask, k, iterations=1)
+        # Wall takes priority — keep wall pixels even if the door U-Net
+        # predicted them as a door.
+        door_mask[refined > 0] = 0
+
+    # ── 4. OCR text exclusion ──────────────────────────────────────────
+    text_mask = np.zeros((h, w), dtype=np.uint8)
+    if ocr_bboxes:
+        for item in ocr_bboxes:
+            # Accept (x1,y1,x2,y2) or (text,x1,y1,x2,y2)
+            if len(item) >= 5:
+                x1, y1, x2, y2 = int(item[1]), int(item[2]), int(item[3]), int(item[4])
+            elif len(item) == 4:
+                x1, y1, x2, y2 = map(int, item)
+            else:
+                continue
+            x1 = max(0, x1 - text_margin);  y1 = max(0, y1 - text_margin)
+            x2 = min(w, x2 + text_margin);  y2 = min(h, y2 + text_margin)
+            if x2 > x1 and y2 > y1:
+                text_mask[y1:y2, x1:x2] = 255
+
+    # ── 5. Apply combined exclusion ────────────────────────────────────
+    excl = (door_mask > 0) | (text_mask > 0)
+    refined[excl] = 0
+
+    n_door = int(np.count_nonzero(door_mask > 0))
+    n_text = int(np.count_nonzero(text_mask > 0))
+    n_excl = int(np.count_nonzero(excl))
+    logger.info(
+        "apply_door_text_filter: excluded %d wall px "
+        "(door=%d, text=%d, combined=%d)",
+        int(np.count_nonzero(wall_mask > 0)) - int(np.count_nonzero(refined > 0)),
+        n_door, n_text, n_excl,
+    )
+    return refined
+
+
+# ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
 
@@ -951,27 +1085,7 @@ class RectWallDetector:
         # that may want to compare against post-processed masks.
         raw_wall_mask = wall_mask.copy()
 
-        # ── 1a. Cap step — morphological close on the wall mask ────────
-        # Bridges small gaps in U-Net wall coverage so rect_decompose sees
-        # connected wall material.  This is the "cap" preprocessing step
-        # applied directly to wall_mask (not just to the enclosed-space
-        # analysis mask).
-        cap_k = max(1, int(getattr(cfg, "rect_cap_kernel_size", 5)))
-        cap_i = max(1, int(getattr(cfg, "rect_cap_iters", 2)))
-        if cap_k > 1 and cap_i > 0:
-            kernel = np.ones((cap_k, cap_k), dtype=np.uint8)
-            wall_mask = cv2.morphologyEx(
-                wall_mask, cv2.MORPH_CLOSE, kernel, iterations=cap_i,
-            )
-            logger.info(
-                "Cap step (MORPH_CLOSE k=%d iters=%d): "
-                "%.1f%% wall pixels (was %.1f%% raw)",
-                cap_k, cap_i,
-                100.0 * int(np.count_nonzero(wall_mask)) / wall_mask.size,
-                100.0 * int(np.count_nonzero(raw_wall_mask)) / raw_wall_mask.size,
-            )
-
-        # ── 1b. Enclosed-space refinement ─────────────────────────────
+        # ── 1a. Enclosed-space refinement ─────────────────────────────
         # Identify enclosed white spaces in the image (rooms / structural
         # cavities) and apply targeted fixes:
         #   • Spaces with an OCR label inside → labelled room; clear stray
@@ -991,6 +1105,43 @@ class RectWallDetector:
             logger.warning(
                 "refine_mask_by_enclosed_spaces failed (%s) — skipping", _rme
             )
+
+        # ── 1b. Cap step — morphological close on the refined mask ────
+        # Bridges any remaining small gaps after enclosed-space refinement
+        # so rect_decompose sees connected wall material.
+        cap_k = max(1, int(getattr(cfg, "rect_cap_kernel_size", 5)))
+        cap_i = max(1, int(getattr(cfg, "rect_cap_iters", 2)))
+        if cap_k > 1 and cap_i > 0:
+            kernel = np.ones((cap_k, cap_k), dtype=np.uint8)
+            wall_mask = cv2.morphologyEx(
+                wall_mask, cv2.MORPH_CLOSE, kernel, iterations=cap_i,
+            )
+            logger.info(
+                "Cap step (MORPH_CLOSE k=%d iters=%d): "
+                "%.1f%% wall pixels (was %.1f%% raw)",
+                cap_k, cap_i,
+                100.0 * int(np.count_nonzero(wall_mask)) / wall_mask.size,
+                100.0 * int(np.count_nonzero(raw_wall_mask)) / raw_wall_mask.size,
+            )
+
+        # ── 1c. Door + OCR-text filter ────────────────────────────────
+        # Mirrors test_cap.py: removes door/window pixels (epoch_040, dilated,
+        # wall-pixels preserved) and OCR text bbox regions from the wall mask
+        # so rect_decompose does not chase walls through openings or text.
+        if getattr(cfg, "enable_wall_door_text_filter", True):
+            try:
+                wall_mask = apply_door_text_filter(
+                    wall_mask, img_bgr, ocr_bboxes,
+                    door_ckpt_path  = getattr(cfg, "unet_checkpoint_path",
+                                              "weights/epoch_040.pth"),
+                    img_size        = getattr(cfg, "unet_img_size", 1024),
+                    confidence      = getattr(cfg, "unet_confidence", 0.5),
+                    door_margin     = getattr(cfg, "wall_filter_door_margin", 10),
+                    text_margin     = getattr(cfg, "wall_filter_text_margin", 5),
+                    include_windows = getattr(cfg, "wall_filter_include_windows", True),
+                )
+            except Exception as _fe:
+                logger.warning("apply_door_text_filter failed (%s) — skipping", _fe)
 
         # ── 2. Diagonal-presence test ──────────────────────────────────
         axis_tol  = getattr(cfg, "rect_axis_tol_deg",      DEFAULT_AXIS_TOL_DEG)

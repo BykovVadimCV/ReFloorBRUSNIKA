@@ -361,6 +361,16 @@ class PipelineConfig:
     # 0.50 = at least half the enclosed region must already be wall pixels.
     rect_enclosed_overlap_threshold: float = 0.50
 
+    # Door + OCR-text wall-mask filter (mirrors test_cap.py)
+    # When True, after the cap step the wall mask is filtered to remove
+    # door/window pixel regions (from epoch_040, dilated by door_margin and
+    # with wall pixels preserved) and OCR text bbox regions (dilated by
+    # text_margin).  The filtered mask is what rect_decompose sees.
+    enable_wall_door_text_filter: bool = True
+    wall_filter_door_margin: int = 10
+    wall_filter_text_margin: int = 5
+    wall_filter_include_windows: bool = True
+
     # Door/window diagonal filter — openings whose parent wall has angle
     # deviating from 0°/90° by more than this are dropped (see #1 in spec:
     # diagonals not allowed for openings).
