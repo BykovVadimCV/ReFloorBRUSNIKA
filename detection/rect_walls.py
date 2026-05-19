@@ -1241,12 +1241,14 @@ class RectWallDetector:
         _LS("Stage 1c — Door + OCR-text pixel exclusion")
         if getattr(cfg, "enable_wall_door_text_filter", True):
             _px_pre_filt = int(np.count_nonzero(wall_mask))
+            # Dynamic U-Net input size: average of image dimensions
+            _unet_size = (H + W) // 2
             try:
                 wall_mask = apply_door_text_filter(
                     wall_mask, img_bgr, ocr_bboxes,
                     door_ckpt_path  = getattr(cfg, "unet_checkpoint_path",
                                               "weights/epoch_040.pth"),
-                    img_size        = getattr(cfg, "unet_img_size", 1024),
+                    img_size        = _unet_size,
                     confidence      = getattr(cfg, "unet_confidence", 0.5),
                     door_margin     = getattr(cfg, "wall_filter_door_margin", 10),
                     text_margin     = getattr(cfg, "wall_filter_text_margin", 5),
@@ -1255,6 +1257,8 @@ class RectWallDetector:
                 _px_post_filt = int(np.count_nonzero(wall_mask))
                 _L("  Door ckpt   : %s",
                    getattr(cfg, "unet_checkpoint_path", "weights/epoch_040.pth"))
+                _L("  U-Net size  : %d px  (dynamic: (H+W)//2 = (%d+%d)//2)",
+                   _unet_size, H, W)
                 _L("  Margins     : door=%d px  text=%d px  include_windows=%s",
                    getattr(cfg, "wall_filter_door_margin", 10),
                    getattr(cfg, "wall_filter_text_margin", 5),
@@ -1743,7 +1747,10 @@ class RectWallDetector:
             logger.warning("Binary U-Net dependencies unavailable: %s", exc)
             return None
 
-        size       = getattr(self.config, "rect_unet_img_size", 1024)
+        # ── Get image dimensions for dynamic U-Net sizing ─────────────────
+        h_orig, w_orig = img_bgr.shape[:2]
+        # Dynamic size: average of image dimensions instead of fixed 1024
+        size       = (h_orig + w_orig) // 2
         confidence = getattr(self.config, "unet_confidence",    0.5)
         device     = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -1760,7 +1767,6 @@ class RectWallDetector:
             return None
 
         # ── Pre-process ─────────────────────────────────────────────────
-        h_orig, w_orig = img_bgr.shape[:2]
         img_rgb   = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         transform = get_val_transform(size)
         inp       = transform(image=img_rgb)["image"].unsqueeze(0).to(device)
@@ -1798,9 +1804,10 @@ class RectWallDetector:
         wall_mask = (pred_full == 1).astype(np.uint8) * 255
 
         logger.info(
-            "Binary U-Net (%s): %.1f%% wall pixels  (conf≥%.2f, %d classes)",
+            "Binary U-Net (%s): %.1f%% wall pixels  (conf≥%.2f, %d classes, "
+            "input_size=%d px [dynamic: (%d+%d)//2])",
             ckpt_path.name,
             100.0 * int(np.count_nonzero(wall_mask)) / wall_mask.size,
-            confidence, _num_classes,
+            confidence, _num_classes, size, h_orig, w_orig,
         )
         return wall_mask

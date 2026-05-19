@@ -1764,6 +1764,10 @@ class FloorplanPipeline:
 
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
+        # Dynamic U-Net input size: average of image dimensions
+        h, w = img.shape[:2]
+        unet_img_size = (h + w) // 2
+
         try:
             from detect_unet import run_unet_subprocess as _detect_unet_subprocess
         except ImportError as exc:
@@ -1773,11 +1777,15 @@ class FloorplanPipeline:
             image_rgb=img_rgb,
             checkpoint_path=ckpt,
             device=self.config.unet_device,
-            img_size=self.config.unet_img_size,
+            img_size=unet_img_size,
             confidence=self.config.unet_confidence,
             min_wall_area=self.config.unet_min_wall_area,
             min_door_area=self.config.unet_min_door_area,
             min_window_area=self.config.unet_min_window_area,
+        )
+        logger.info(
+            "U-Net subprocess: img_size=%d px (dynamic: (%d+%d)//2)",
+            unet_img_size, h, w
         )
 
         if unet_result is None:
