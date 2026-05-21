@@ -1,11 +1,4 @@
-"""
-Система анализа планировок помещений - Модуль алгоритмической детекции окон
-Версия: 3.9
-Автор: Быков Вадим Олегович
-Дата: 01.28.2026
-
-Алгоритм детекции окон на основе параллельных тонких линий.
-"""
+"""Window detection based on parallel thin lines."""
 
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
@@ -55,7 +48,7 @@ def _iou_xyxy(
     return inter / union if union > 0.0 else 0.0
 
 
-class AlgorithmicWindowDetector:
+class WindowDetector:
     """
     Детектор окон на основе алгоритма параллельных линий.
 

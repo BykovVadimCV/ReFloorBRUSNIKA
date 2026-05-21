@@ -498,7 +498,7 @@ def _run_unet(img_bgr: np.ndarray, ckpt_path: str,
                ) -> Optional[Dict[str, Any]]:
     """Run the project U-Net on a BGR image. Returns its native dict, or None."""
     try:
-        from detect_unet import run_unet_pipeline
+        from detection.unet_inference import run_unet_pipeline
     except Exception as exc:
         logger.info("[diagonal] U-Net module unavailable: %s", exc)
         return None

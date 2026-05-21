@@ -1,19 +1,4 @@
-"""
-SmartFloorPlanGenerator — Professional-Grade Configurable Procedural Engine
-Version: 6.0
-Author: Bykov Vadim Olegovich
-Date: 2026-01-28
-Architecture: Plugin-based strategy system with Shapely geometry, theme engine,
- constraint solver, vector export, semantic furniture placement, and multi-format output.
-Changes v6.0:
- - NEW wall type: "outlined" — dark contour with background fill inside
- - NEW door type: "cross" — double-stroke wall segment crossed by thin perpendicular line with serifs
- - U-Net semantic segmentation masks output (multi-class PNG masks compatible with
-   pretrained encoder backbones like ResNet-50 / EfficientNet-b3)
- - All v5.0 features preserved
-Dependencies:
- pip install opencv-python numpy shapely networkx pulp svgwrite ezdxf pydantic pyyaml scipy noise kiwisolver
-"""
+"""Procedural floorplan dataset generator with semantic-segmentation mask output."""
 from __future__ import annotations
 import os
 import sys

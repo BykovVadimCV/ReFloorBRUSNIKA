@@ -1,9 +1,4 @@
-"""
-Visualization utilities for the ReFloorBRUSNIKA pipeline.
-
-Extracted from main.py. Generates summary images and room/OCR overlays
-using matplotlib and OpenCV.
-"""
+"""Summary-image and overlay rendering for the pipeline output."""
 
 from __future__ import annotations
 
@@ -25,7 +20,7 @@ import numpy as np
 # DESIGN SYSTEM
 # ============================================================
 
-class VisualizationTheme:
+class PlotStyle:
     """Colors and styling constants for visualization output."""
 
     FIG_BG = 'white'
@@ -111,7 +106,7 @@ def format_wall_length(length_cm: float) -> str:
 def _axes_clean(ax: plt.Axes, title: str = '') -> None:
     """Clean up matplotlib axes: remove ticks, thin spines, set title."""
     for spine in ax.spines.values():
-        spine.set_edgecolor(VisualizationTheme.AXES_EDGE)
+        spine.set_edgecolor(PlotStyle.AXES_EDGE)
         spine.set_linewidth(0.5)
     ax.set_xticks([])
     ax.set_yticks([])
@@ -119,7 +114,7 @@ def _axes_clean(ax: plt.Axes, title: str = '') -> None:
         ax.set_title(
             title,
             fontsize=9,
-            color=VisualizationTheme.TITLE_COLOR,
+            color=PlotStyle.TITLE_COLOR,
             fontfamily='sans-serif',
             fontweight='normal',
             loc='left',
@@ -130,7 +125,7 @@ def _axes_clean(ax: plt.Axes, title: str = '') -> None:
 def _watermark(ax: plt.Axes) -> None:
     """Add watermark text to a matplotlib axes."""
     ax.text(
-        0.995, 0.015, VisualizationTheme.WATERMARK,
+        0.995, 0.015, PlotStyle.WATERMARK,
         transform=ax.transAxes,
         fontsize=4.9, color='#aaaaaa',
         ha='right', va='bottom',
@@ -207,8 +202,8 @@ def build_wall_overlay(
             cx = int((sx1 + sx2) / 2)
             pt1 = (cx, int(sy1))
             pt2 = (cx, int(sy2))
-        shadow = VisualizationTheme.WALL_OUTER_SHADOW_CV2 if is_outer else VisualizationTheme.WALL_INNER_SHADOW_CV2
-        fg = VisualizationTheme.WALL_OUTER_CV2 if is_outer else VisualizationTheme.WALL_INNER_CV2
+        shadow = PlotStyle.WALL_OUTER_SHADOW_CV2 if is_outer else PlotStyle.WALL_INNER_SHADOW_CV2
+        fg = PlotStyle.WALL_OUTER_CV2 if is_outer else PlotStyle.WALL_INNER_CV2
         cv2.line(overlay, pt1, pt2, shadow, 6)
         cv2.line(overlay, pt1, pt2, fg, 3)
 
@@ -233,8 +228,8 @@ def build_wall_overlay(
         sub = overlay[ry1:ry2, rx1:rx2]
         if sub.size:
             bg = (
-                VisualizationTheme.WALL_LABEL_BG_OUTER
-                if is_outer else VisualizationTheme.WALL_LABEL_BG_INNER
+                PlotStyle.WALL_LABEL_BG_OUTER
+                if is_outer else PlotStyle.WALL_LABEL_BG_INNER
             )
             bg_layer = np.full_like(sub, bg)
             cv2.addWeighted(sub, 0.15, bg_layer, 0.85, 0, sub)
@@ -250,15 +245,15 @@ def build_wall_overlay(
         for op in openings_unified:
             x1, y1, x2, y2 = op.bbox.to_int_tuple()
             if op.opening_type == UOpeningType.DOOR:
-                color = VisualizationTheme.DOOR_BORDER_CV2
+                color = PlotStyle.DOOR_BORDER_CV2
             elif op.opening_type == UOpeningType.WINDOW:
                 sub = overlay[y1:y2, x1:x2]
                 if sub.size:
-                    tint = np.full_like(sub, VisualizationTheme.WINDOW_TINT_CV2)
+                    tint = np.full_like(sub, PlotStyle.WINDOW_TINT_CV2)
                     cv2.addWeighted(sub, 0.55, tint, 0.45, 0, sub)
-                color = VisualizationTheme.WINDOW_BORDER_CV2
+                color = PlotStyle.WINDOW_BORDER_CV2
             else:
-                color = VisualizationTheme.GAP_BORDER_CV2
+                color = PlotStyle.GAP_BORDER_CV2
             cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
 
     # Legacy paths (for backward compat with old pipeline results)
@@ -266,34 +261,34 @@ def build_wall_overlay(
         x, y, ww, hh = win.x, win.y, win.w, win.h
         sub = overlay[y:y + hh, x:x + ww]
         if sub.size:
-            tint = np.full_like(sub, VisualizationTheme.WINDOW_TINT_CV2)
+            tint = np.full_like(sub, PlotStyle.WINDOW_TINT_CV2)
             cv2.addWeighted(sub, 0.55, tint, 0.45, 0, sub)
         cv2.rectangle(overlay, (x, y), (x + ww, y + hh),
-                      VisualizationTheme.WINDOW_BORDER_CV2, 2)
+                      PlotStyle.WINDOW_BORDER_CV2, 2)
 
     for d in (yolo_doors or []):
         x1, y1, x2, y2 = map(int, d.bbox)
         cv2.rectangle(overlay, (x1, y1), (x2, y2),
-                      VisualizationTheme.DOOR_BORDER_CV2, 2)
+                      PlotStyle.DOOR_BORDER_CV2, 2)
 
     for w in (yolo_windows or []):
         x1, y1, x2, y2 = map(int, w.bbox)
         cv2.rectangle(overlay, (x1, y1), (x2, y2),
-                      VisualizationTheme.WINDOW_BORDER_CV2, 2)
+                      PlotStyle.WINDOW_BORDER_CV2, 2)
 
     for op in (gap_openings or []):
         if getattr(op, 'is_valid', True):
             cv2.rectangle(overlay, (op.x1, op.y1), (op.x2, op.y2),
-                          VisualizationTheme.GAP_BORDER_CV2, 2)
+                          PlotStyle.GAP_BORDER_CV2, 2)
 
     # Draw door arcs
     if door_arcs:
         try:
-            from detection.doordetector import AlgorithmicDoorArcDetector
+            from detection.door_arc import DoorArcDetector
             for arc in door_arcs:
-                AlgorithmicDoorArcDetector.draw_arc_on_image(
+                DoorArcDetector.draw_arc_on_image(
                     overlay, arc,
-                    color=VisualizationTheme.DOOR_BORDER_CV2,
+                    color=PlotStyle.DOOR_BORDER_CV2,
                     thickness=3,
                     draw_hinge=True,
                     draw_label=False,
@@ -325,7 +320,7 @@ def build_wall_bbox_overlay(
 
     for i, seg in enumerate(segments or []):
         is_outer = i in outer_ids
-        color = VisualizationTheme.WALL_OUTER_CV2 if is_outer else VisualizationTheme.WALL_INNER_CV2
+        color = PlotStyle.WALL_OUTER_CV2 if is_outer else PlotStyle.WALL_INNER_CV2
         sx1, sy1, sx2, sy2 = _seg_coords(seg)
         x1, y1, x2, y2 = int(sx1), int(sy1), int(sx2), int(sy2)
         cv2.rectangle(fill_layer, (x1, y1), (x2, y2), color, -1)
@@ -383,23 +378,23 @@ def build_doors_overlay(
             continue
         x1, y1, x2, y2 = op.bbox.to_int_tuple()
         cv2.rectangle(overlay, (x1, y1), (x2, y2),
-                      VisualizationTheme.DOOR_BORDER_CV2, 2)
+                      PlotStyle.DOOR_BORDER_CV2, 2)
         # Label with confidence
         label = f'{op.confidence:.0%}'
         if op.source:
             label = f'{op.source} {label}'
         cv2.putText(overlay, label, (x1, max(0, y1 - 4)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35,
-                    VisualizationTheme.DOOR_BORDER_CV2, 1, cv2.LINE_AA)
+                    PlotStyle.DOOR_BORDER_CV2, 1, cv2.LINE_AA)
 
     # Draw door arcs
     if door_arcs:
         try:
-            from detection.doordetector import AlgorithmicDoorArcDetector
+            from detection.door_arc import DoorArcDetector
             for arc in door_arcs:
-                AlgorithmicDoorArcDetector.draw_arc_on_image(
+                DoorArcDetector.draw_arc_on_image(
                     overlay, arc,
-                    color=VisualizationTheme.DOOR_BORDER_CV2,
+                    color=PlotStyle.DOOR_BORDER_CV2,
                     thickness=3,
                     draw_hinge=True,
                     draw_label=False,
@@ -426,17 +421,17 @@ def build_windows_overlay(
         # Tint window area
         sub = overlay[y1:y2, x1:x2]
         if sub.size:
-            tint = np.full_like(sub, VisualizationTheme.WINDOW_TINT_CV2)
+            tint = np.full_like(sub, PlotStyle.WINDOW_TINT_CV2)
             cv2.addWeighted(sub, 0.55, tint, 0.45, 0, sub)
         cv2.rectangle(overlay, (x1, y1), (x2, y2),
-                      VisualizationTheme.WINDOW_BORDER_CV2, 2)
+                      PlotStyle.WINDOW_BORDER_CV2, 2)
         # Label with confidence
         label = f'{op.confidence:.0%}'
         if op.source:
             label = f'{op.source} {label}'
         cv2.putText(overlay, label, (x1, max(0, y1 - 4)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35,
-                    VisualizationTheme.WINDOW_BORDER_CV2, 1, cv2.LINE_AA)
+                    PlotStyle.WINDOW_BORDER_CV2, 1, cv2.LINE_AA)
 
     return overlay
 
@@ -454,8 +449,8 @@ def build_rooms_openings_overlay(
     overlay = img.copy()
     fill_layer = np.zeros_like(img)
 
-    fills = VisualizationTheme.ROOM_FILLS
-    borders = VisualizationTheme.ROOM_BORDERS
+    fills = PlotStyle.ROOM_FILLS
+    borders = PlotStyle.ROOM_BORDERS
 
     for i, room in enumerate(rooms or []):
         color_hex = fills[i % len(fills)]
@@ -493,22 +488,22 @@ def build_rooms_openings_overlay(
     for op in (openings or []):
         x1, y1, x2, y2 = op.bbox.to_int_tuple()
         if op.opening_type == UOpeningType.DOOR:
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), VisualizationTheme.DOOR_BORDER_CV2, 2)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), PlotStyle.DOOR_BORDER_CV2, 2)
         elif op.opening_type == UOpeningType.WINDOW:
             sub = overlay[y1:y2, x1:x2]
             if sub.size:
-                tint = np.full_like(sub, VisualizationTheme.WINDOW_TINT_CV2)
+                tint = np.full_like(sub, PlotStyle.WINDOW_TINT_CV2)
                 cv2.addWeighted(sub, 0.55, tint, 0.45, 0, sub)
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), VisualizationTheme.WINDOW_BORDER_CV2, 2)
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), PlotStyle.WINDOW_BORDER_CV2, 2)
 
     # Draw door arcs
     if door_arcs:
         try:
-            from detection.doordetector import AlgorithmicDoorArcDetector
+            from detection.door_arc import DoorArcDetector
             for arc in door_arcs:
-                AlgorithmicDoorArcDetector.draw_arc_on_image(
+                DoorArcDetector.draw_arc_on_image(
                     overlay, arc,
-                    color=VisualizationTheme.DOOR_BORDER_CV2,
+                    color=PlotStyle.DOOR_BORDER_CV2,
                     thickness=2, draw_hinge=True, draw_label=False,
                 )
         except Exception:
@@ -569,7 +564,7 @@ class FloorplanVisualizer:
 
         fig = plt.figure(
             figsize=(24, 14), dpi=dpi,
-            facecolor=VisualizationTheme.FIG_BG,
+            facecolor=PlotStyle.FIG_BG,
         )
         gs = GridSpec(
             2, 3, figure=fig,
@@ -586,7 +581,7 @@ class FloorplanVisualizer:
 
         fig.text(
             0.5, 0.970, 'Floor Plan Analysis',
-            fontsize=14, color=VisualizationTheme.TITLE_COLOR,
+            fontsize=14, color=PlotStyle.TITLE_COLOR,
             fontfamily='sans-serif', fontweight='semibold',
             ha='center', va='top',
         )
@@ -594,7 +589,7 @@ class FloorplanVisualizer:
             0.5, 0.945,
             f'{n_walls} walls  \u00b7  {n_doors} doors  \u00b7  {n_windows} windows'
             f'  \u00b7  {n_gaps} gaps  \u00b7  {n_arcs} swing arcs  \u00b7  {area_str}',
-            fontsize=9, color=VisualizationTheme.CAPTION_COLOR,
+            fontsize=9, color=PlotStyle.CAPTION_COLOR,
             fontfamily='sans-serif', ha='center', va='top',
         )
 
@@ -655,7 +650,7 @@ class FloorplanVisualizer:
 
         fig.savefig(
             output_path, dpi=dpi, bbox_inches='tight',
-            facecolor=VisualizationTheme.FIG_BG,
+            facecolor=PlotStyle.FIG_BG,
             edgecolor='none', pad_inches=0.015,
         )
         plt.close(fig)
@@ -708,13 +703,13 @@ class FloorplanVisualizer:
         fig, ax = plt.subplots(
             1, 1,
             figsize=(w / dpi + 0.3, h / dpi + 0.5),
-            dpi=dpi, facecolor=VisualizationTheme.FIG_BG,
+            dpi=dpi, facecolor=PlotStyle.FIG_BG,
         )
         fig.subplots_adjust(left=0.01, right=0.99, top=0.95, bottom=0.01)
 
         fig.text(
             0.01, 0.98, 'Rooms & OCR labels',
-            fontsize=8, color=VisualizationTheme.TITLE_COLOR,
+            fontsize=8, color=PlotStyle.TITLE_COLOR,
             fontfamily='sans-serif', fontweight='semibold', va='top',
         )
 
@@ -726,8 +721,8 @@ class FloorplanVisualizer:
 
         # Draw rooms
         for i, room in enumerate(rooms or []):
-            fill = VisualizationTheme.ROOM_FILLS[i % len(VisualizationTheme.ROOM_FILLS)]
-            border = VisualizationTheme.ROOM_BORDERS[i % len(VisualizationTheme.ROOM_BORDERS)]
+            fill = PlotStyle.ROOM_FILLS[i % len(PlotStyle.ROOM_FILLS)]
+            border = PlotStyle.ROOM_BORDERS[i % len(PlotStyle.ROOM_BORDERS)]
             pts_px = room_points_to_px(room, self.pixels_to_cm)
             if len(pts_px) < 3:
                 continue
@@ -767,18 +762,18 @@ class FloorplanVisualizer:
             elif hasattr(opening, 'center'):
                 ox = cm_to_px(opening.center.x, self.pixels_to_cm)
                 oy = cm_to_px(opening.center.y, self.pixels_to_cm)
-                from floorplanexporter import OpeningType as LegacyOT
+                from floorplan_export.legacy import OpeningType as LegacyOT
                 is_door = opening.opening_type == LegacyOT.DOOR
                 is_window = opening.opening_type == LegacyOT.WINDOW
             else:
                 continue
 
             if is_door:
-                color, marker = VisualizationTheme.DOOR_MPL, 's'
+                color, marker = PlotStyle.DOOR_MPL, 's'
             elif is_window:
-                color, marker = VisualizationTheme.WINDOW_MPL, 'D'
+                color, marker = PlotStyle.WINDOW_MPL, 'D'
             else:
-                color, marker = VisualizationTheme.OPENING_MPL, 'o'
+                color, marker = PlotStyle.OPENING_MPL, 'o'
             ax.plot(ox, oy, marker, color=color, markersize=4.5,
                     markeredgecolor='white', markeredgewidth=0.5,
                     alpha=0.85, zorder=4)
@@ -787,7 +782,7 @@ class FloorplanVisualizer:
         if ocr_labels:
             for text, x1, y1, x2, y2 in ocr_labels:
                 is_num = parse_ocr_area_m2(text) is not None
-                ec = VisualizationTheme.OCR_NUMERIC_MPL if is_num else VisualizationTheme.OCR_TEXT_MPL
+                ec = PlotStyle.OCR_NUMERIC_MPL if is_num else PlotStyle.OCR_TEXT_MPL
                 ax.add_patch(MplRect(
                     (x1, y1), x2 - x1, y2 - y1,
                     linewidth=0.6 if is_num else 0.35,
@@ -813,20 +808,20 @@ class FloorplanVisualizer:
                     angle=0,
                     theta1=arc.start_angle_deg,
                     theta2=arc.end_angle_deg,
-                    color=VisualizationTheme.DOOR_MPL,
+                    color=PlotStyle.DOOR_MPL,
                     linewidth=1.9,
                     linestyle='--',
                     zorder=6,
                 )
                 ax.add_patch(arc_patch)
                 hx, hy = arc.hinge
-                ax.plot(hx, hy, 'd', color=VisualizationTheme.DOOR_MPL,
+                ax.plot(hx, hy, 'd', color=PlotStyle.DOOR_MPL,
                         markersize=5.5, markeredgecolor='white',
                         markeredgewidth=0.6, zorder=7)
 
         fig.savefig(
             output_path, dpi=dpi, bbox_inches='tight',
-            facecolor=VisualizationTheme.FIG_BG,
+            facecolor=PlotStyle.FIG_BG,
             edgecolor='none', pad_inches=0.015,
         )
         plt.close(fig)

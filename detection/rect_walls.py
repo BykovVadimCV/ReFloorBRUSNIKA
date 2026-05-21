@@ -49,7 +49,7 @@ import numpy as np
 from core.config import PipelineConfig
 from core.models import BBox, DetectionResult, WallSegment
 
-import rect_decompose as rd
+from core import rect_decompose as rd
 
 logger = logging.getLogger(__name__)
 
@@ -921,7 +921,7 @@ def _run_door_window_pixel_mask(
 
     try:
         import torch
-        from detect_unet import build_model_from_checkpoint, get_val_transform
+        from detection.unet_inference import build_model_from_checkpoint, get_val_transform
 
         dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model, num_classes = build_model_from_checkpoint(ckpt_path, dev)
@@ -1742,7 +1742,7 @@ class RectWallDetector:
 
         try:
             import torch
-            from detect_unet import build_model_from_checkpoint, get_val_transform
+            from detection.unet_inference import build_model_from_checkpoint, get_val_transform
         except Exception as exc:
             logger.warning("Binary U-Net dependencies unavailable: %s", exc)
             return None

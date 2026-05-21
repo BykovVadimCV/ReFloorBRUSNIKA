@@ -7,10 +7,10 @@ and YOLO inference adapters.
 
 from detection.walls import ColorWallDetector
 from detection.yolo import YOLODetector
-from detection.openings import OpeningDetectionPipeline
+from detection.openings import OpeningPipeline
 
 __all__ = [
     "ColorWallDetector",
     "YOLODetector",
-    "OpeningDetectionPipeline",
+    "OpeningPipeline",
 ]

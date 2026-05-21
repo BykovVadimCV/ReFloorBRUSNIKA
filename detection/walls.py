@@ -1,9 +1,4 @@
-"""
-Wall detection adapter for the ReFloorBRUSNIKA pipeline.
-
-Wraps VersatileWallDetector from the existing walldetector.py,
-converting its output to unified core.models types.
-"""
+"""Wall detection adapter — wraps BrusnikaWallDetector and emits unified types."""
 
 from __future__ import annotations
 
@@ -16,7 +11,7 @@ import numpy as np
 from core.config import PipelineConfig
 from core.models import BBox, DetectionResult, WallSegment
 from detection.base import WallDetector
-from detection.walldetector import VersatileWallDetector, WallRectangle, Theme
+from detection.walldetector import BrusnikaWallDetector, WallRectangle, WallParams
 
 import logging
 
@@ -602,7 +597,7 @@ def wall_rectangle_to_segment(rect: WallRectangle) -> WallSegment:
     Convert a WallRectangle (from walldetector.py) to a unified WallSegment.
 
     Args:
-        rect: WallRectangle from VersatileWallDetector
+        rect: WallRectangle from BrusnikaWallDetector
 
     Returns:
         Unified WallSegment with BBox
@@ -637,20 +632,20 @@ class ColorWallDetector(WallDetector):
     """
     Color-based wall detector adapter.
 
-    Wraps VersatileWallDetector, converts WallRectangle output to
+    Wraps BrusnikaWallDetector, converts WallRectangle output to
     unified WallSegment/DetectionResult format.
     """
 
     def __init__(self, config: Optional[PipelineConfig] = None) -> None:
         self.config = config or PipelineConfig()
-        self._inner: Optional[VersatileWallDetector] = None
+        self._inner: Optional[BrusnikaWallDetector] = None
         self._last_rectangles: List[WallRectangle] = []  # Cache for pipeline
 
-    def _ensure_inner(self, ocr_model=None) -> VersatileWallDetector:
-        """Lazily initialize the inner VersatileWallDetector."""
+    def _ensure_inner(self, ocr_model=None) -> BrusnikaWallDetector:
+        """Lazily initialize the inner BrusnikaWallDetector."""
         if self._inner is None:
             cfg = self.config
-            self._inner = VersatileWallDetector(
+            self._inner = BrusnikaWallDetector(
                 wall_color_hex=cfg.wall_color_hex,
                 color_tolerance=cfg.color_tolerance,
                 auto_wall_color=False,  # color override handled in detect()
@@ -669,7 +664,7 @@ class ColorWallDetector(WallDetector):
         Args:
             ocr_model: Optional docTR OCR model instance
         """
-        self._inner = VersatileWallDetector(
+        self._inner = BrusnikaWallDetector(
             wall_color_hex=self.config.wall_color_hex,
             color_tolerance=self.config.color_tolerance,
             auto_wall_color=False,  # color override handled in detect()
@@ -730,9 +725,9 @@ class ColorWallDetector(WallDetector):
             return self._inner.ocr_model
         return None
 
-    def get_inner(self) -> VersatileWallDetector:
+    def get_inner(self) -> BrusnikaWallDetector:
         """
-        Get the underlying VersatileWallDetector.
+        Get the underlying BrusnikaWallDetector.
 
         Useful for passing to other modules that need the raw detector
         (e.g., for OCR text extraction).

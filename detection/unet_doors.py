@@ -20,7 +20,7 @@ Pipeline
    If no gap matches within the search radius, keep the raw bbox as-is.
 
 The result is a list of Opening objects with source="unet_door" that feed
-into the deduplication step of OpeningDetectionPipeline alongside any
+into the deduplication step of OpeningPipeline alongside any
 YOLO or geometric detections.
 """
 
@@ -132,7 +132,7 @@ def _rect_decompose_blob(
     *bbox* is the (x1, y1, x2, y2) offset of sub_mask within the full image.
     """
     try:
-        import rect_decompose as rd
+        from core import rect_decompose as rd
     except ImportError:
         logger.debug("rect_decompose not available — using blob bbox directly")
         return [bbox]
@@ -586,7 +586,7 @@ class UNetDoorDetector:
             return False
         try:
             import torch
-            from detect_unet import build_model_from_checkpoint
+            from detection.unet_inference import build_model_from_checkpoint
 
             dev_str = self.device or ("cuda" if __import__("torch").cuda.is_available() else "cpu")
             self._torch_device = __import__("torch").device(dev_str)
@@ -753,7 +753,7 @@ class UNetDoorDetector:
         """
         try:
             import torch
-            from detect_unet import get_val_transform
+            from detection.unet_inference import get_val_transform
 
             h_orig, w_orig = img_bgr.shape[:2]
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)

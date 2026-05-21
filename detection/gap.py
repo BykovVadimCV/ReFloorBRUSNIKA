@@ -1,11 +1,4 @@
-"""
-Система анализа планировок помещений - Модуль геометрической детекции проёмов
-Версия: 3.9
-Автор: Быков Вадим Олегович
-Дата: 01.28.2026
-
-Ray casting для поиска разрывов между стенам, обработка пересекающихся стен
-"""
+"""Geometric opening detection via ray casting between wall pairs."""
 
 import cv2
 import numpy as np
@@ -70,7 +63,7 @@ class RayCastResult:
     occlusion_ratio: float
 
 
-class GeometricOpeningDetector:
+class GapDetector:
     """
     Детектор геометрических проёмов в стенах.
 

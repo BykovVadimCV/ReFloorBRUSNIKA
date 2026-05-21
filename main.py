@@ -1,13 +1,4 @@
-"""
-================================================================================
-СИСТЕМА АВТОМАТИЧЕСКОГО АНАЛИЗА ПЛАНИРОВОК КВАРТИР «БРУСНИКА»
-Модуль: CLI-интерфейс (main.py)
-Версия: 6.0 — Clean Architecture Edition
-
-Запуск:
-  python main.py --input <path> --output <dir> [options]
-================================================================================
-"""
+"""CLI entry point for the floorplan analysis pipeline."""
 
 import argparse
 import logging

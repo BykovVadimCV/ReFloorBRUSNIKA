@@ -507,7 +507,7 @@ class Room:
 @dataclass
 class FusedDoor:
     """
-    Canonical door representation produced by DoorFusionEngine.
+    Canonical door representation produced by DoorFusion.
 
     Combines information from YOLO detection, gap detection,
     and door arc detection into a single authoritative record.

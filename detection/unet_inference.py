@@ -1,20 +1,4 @@
-#!/usr/bin/env python3
-"""
-detect_unet.py — U-Net semantic segmentation → bounding box extraction.
-
-Loads a trained U-Net checkpoint, runs inference on floorplan images,
-post-processes the predicted semantic masks to extract individual
-bounding boxes for walls, doors, and windows, then outputs annotated
-images and optional JSON.
-
-Usage
------
-    python detect_unet.py \
-        --checkpoint  best_unet.pth \
-        --images      path/to/images/ \
-        --save-dir    results/ \
-        --save-json
-"""
+"""U-Net semantic segmentation inference plus bounding-box post-processing."""
 
 import argparse
 import json

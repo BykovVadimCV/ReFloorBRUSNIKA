@@ -55,7 +55,7 @@ def make_region_colormap(num_labels: int, labels: np.ndarray,
 def run_unet_mask(image_rgb: np.ndarray, checkpoint_path: str) -> np.ndarray:
     """Run U-Net and return the wall mask (H, W) binary uint8."""
     import torch
-    from detect_unet import build_model, load_checkpoint, get_val_transform
+    from detection.unet_inference import build_model, load_checkpoint, get_val_transform
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model()

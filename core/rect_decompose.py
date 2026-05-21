@@ -1,40 +1,4 @@
-"""
-rect_decompose.py  (improved)
-------------------------------
-Approximate a binary pixel mask with a minimal set of overlapping rectangles
-at any angle.  Rectangles may overlap; the union should be as close as possible
-to the original mask (minimising symmetric difference) while using as few
-rectangles as possible.
-
-Key improvements over v1
-------------------------
-1. Max-weight subrectangle (Kadane 2-D) replaces the O(n^4) brute-force loop.
-   For a given angle the weight grid assigns +1 to uncovered mask pixels and
-   -1 to outside-mask pixels; the max-weight axis-aligned subrectangle in that
-   grid is the best rectangle at that angle — found in O(rows² × cols) instead
-   of O(n^4).
-
-2. PCA-guided angle search.  The principal axis of the remaining mask pixels is
-   computed cheaply and a fine grid of angles around it is added to the uniform
-   schedule.  This lets the algorithm lock onto diagonal features with fewer
-   total angle evaluations.
-
-3. Rectangle penalty.  A configurable minimum gain (--rect-penalty, default 2 %
-   of total mask pixels) must be exceeded before a new rectangle is placed.
-   This directly encodes "use fewer rectangles" in the objective instead of
-   relying on the user to pick the right max_rects.
-
-4. Coordinate-descent refinement.  After every greedy placement the five
-   parameters (cx, cy, w, h, angle) are hill-climbed with a doubling/halving
-   step schedule.  This recovers the inexactness introduced by the integer grid
-   used during candidate search.
-
-Usage
------
-    python rect_decompose.py [image.png] [--max-rects N] [--angle-steps K]
-                             [--rect-penalty P] [--no-refine]
-                             [--output out.png] [--no-show]
-"""
+"""Approximate a binary mask with a minimal set of overlapping rotated rectangles."""
 
 import argparse
 import math

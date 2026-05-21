@@ -1,9 +1,4 @@
-"""
-SH3D export adapter for the ReFloorBRUSNIKA pipeline.
-
-Wraps SweetHome3DExporter from floorplanexporter.py, accepting
-unified core.models types and converting them as needed.
-"""
+"""SH3D export adapter — wraps the legacy SweetHome3D exporter, accepting unified types."""
 
 from __future__ import annotations
 
@@ -57,7 +52,7 @@ def window_opening_to_overlay_wall(
     The returned wall is appended to the SH3D export's
     ``extra_structural_walls`` list (with ``is_structural=False``).
     """
-    from floorplanexporter import Wall as _LegacyWall, Point as _LegacyPoint
+    from floorplan_export.legacy import Wall as _LegacyWall, Point as _LegacyPoint
 
     cx, cy = window.bbox.center
 
@@ -188,7 +183,7 @@ class SH3DExporter:
 
     def _init_inner(self) -> None:
         """Initialize the underlying SweetHome3DExporter."""
-        from floorplanexporter import SweetHome3DExporter as LegacyExporter
+        from floorplan_export.legacy import SweetHome3DExporter as LegacyExporter
         cfg = self.config
         self._inner = LegacyExporter(
             pixels_to_cm=cfg.pixels_to_cm,
@@ -243,7 +238,7 @@ class SH3DExporter:
         #   • ThicknessNormalizer ignores them (only uses is_structural=True walls)
         # This guarantees every U-Net door has a pre-built parent wall and the
         # exporter never needs to synthesise or guess wall geometry for doors.
-        from floorplanexporter import Wall as _LegacyWall, Point as _LegacyPoint
+        from floorplan_export.legacy import Wall as _LegacyWall, Point as _LegacyPoint
 
         regular_walls = [w for w in walls if not w.is_diagonal and not w.is_door_wall]
         diag_walls    = [w for w in walls if w.is_diagonal]
@@ -371,15 +366,7 @@ class SH3DExporter:
 
 
 def _convert_legacy_rooms(legacy_rooms: List) -> List[Room]:
-    """
-    Convert legacy Room objects from floorplanexporter.py to core.models.Room.
-
-    Args:
-        legacy_rooms: List of floorplanexporter.Room objects
-
-    Returns:
-        List of core.models.Room objects
-    """
+    """Convert legacy Room objects to core.models.Room."""
     from core.models import Point, Room
 
     result = []

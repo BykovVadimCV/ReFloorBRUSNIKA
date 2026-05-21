@@ -42,7 +42,7 @@ sys.path.insert(0, PROJECT_ROOT)
 def get_unet_wall_mask(image_rgb: np.ndarray, checkpoint_path: str) -> np.ndarray:
     """Run U-Net and return binary wall mask (H, W), 255=wall, 0=other."""
     import torch
-    from detect_unet import build_model, load_checkpoint, get_val_transform
+    from detection.unet_inference import build_model, load_checkpoint, get_val_transform
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model()

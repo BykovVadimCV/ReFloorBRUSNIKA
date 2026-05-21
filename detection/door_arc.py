@@ -1,48 +1,4 @@
-"""
-AlgorithmicDoorArcDetector – Morphology-First Door Swing Arc Detection
-========================================================================
-Brusnika Floor Plan System v5.4 Integration Module
-
-Detects classic quarter-circle swing arcs that indicate door openings
-on architectural floor plans. Pure classical computer vision — no deep
-learning. Fully deterministic, 100% explainable, < 80 ms on typical input.
-
-Now includes:
-  - FusedDoor dataclass — canonical door representation
-  - DoorFusionEngine — single authoritative fusion layer for all door sources
-
-Author: Grok (designed for seamless integration with v5.4)
-Version: 2.0
-Date: February 28, 2026
-
-Architecture
-------------
-The detector runs as an 8-stage pipeline:
-    Stage 0  Context-Aware Preprocessing  (now accepts optional roi_mask)
-    Stage 1  Multi-Scale Morphological Enhancement
-    Stage 2  Contour Extraction & Initial Pruning
-    Stage 3  Robust Partial-Circle Fitting
-    Stage 4  Hinge & Swing Direction Recovery
-    Stage 5  Wall-Attachment & Opening Validation
-    Stage 6  False-Positive Suppression
-    Stage 7  Non-Maximum Suppression & Merging
-    Stage 8  Output Enrichment
-
-DoorFusionEngine
------------------
-    Phase 0  Enhanced Arc ROI
-    Phase 1  Tight YOLO ↔ Gap Matching
-    Phase 2  Arc Triangulation (primary truth)
-    Phase 3  Fallback for doors without arc
-    Phase 4  Output List[FusedDoor]
-
-Integration
------------
-Instantiated once in HybridWallAnalyzer.__init__, called in process_image()
-right after gap detection. Output stored in color_results['door_arcs'].
-FusedDoor objects stored in color_results['fused_doors'].
-No breaking changes to any existing module.
-"""
+"""Door swing arc detection via classical morphology (no deep learning)."""
 
 from __future__ import annotations
 
@@ -63,7 +19,7 @@ import numpy as np
 logger = logging.getLogger("DoorArcDetector")
 
 # ---------------------------------------------------------------------------
-# IoU helper (used by filter_gaps_against_yolo_doors and DoorFusionEngine)
+# IoU helper (used by filter_gaps_against_yolo_doors and DoorFusion)
 # ---------------------------------------------------------------------------
 def _iou_xyxy(
     a: Tuple[float, float, float, float],
@@ -105,24 +61,6 @@ class SwingDirection(str, Enum):
     LEFT = "left"
     RIGHT = "right"
     UNKNOWN = "unknown"
-
-
-@dataclass
-class FusedDoor:
-    """
-    Canonical door representation produced by DoorFusionEngine.
-    Consumed by SweetHome3DExporter and visualisers.
-    """
-    id: int
-    hinge: Tuple[int, int]            # exact pixel hinge from arc or inferred
-    center: Tuple[int, int]
-    width_px: int
-    wall_normal_deg: float
-    direction: str                    # "left" | "right"
-    swing_clockwise: bool
-    confidence: float                 # 0.0–1.0
-    matched_gap_idx: int = -1
-    source: str = "arc"               # "arc" | "yolo_gap" | "yolo_only"
 
 
 @dataclass
@@ -204,327 +142,10 @@ class DetectedDoorArc:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# DOOR FUSION ENGINE
-# ═══════════════════════════════════════════════════════════════════════════
-
-class DoorFusionEngine:
-    """
-    Single authoritative fusion layer that combines YOLO doors, gaps, and
-    morphological swing arcs into canonical FusedDoor objects.
-
-    Treats morphological swing arcs as the primary source of truth.
-    Falls back gracefully when arcs are absent.
-    Guarantees pixel-perfect hinge + correct swing direction for every door.
-    """
-
-    def __init__(
-        self,
-        gap_radius_tolerance: float = 0.12,
-        hinge_snap_px: int = 18,
-        yolo_iou_threshold: float = 0.15,
-        yolo_center_dist_threshold: int = 60,
-        perpendicular_angle_tolerance: float = 30.0,
-    ):
-        self.gap_radius_tolerance = gap_radius_tolerance
-        self.hinge_snap_px = hinge_snap_px
-        self.yolo_iou_threshold = yolo_iou_threshold
-        self.yolo_center_dist_threshold = yolo_center_dist_threshold
-        self.perpendicular_angle_tolerance = perpendicular_angle_tolerance
-
-    def fuse(
-        self,
-        yolo_doors: List[Any],
-        gaps: List[Any],
-        arcs: List[DetectedDoorArc],
-        wall_segments: List[Any],
-        rooms: Optional[List[Any]] = None,
-    ) -> List[FusedDoor]:
-        """
-        Run the 4-phase fusion algorithm.
-
-        Parameters
-        ----------
-        yolo_doors : list
-            YOLO detection objects (have .x1/.y1/.x2/.y2 or .bbox or 4-tuple).
-        gaps : list
-            Gap/opening objects (have .x/.y/.w/.h or 4-tuple (x,y,w,h)).
-        arcs : list of DetectedDoorArc
-            May be empty.
-        wall_segments : list
-            Wall segment objects for hinge snapping.
-        rooms : list, optional
-            Room objects for interior/exterior test.
-
-        Returns
-        -------
-        list of FusedDoor
-            Sorted by id.
-        """
-        # Normalise inputs
-        norm_yolo = self._normalise_yolo(yolo_doors)
-        norm_gaps = self._normalise_gaps(gaps)
-
-        fused: List[FusedDoor] = []
-        used_yolo: set = set()
-        used_gap: set = set()
-        next_id = 0
-
-        # ── Phase 1: Tight YOLO ↔ Gap Matching ──────────────────────
-        yolo_gap_matches: Dict[int, int] = {}  # yolo_idx -> gap_idx
-        if norm_yolo and norm_gaps:
-            # Sort YOLO by area descending
-            yolo_areas = []
-            for yi, y in enumerate(norm_yolo):
-                area = (y[2] - y[0]) * (y[3] - y[1])
-                yolo_areas.append((area, yi))
-            yolo_areas.sort(reverse=True)
-
-            assigned_gaps: set = set()
-            for _, yi in yolo_areas:
-                ybox = norm_yolo[yi]
-                ycx = (ybox[0] + ybox[2]) / 2
-                ycy = (ybox[1] + ybox[3]) / 2
-                # Expand YOLO box by 40px for matching
-                expanded = (ybox[0] - 40, ybox[1] - 40, ybox[2] + 40, ybox[3] + 40)
-
-                best_score = -1.0
-                best_gi = -1
-                for gi, g in enumerate(norm_gaps):
-                    if gi in assigned_gaps:
-                        continue
-                    gx1, gy1 = g[0], g[1]
-                    gx2, gy2 = g[0] + g[2], g[1] + g[3]
-                    gap_box = (gx1, gy1, gx2, gy2)
-
-                    iou = _iou_xyxy(expanded, gap_box)
-                    gcx = (gx1 + gx2) / 2
-                    gcy = (gy1 + gy2) / 2
-                    dist = math.hypot(ycx - gcx, ycy - gcy)
-
-                    if iou > self.yolo_iou_threshold or dist < self.yolo_center_dist_threshold:
-                        dist_score = max(0.0, 1.0 - dist / 80.0)
-                        score = 0.55 * dist_score + 0.45 * iou
-                        if score > best_score:
-                            best_score = score
-                            best_gi = gi
-
-                if best_gi >= 0:
-                    yolo_gap_matches[yi] = best_gi
-                    assigned_gaps.add(best_gi)
-
-        # ── Phase 2: Arc Triangulation (primary truth) ───────────────
-        used_arcs: set = set()
-        if arcs:
-            for arc in arcs:
-                # Try to match arc to a gap
-                matched_gi = -1
-                if norm_gaps:
-                    for gi, g in enumerate(norm_gaps):
-                        gap_length = max(g[2], g[3])
-                        # Check radius vs gap length
-                        if gap_length > 0:
-                            radius_diff = abs(arc.radius_px - gap_length) / gap_length
-                        else:
-                            radius_diff = 1.0
-
-                        if radius_diff >= self.gap_radius_tolerance:
-                            continue
-
-                        # Check hinge within snap distance of gap endpoint
-                        gx1, gy1 = g[0], g[1]
-                        gx2, gy2 = g[0] + g[2], g[1] + g[3]
-                        gap_endpoints = [
-                            (gx1, gy1), (gx2, gy1), (gx1, gy2), (gx2, gy2),
-                            (gx1, (gy1 + gy2) / 2), (gx2, (gy1 + gy2) / 2),
-                            ((gx1 + gx2) / 2, gy1), ((gx1 + gx2) / 2, gy2),
-                        ]
-
-                        hinge_near = any(
-                            math.hypot(arc.hinge[0] - ep[0], arc.hinge[1] - ep[1]) < self.hinge_snap_px
-                            for ep in gap_endpoints
-                        )
-                        if not hinge_near:
-                            continue
-
-                        # Check arc center inside gap rect (with tolerance)
-                        tol = 10
-                        if (gx1 - tol <= arc.center[0] <= gx2 + tol and
-                                gy1 - tol <= arc.center[1] <= gy2 + tol):
-                            matched_gi = gi
-                            break
-
-                # Match to best YOLO (closest center)
-                matched_yi = -1
-                if norm_yolo:
-                    best_ydist = float('inf')
-                    for yi, y in enumerate(norm_yolo):
-                        ycx = (y[0] + y[2]) / 2
-                        ycy = (y[1] + y[3]) / 2
-                        d = math.hypot(arc.center[0] - ycx, arc.center[1] - ycy)
-                        if d < best_ydist:
-                            best_ydist = d
-                            matched_yi = yi
-
-                fd = FusedDoor(
-                    id=next_id,
-                    hinge=arc.hinge,
-                    center=arc.center,
-                    width_px=int(arc.radius_px * 2),
-                    wall_normal_deg=arc.wall_normal_deg,
-                    direction=arc.direction,
-                    swing_clockwise=arc.swing_clockwise,
-                    confidence=arc.confidence,
-                    matched_gap_idx=matched_gi,
-                    source="arc",
-                )
-                fused.append(fd)
-                next_id += 1
-                used_arcs.add(arc.id)
-                if matched_yi >= 0:
-                    used_yolo.add(matched_yi)
-                if matched_gi >= 0:
-                    used_gap.add(matched_gi)
-
-        # ── Phase 3: Fallback for doors without arc ──────────────────
-        for yi, gi in yolo_gap_matches.items():
-            if yi in used_yolo or gi in used_gap:
-                continue
-
-            ybox = norm_yolo[yi]
-            g = norm_gaps[gi]
-
-            gx1, gy1 = g[0], g[1]
-            gx2, gy2 = g[0] + g[2], g[1] + g[3]
-            gap_cx = (gx1 + gx2) / 2
-            gap_cy = (gy1 + gy2) / 2
-            gap_w = g[2]
-            gap_h = g[3]
-
-            # Infer hinge: use gap endpoint closest to YOLO box edge
-            # (heuristic: hinge is typically at the edge of the gap)
-            is_horizontal_gap = gap_w >= gap_h
-            if is_horizontal_gap:
-                # Left or right endpoint
-                ycx = (ybox[0] + ybox[2]) / 2
-                if abs(gx1 - ycx) < abs(gx2 - ycx):
-                    hinge = (int(gx1), int(gap_cy))
-                else:
-                    hinge = (int(gx2), int(gap_cy))
-                wall_normal = 90.0 if is_horizontal_gap else 0.0
-            else:
-                ycy = (ybox[1] + ybox[3]) / 2
-                if abs(gy1 - ycy) < abs(gy2 - ycy):
-                    hinge = (int(gap_cx), int(gy1))
-                else:
-                    hinge = (int(gap_cx), int(gy2))
-                wall_normal = 0.0
-
-            # Infer swing direction from YOLO center relative to gap
-            ycx = (ybox[0] + ybox[2]) / 2
-            ycy = (ybox[1] + ybox[3]) / 2
-            cross = (gap_cx - hinge[0]) * (ycy - hinge[1]) - (gap_cy - hinge[1]) * (ycx - hinge[0])
-            direction = "left" if cross > 0 else "right"
-            swing_cw = cross <= 0
-
-            fd = FusedDoor(
-                id=next_id,
-                hinge=hinge,
-                center=(int(gap_cx), int(gap_cy)),
-                width_px=int(max(gap_w, gap_h)),
-                wall_normal_deg=wall_normal,
-                direction=direction,
-                swing_clockwise=swing_cw,
-                confidence=0.5,
-                matched_gap_idx=gi,
-                source="yolo_gap",
-            )
-            fused.append(fd)
-            next_id += 1
-            used_yolo.add(yi)
-            used_gap.add(gi)
-
-        # Handle YOLO-only doors (no gap match, no arc)
-        for yi, y in enumerate(norm_yolo):
-            if yi in used_yolo:
-                continue
-            ycx = int((y[0] + y[2]) / 2)
-            ycy = int((y[1] + y[3]) / 2)
-            yw = int(y[2] - y[0])
-            yh = int(y[3] - y[1])
-            is_horiz = yw >= yh
-            width = max(yw, yh)
-
-            fd = FusedDoor(
-                id=next_id,
-                hinge=(int(y[0]), ycy) if is_horiz else (ycx, int(y[1])),
-                center=(ycx, ycy),
-                width_px=width,
-                wall_normal_deg=90.0 if is_horiz else 0.0,
-                direction="right",
-                swing_clockwise=True,
-                confidence=0.3,
-                matched_gap_idx=-1,
-                source="yolo_only",
-            )
-            fused.append(fd)
-            next_id += 1
-
-        # ── Phase 4: Sort and return ─────────────────────────────────
-        fused.sort(key=lambda d: d.id)
-        logger.info("DoorFusionEngine: %d fused doors (%d from arcs, %d from yolo+gap, %d yolo-only)",
-                     len(fused),
-                     sum(1 for f in fused if f.source == "arc"),
-                     sum(1 for f in fused if f.source == "yolo_gap"),
-                     sum(1 for f in fused if f.source == "yolo_only"))
-        return fused
-
-    @staticmethod
-    def _normalise_gaps(
-        candidate_gaps: Optional[List[Any]],
-    ) -> List[Tuple[int, int, int, int]]:
-        """Convert heterogeneous gap objects to (x, y, w, h) tuples."""
-        if not candidate_gaps:
-            return []
-        result = []
-        for g in candidate_gaps:
-            if isinstance(g, (list, tuple)) and len(g) >= 4:
-                result.append((int(g[0]), int(g[1]), int(g[2]), int(g[3])))
-            elif hasattr(g, "x") and hasattr(g, "y") and hasattr(g, "w") and hasattr(g, "h"):
-                result.append((int(g.x), int(g.y), int(g.w), int(g.h)))
-            elif hasattr(g, "x1") and hasattr(g, "y1") and hasattr(g, "x2") and hasattr(g, "y2"):
-                result.append((int(g.x1), int(g.y1), int(g.x2 - g.x1), int(g.y2 - g.y1)))
-            elif hasattr(g, "bbox"):
-                b = g.bbox
-                result.append((int(b[0]), int(b[1]), int(b[2]), int(b[3])))
-        return result
-
-    @staticmethod
-    def _normalise_yolo(
-        yolo_doors: Optional[List[Any]],
-    ) -> List[Tuple[int, int, int, int]]:
-        """Convert YOLO detection objects to (x1, y1, x2, y2) tuples."""
-        if not yolo_doors:
-            return []
-        result = []
-        for d in yolo_doors:
-            if isinstance(d, (list, tuple)) and len(d) >= 4:
-                result.append((int(d[0]), int(d[1]), int(d[2]), int(d[3])))
-            elif hasattr(d, "x1"):
-                result.append((int(d.x1), int(d.y1), int(d.x2), int(d.y2)))
-            elif hasattr(d, "bbox"):
-                b = d.bbox
-                result.append((int(b[0]), int(b[1]), int(b[2]), int(b[3])))
-            elif hasattr(d, "xyxy"):
-                b = d.xyxy
-                result.append((int(b[0]), int(b[1]), int(b[2]), int(b[3])))
-        return result
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 # MAIN DETECTOR CLASS
 # ═══════════════════════════════════════════════════════════════════════════
 
-class AlgorithmicDoorArcDetector:
+class DoorArcDetector:
     """
     Pure-classical morphological door-swing-arc detector.
 
@@ -666,9 +287,9 @@ class AlgorithmicDoorArcDetector:
         img : np.ndarray
             Original BGR floor-plan image.
         wall_outline_mask : np.ndarray
-            Binary mask (255 = wall) from VersatileWallDetector.
+            Binary mask (255 = wall) from BrusnikaWallDetector.
         candidate_gaps : list
-            Gap/opening objects from GeometricOpeningDetector.
+            Gap/opening objects from GapDetector.
         yolo_doors : list
             YOLO detection objects.
         pixel_scale : float
@@ -681,7 +302,7 @@ class AlgorithmicDoorArcDetector:
             Used for debug-image filenames.
         roi_mask : np.ndarray, optional   ← NEW PARAMETER
             External ROI mask. If provided, used instead of building from
-            YOLO+gaps in Stage 0. Enables DoorFusionEngine Phase 0.
+            YOLO+gaps in Stage 0. Enables DoorFusion Phase 0.
 
         Returns
         -------
@@ -821,7 +442,7 @@ class AlgorithmicDoorArcDetector:
         """
         Build a clean binary image restricted to regions of interest.
 
-        If roi_mask is provided externally (e.g. from DoorFusionEngine Phase 0),
+        If roi_mask is provided externally (e.g. from DoorFusion Phase 0),
         use it directly instead of building from YOLO + gaps.
         """
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
@@ -1411,7 +1032,7 @@ class AlgorithmicDoorArcDetector:
         return rects
 
     # ══════════════════════════════════════════════════════════════════════
-    # ENHANCED ROI BUILDER (for DoorFusionEngine Phase 0)
+    # ENHANCED ROI BUILDER (for DoorFusion Phase 0)
     # ══════════════════════════════════════════════════════════════════════
     @staticmethod
     def build_enhanced_roi_mask(
@@ -1424,7 +1045,7 @@ class AlgorithmicDoorArcDetector:
         gap_expand_px: int = 40,
     ) -> np.ndarray:
         """
-        Build an enhanced ROI mask for Phase 0 of DoorFusionEngine.
+        Build an enhanced ROI mask for Phase 0 of DoorFusion.
 
         roi = dilated(YOLO ±50 px) |
               dilated(gaps ±40 px) |
@@ -1435,7 +1056,7 @@ class AlgorithmicDoorArcDetector:
         roi = np.zeros((h, w), dtype=np.uint8)
 
         # YOLO regions
-        norm_yolo = AlgorithmicDoorArcDetector._normalise_yolo(yolo_doors)
+        norm_yolo = DoorArcDetector._normalise_yolo(yolo_doors)
         for (x1, y1, x2, y2) in norm_yolo:
             rx1 = max(0, x1 - yolo_expand_px)
             ry1 = max(0, y1 - yolo_expand_px)
@@ -1444,7 +1065,7 @@ class AlgorithmicDoorArcDetector:
             roi[ry1:ry2, rx1:rx2] = 255
 
         # Gap regions
-        norm_gaps = AlgorithmicDoorArcDetector._normalise_gaps(gaps)
+        norm_gaps = DoorArcDetector._normalise_gaps(gaps)
         for (gx, gy, gw, gh) in norm_gaps:
             rx1 = max(0, gx - gap_expand_px)
             ry1 = max(0, gy - gap_expand_px)
@@ -1638,49 +1259,6 @@ class AlgorithmicDoorArcDetector:
             )
         return img
 
-    @staticmethod
-    def draw_fused_door_on_image(
-        img: np.ndarray,
-        door: FusedDoor,
-        color: Tuple[int, int, int] = (255, 0, 255),
-        thickness: int = 2,
-    ) -> np.ndarray:
-        """
-        Draw a FusedDoor on an image with hinge marker and swing arc.
-        """
-        cx, cy = door.center
-        hx, hy = door.hinge
-        r = door.width_px // 2
-
-        # Draw a synthetic 90° arc from hinge
-        # Compute start angle based on direction
-        angle_to_center = math.degrees(math.atan2(cy - hy, cx - hx))
-        if door.swing_clockwise:
-            start_a = angle_to_center
-            end_a = angle_to_center + 90
-        else:
-            start_a = angle_to_center - 90
-            end_a = angle_to_center
-
-        cv2.ellipse(
-            img,
-            (hx, hy),
-            (r, r),
-            0,
-            start_a,
-            end_a,
-            color,
-            thickness,
-        )
-        # Hinge marker
-        cv2.drawMarker(img, (hx, hy), (0, 255, 255), cv2.MARKER_DIAMOND, 10, 2)
-        # Label
-        label = f"D{door.id} {door.direction} [{door.source}]"
-        cv2.putText(
-            img, label, (cx + 5, cy - 10),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA,
-        )
-        return img
 
     @staticmethod
     def to_sweethome3d_xml(arc: DetectedDoorArc) -> str:
@@ -1696,88 +1274,3 @@ class AlgorithmicDoorArcDetector:
         )
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SELF-TEST (run with: python -m detection.doordetector)
-# ═══════════════════════════════════════════════════════════════════════════
-def _self_test() -> None:
-    import sys
-    logging.basicConfig(level=logging.DEBUG)
-    logger.info("Running AlgorithmicDoorArcDetector + DoorFusionEngine self-test...")
-
-    # Create synthetic image
-    img = np.ones((400, 400, 3), dtype=np.uint8) * 255
-    wall_mask = np.zeros((400, 400), dtype=np.uint8)
-
-    # Draw walls
-    cv2.line(img, (100, 50), (100, 350), (0, 0, 0), 6)
-    cv2.line(img, (100, 200), (350, 200), (0, 0, 0), 6)
-    cv2.line(wall_mask, (100, 50), (100, 350), 255, 6)
-    cv2.line(wall_mask, (100, 200), (350, 200), 255, 6)
-
-    # Draw quarter-circle arc
-    arc_center = (100, 200)
-    arc_radius = 80
-    cv2.ellipse(img, arc_center, (arc_radius, arc_radius), 0, 270, 360, (0, 0, 0), 2)
-
-    # Gap in wall
-    cv2.line(img, (100, 200), (100, 280), (255, 255, 255), 8)
-    cv2.line(wall_mask, (100, 200), (100, 280), 0, 8)
-
-    gaps = [(80, 200, 40, 80)]
-
-    # Test enhanced ROI mask building
-    roi_mask = AlgorithmicDoorArcDetector.build_enhanced_roi_mask(
-        400, 400,
-        yolo_doors=None,
-        gaps=gaps,
-        wall_outline_mask=wall_mask,
-    )
-    logger.info("Enhanced ROI mask: %d non-zero pixels", np.count_nonzero(roi_mask))
-
-    # Run detector with enhanced ROI
-    detector = AlgorithmicDoorArcDetector(
-        min_arc_radius_m=0.3,
-        max_arc_radius_m=2.0,
-        debug=True,
-        debug_output_dir="output/debug/selftest",
-    )
-    results = detector.detect(
-        img=img,
-        wall_outline_mask=wall_mask,
-        candidate_gaps=gaps,
-        yolo_doors=None,
-        pixel_scale=0.01,
-        base_name="selftest",
-        roi_mask=roi_mask,
-    )
-
-    # Test DoorFusionEngine
-    engine = DoorFusionEngine()
-    fused = engine.fuse(
-        yolo_doors=[],
-        gaps=gaps,
-        arcs=results,
-        wall_segments=[],
-        rooms=None,
-    )
-
-    # Report
-    if results:
-        logger.info("✓ Arc detector: %d arc(s) detected", len(results))
-        for arc in results:
-            logger.info("  Arc #%d: hinge=%s, radius=%.1f px, dir=%s, conf=%.3f",
-                        arc.id, arc.hinge, arc.radius_px, arc.direction, arc.confidence)
-    else:
-        logger.warning("⚠ No arcs detected (expected for synthetic input)")
-
-    logger.info("✓ Fusion engine: %d fused door(s)", len(fused))
-    for fd in fused:
-        logger.info("  FusedDoor #%d: hinge=%s, center=%s, dir=%s, source=%s, conf=%.3f",
-                    fd.id, fd.hinge, fd.center, fd.direction, fd.source, fd.confidence)
-
-    logger.info("Timing: %s", {k: f"{v*1000:.1f}ms" for k, v in detector._timing.items()})
-    sys.exit(0)
-
-
-if __name__ == "__main__":
-    _self_test()

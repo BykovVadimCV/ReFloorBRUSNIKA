@@ -1,19 +1,4 @@
-"""
-================================================================================
-СИСТЕМА АВТОМАТИЧЕСКОГО АНАЛИЗА ПЛАНИРОВОК КВАРТИР «БРУСНИКА»
-Модуль: FastAPI-сервер обработки планировок (api.py)
-Версия: 6.0 — Clean Architecture Edition
-
-Эндпоинты:
-  GET  /health   — статус сервера
-  POST /process  — отправить изображение, получить SH3D + GLTF + PNG
-
-Архитектура:
-  - Один экземпляр FloorplanPipeline создаётся при старте (singleton)
-  - asyncio.Semaphore ограничивает параллельные задачи
-  - CPU-тяжёлая обработка выполняется в run_in_executor (thread pool)
-================================================================================
-"""
+"""FastAPI server exposing the floorplan analysis pipeline over HTTP."""
 
 import asyncio
 import base64

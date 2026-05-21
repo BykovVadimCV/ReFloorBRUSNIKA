@@ -1,14 +1,4 @@
-"""
-Unified opening detection pipeline for the ReFloorBRUSNIKA pipeline.
-
-Merges and orchestrates:
-- GeometricOpeningDetector (gap.py) — ray casting
-- AlgorithmicWindowDetector (windowdetector.py) — parallel lines
-- AlgorithmicDoorArcDetector + DoorFusionEngine (doordetector.py) — door arcs
-- YOLODoorWindowDetector (furnituredetector.py) — YOLO inference
-
-All outputs are converted to unified core.models.Opening objects.
-"""
+"""Unified opening detection: orchestrates gap, window, door-arc, and YOLO detectors."""
 
 from __future__ import annotations
 
@@ -106,7 +96,7 @@ def fused_door_to_unified(fd: FusedDoor) -> Opening:
     Convert a FusedDoor (from doordetector.py) to unified Opening.
 
     Args:
-        fd: FusedDoor object from DoorFusionEngine
+        fd: FusedDoor object from DoorFusion
 
     Returns:
         Unified Opening object
@@ -215,7 +205,7 @@ def deduplicate_openings(
 # UNIFIED OPENING DETECTION PIPELINE
 # ============================================================
 
-class OpeningDetectionPipeline:
+class OpeningPipeline:
     """
     Single orchestrator for all opening detection.
 
@@ -227,7 +217,7 @@ class OpeningDetectionPipeline:
     2. Geometric gap detection (ray casting)
     3. Algorithmic window detection (parallel lines)
     4. Door arc detection (morphological)
-    5. DoorFusionEngine fusion
+    5. DoorFusion fusion
     6. Deduplication
     """
 
@@ -252,14 +242,15 @@ class OpeningDetectionPipeline:
             yolo_model: Optional pre-loaded YOLODoorWindowDetector instance.
                         If None, uses the one from the YOLO adapter.
         """
-        from detection.gap import GeometricOpeningDetector
-        from detection.windowdetector import AlgorithmicWindowDetector
-        from detection.doordetector import AlgorithmicDoorArcDetector, DoorFusionEngine
+        from detection.gap import GapDetector
+        from detection.windowdetector import WindowDetector
+        from detection.door_arc import DoorArcDetector
+        from detection.door_fusion import DoorFusion
 
         cfg = self.config
         pixel_scale = cfg.pixels_to_m  # meters per pixel
 
-        self._gap_detector = GeometricOpeningDetector(
+        self._gap_detector = GapDetector(
             min_gap_width_m=cfg.min_opening_width_m,
             max_gap_width_m=cfg.max_opening_width_m,
             max_extension_length=300,
@@ -268,13 +259,13 @@ class OpeningDetectionPipeline:
             min_opening_aspect_ratio=4.0,   # was 5.0 — accept slightly squarer gaps
             max_non_white_ratio=0.45,        # was 0.35 — tolerate furniture overlapping gap
         )
-        self._window_detector = AlgorithmicWindowDetector()
-        self._arc_detector = AlgorithmicDoorArcDetector(
+        self._window_detector = WindowDetector()
+        self._arc_detector = DoorArcDetector(
             min_arc_radius_m=0.6,
             max_arc_radius_m=1.2,
             debug=cfg.debug_arcs,
         )
-        self._fusion_engine = DoorFusionEngine()
+        self._fusion_engine = DoorFusion()
         self._yolo_detector = yolo_model
 
         # U-Net 4-class door detector (epoch_040.pth) — optional
@@ -308,7 +299,7 @@ class OpeningDetectionPipeline:
             ok = self._unet_door_detector.initialize()
             if not ok:
                 logger.warning(
-                    "OpeningDetectionPipeline: UNetDoorDetector failed to load — "
+                    "OpeningPipeline: UNetDoorDetector failed to load — "
                     "U-Net door detection disabled"
                 )
                 self._unet_door_detector = None
@@ -417,7 +408,7 @@ class OpeningDetectionPipeline:
                 if unet_doors:
                     all_openings.extend(unet_doors)
                     logger.info(
-                        "OpeningDetectionPipeline: U-Net added %d door(s), "
+                        "OpeningPipeline: U-Net added %d door(s), "
                         "%d door-wall segments",
                         len(unet_doors), len(self._debug_door_wall_segments),
                     )
@@ -484,7 +475,7 @@ class OpeningDetectionPipeline:
                 )
 
                 if self._fusion_engine is not None and arcs:
-                    from detection.doordetector import FusedDoor as LegacyFusedDoor
+                    from detection.door_fusion import FusedDoor as LegacyFusedDoor
                     fused = self._fusion_engine.fuse(
                         yolo_doors=raw_yolo_doors,
                         gaps=raw_gaps_for_arc,

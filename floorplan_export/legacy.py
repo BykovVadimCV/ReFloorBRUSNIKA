@@ -1,12 +1,4 @@
-"""
-================================================================================
-СИСТЕМА АВТОМАТИЧЕСКОГО АНАЛИЗА ПЛАНИРОВОК КВАРТИР «БРУСНИКА»
-Модуль: Экспорт в SweetHome3D (floorplanexporter.py)
-Версия: 6.0 — Flood-Fill Room Detection + Correct Opening Sizing
-Автор: Быков Вадим Олегович
-Дата: 2 марта 2026 г.
-================================================================================
-"""
+"""SweetHome3D exporter: flood-fill room detection, opening sizing, and SH3D ZIP packaging."""
 import math
 import uuid
 import zipfile
@@ -1477,7 +1469,7 @@ class SweetHome3DExporter:
 
         # Sources that were already precisely snapped upstream — skip re-snapping
         # to avoid fighting with the gap-based placement from UNetDoorDetector
-        # or AlgorithmicDoorArcDetector.
+        # or DoorArcDetector.
         _confident_sources: frozenset = frozenset({"unet_door", "arc"})
 
         # Build a quick lookup: opening_wall id → source string
