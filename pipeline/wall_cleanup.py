@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 from typing import List
 
 import numpy as np
 
-from core.models import WallSegment
+from core.models import BBox, WallSegment
 
 logger = logging.getLogger(__name__)
 
