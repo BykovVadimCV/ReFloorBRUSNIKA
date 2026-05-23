@@ -32,6 +32,17 @@ def cleanup_walls(walls: List[WallSegment],
     if not walls:
         return walls
 
+    # Diagonal (rotated) walls are passed through unchanged. Every step below
+    # assumes axis-aligned bbox geometry: thickness = min(width, height),
+    # orientation derived from the AABB, thickness-snap rewrites the bbox to a
+    # thin strip around its center. Applied to a rotated wall, those would
+    # corrupt the AABB and strip is_diagonal / outline — the SH3D adapter would
+    # then route it through the axis-aligned path and write a flat rectangle.
+    diagonal_walls = [w for w in walls if w.is_diagonal]
+    walls = [w for w in walls if not w.is_diagonal]
+    if not walls:
+        return list(diagonal_walls)
+
     # --- 1. Remove zero-length and degenerate walls -------------------------
     clean: List[WallSegment] = []
     for w in walls:
@@ -207,17 +218,23 @@ def cleanup_walls(walls: List[WallSegment],
                         wi = clean[i]
 
     # --- 6. Re-assign IDs ---------------------------------------------------
+    # Diagonals were partitioned out at the top; re-attach them here so the
+    # whole returned list shares one ID sequence.
+    combined = clean + list(diagonal_walls)
     result = []
-    for i, w in enumerate(clean):
+    for i, w in enumerate(combined):
         result.append(WallSegment(
             id=f"wall_{i}",
             bbox=w.bbox,
             thickness=w.thickness,
             is_structural=w.is_structural,
             is_outer=w.is_outer,
+            is_diagonal=w.is_diagonal,
+            is_door_wall=w.is_door_wall,
             outline=w.outline,
         ))
 
-    logger.info("Wall cleanup: %d -> %d walls", len(walls), len(result))
+    logger.info("Wall cleanup: %d -> %d walls (incl. %d diagonal pass-through)",
+                len(walls) + len(diagonal_walls), len(result), len(diagonal_walls))
     return result
 

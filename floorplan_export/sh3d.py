@@ -250,7 +250,9 @@ class SH3DExporter:
         ptcm = self.config.pixels_to_cm
         extra_structural: List = []
 
-        # Diagonal walls (structural)
+        # Diagonal walls (structural). is_diagonal=True keeps the post-
+        # processing passes in legacy.py from collapsing the rotated endpoints
+        # onto a single axis (which would render as one massive wall).
         for dw in diag_walls:
             if dw.outline and len(dw.outline) >= 2:
                 (ox1, oy1), (ox2, oy2) = dw.outline[0], dw.outline[1]
@@ -259,6 +261,7 @@ class SH3DExporter:
                     end=_LegacyPoint(ox2 * ptcm, oy2 * ptcm),
                     thickness=max(dw.thickness * ptcm, 2.0),
                     is_structural=True,
+                    is_diagonal=True,
                 ))
         if diag_walls:
             logger.debug("SH3DExporter: %d diagonal walls → %d LegacyWall objects",

@@ -343,6 +343,14 @@ class Wall:
     wall_at_end: Optional[str] = None
     pattern: str = 'hatchUp'
     is_structural: bool = True
+    # True for rotated (non-axis-aligned) walls. The post-processing passes
+    # (_align_walls_to_shared_axes, _extend_walls_along_axis,
+    # _snap_endpoints_to_corners, ThicknessNormalizer, ParentWallFinder)
+    # all assume axis-aligned geometry classified by is_horizontal; applying
+    # them to a diagonal wall flattens it onto a single x or y row, which
+    # SH3D then renders as a single massive wall. Diagonals are passed
+    # through these passes unchanged.
+    is_diagonal: bool = False
     # Original detection bounding box in cm (x1, y1, x2, y2) — full rectangle as
     # returned by the detector, before the wall is narrowed to a centreline.
     # Used by _snap_doors_to_wall_gaps for proximity search.
@@ -619,7 +627,12 @@ class ThicknessNormalizer:
     def __init__(
         self, structural_walls: List[Wall], search_radius: float = 80.0
     ) -> None:
-        self.structural_walls = [w for w in structural_walls if w.is_structural]
+        # Skip diagonals: they're classified by is_horizontal off their AABB
+        # and would distort thickness candidates for axis-aligned openings.
+        self.structural_walls = [
+            w for w in structural_walls
+            if w.is_structural and not w.is_diagonal
+        ]
         self.search_radius = search_radius
 
     def get_thickness_for_segment(
@@ -664,6 +677,11 @@ class ParentWallFinder:
         best_wall: Optional[Wall] = None
         best_distance = float('inf')
         for wall in self.walls:
+            # Diagonals are never parents of an axis-aligned opening here:
+            # is_horizontal is bbox-derived for them so this check would
+            # spuriously match.
+            if wall.is_diagonal:
+                continue
             if wall.is_horizontal != is_horizontal:
                 continue
             dx = wall.end.x - wall.start.x
@@ -1463,7 +1481,8 @@ class SweetHome3DExporter:
             else:
                 return (sw.get_centerline_y() - sw.thickness / 2) if sw.is_horizontal else sw.get_min_y()
 
-        sw_bboxes = [(sw, _wall_bbox(sw)) for sw in structural_walls]
+        # Diagonals have no meaningful axis-aligned bbox for this snap — skip them.
+        sw_bboxes = [(sw, _wall_bbox(sw)) for sw in structural_walls if not sw.is_diagonal]
         self._door_placement_debug: List[dict] = []
         to_remove: set = set()
 
@@ -1774,8 +1793,11 @@ class SweetHome3DExporter:
     def _align_walls_to_shared_axes(
         self, walls: List[Wall], tolerance: float
     ) -> None:
-        h_walls = [w for w in walls if w.is_horizontal]
-        v_walls = [w for w in walls if not w.is_horizontal]
+        # Diagonals must be excluded: is_horizontal classifies them by AABB
+        # and the snap below would flatten their endpoints onto one axis.
+        axis_walls = [w for w in walls if not w.is_diagonal]
+        h_walls = [w for w in axis_walls if w.is_horizontal]
+        v_walls = [w for w in axis_walls if not w.is_horizontal]
         for w in h_walls:
             avg = (w.start.y + w.end.y) / 2
             w.start.y = w.end.y = avg
@@ -1817,13 +1839,14 @@ class SweetHome3DExporter:
         structural_walls: List[Wall],
         tolerance: float,
     ) -> None:
+        # Diagonals are not valid axis snap targets.
         h_struct = [
             (w.get_centerline_y(), w.length)
-            for w in structural_walls if w.is_horizontal
+            for w in structural_walls if not w.is_diagonal and w.is_horizontal
         ]
         v_struct = [
             (w.get_centerline_x(), w.length)
-            for w in structural_walls if not w.is_horizontal
+            for w in structural_walls if not w.is_diagonal and not w.is_horizontal
         ]
         for ow in opening_walls:
             if ow.is_horizontal:
@@ -1846,9 +1869,10 @@ class SweetHome3DExporter:
     def _extend_walls_along_axis(
         self, walls: List[Wall], max_gap: float, iterations: int = 2
     ) -> None:
+        # Diagonals are skipped — _try_extend_endpoint moves only x or y.
         for _ in range(iterations):
             for wall in walls:
-                if wall.length < 0.1:
+                if wall.length < 0.1 or wall.is_diagonal:
                     continue
                 self._try_extend_endpoint(wall, 'start', walls, max_gap)
                 self._try_extend_endpoint(wall, 'end', walls, max_gap)
@@ -1862,7 +1886,7 @@ class SweetHome3DExporter:
     ) -> None:
         for _ in range(iterations):
             for wall in walls_to_extend:
-                if wall.length < 0.1:
+                if wall.length < 0.1 or wall.is_diagonal:
                     continue
                 self._try_extend_endpoint(wall, 'start', target_walls, max_gap)
                 self._try_extend_endpoint(wall, 'end', target_walls, max_gap)
@@ -1878,6 +1902,10 @@ class SweetHome3DExporter:
         best_ext, best_gap = None, max_gap
         for other in all_walls:
             if other.wall_id == wall.wall_id:
+                continue
+            # Diagonals are not valid axis-aligned targets — their
+            # is_horizontal is bbox-derived and would mis-guide _calc_gap.
+            if other.is_diagonal:
                 continue
             info = self._calc_gap(wall, point, other, wall.is_horizontal)
             if info is None:
@@ -1962,9 +1990,11 @@ class SweetHome3DExporter:
     def _snap_endpoints_to_corners(
         self, walls: List[Wall], snap_distance: float = 5.0
     ) -> None:
+        # Diagonals are not eligible as snap participants — snapping only x
+        # or only y would slide the endpoint off the diagonal's line.
         endpoints = [
             (w, e, w.start if e == 'start' else w.end)
-            for w in walls for e in ('start', 'end')
+            for w in walls if not w.is_diagonal for e in ('start', 'end')
         ]
         for i, (w1, e1, p1) in enumerate(endpoints):
             for w2, e2, p2 in endpoints[i + 1:]:

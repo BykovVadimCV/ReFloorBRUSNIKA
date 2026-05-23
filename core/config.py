@@ -96,6 +96,11 @@ class PipelineConfig:
     def max_opening_width_px(self) -> float:
         return (self.max_opening_width_m * 100) / self.pixels_to_cm
 
+    # Per-image cap on door/gap opening widths: max_allowed = multiplier ×
+    # median detected door width. 1.3 leaves room for legitimate wider
+    # entries (French doors) while suppressing over-extended geometric gaps.
+    opening_max_door_multiplier: float = 1.3
+
     # Gap detection: white content ratio threshold (ratio of white pixels in gap)
     gap_white_ratio_threshold: float = 0.30
 

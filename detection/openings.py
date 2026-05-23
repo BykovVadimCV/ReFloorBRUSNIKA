@@ -497,6 +497,18 @@ class OpeningPipeline:
             all_openings = non_door_openings + fused_doors
         # If fusion failed, keep existing doors from steps 1-2
 
+        # ── Step 4.5: Cap door/gap widths by detected door benchmark ──
+        # Gap detection is geometric and can over-extend into adjacent
+        # corridors, producing implausibly wide "openings". Use the
+        # median detected door width on this image as a benchmark and
+        # drop door/gap openings whose long side exceeds ~1.3× it.
+        # Windows are exempted — they can legitimately be wider.
+        all_openings = _cap_openings_by_door_benchmark(
+            all_openings,
+            cfg=cfg,
+            pixel_scale=ps,
+        )
+
         # ── Step 5: Final deduplication ───────────────────────────────
         return deduplicate_openings(all_openings, iou_threshold=cfg.iou_threshold)
 
@@ -504,6 +516,59 @@ class OpeningPipeline:
 # ============================================================
 # INTERNAL HELPERS
 # ============================================================
+
+def _cap_openings_by_door_benchmark(
+    openings: List[Opening],
+    cfg: PipelineConfig,
+    pixel_scale: float,
+) -> List[Opening]:
+    """Drop door/gap openings wider than ~1.3× the median detected door width.
+
+    The benchmark comes from doors that survived ``_resolve_doors_to_gaps`` —
+    those have wall-gap bboxes (not the inflated YOLO leaf-bbox) and so their
+    long side is the true door width. If no door benchmark is available the
+    function returns *openings* unchanged.
+    """
+    door_long_sides = [
+        max(o.bbox.width, o.bbox.height)
+        for o in openings
+        if o.opening_type == OpeningType.DOOR
+    ]
+    if not door_long_sides:
+        return openings
+
+    benchmark_px = float(np.median(door_long_sides))
+    multiplier = getattr(cfg, "opening_max_door_multiplier", 1.3)
+    max_allowed_px = benchmark_px * multiplier
+
+    # Hard floor so the cap never falls below a real door's physical width:
+    # if YOLO+gap fusion misses the wider doorways in a plan, we still allow
+    # openings up to min_plausible_opening_width_cm.
+    floor_cm = getattr(cfg, "min_plausible_opening_width_cm", 40.0)
+    if pixel_scale > 0:
+        floor_px = (floor_cm / 100.0) / pixel_scale
+        max_allowed_px = max(max_allowed_px, floor_px)
+
+    kept: List[Opening] = []
+    dropped = 0
+    for op in openings:
+        if op.opening_type == OpeningType.WINDOW:
+            kept.append(op)
+            continue
+        long_side = max(op.bbox.width, op.bbox.height)
+        if long_side > max_allowed_px:
+            dropped += 1
+            continue
+        kept.append(op)
+
+    if dropped:
+        logger.info(
+            "OpeningPipeline: capped %d opening(s) by door benchmark "
+            "(median door=%.1fpx, max=%.1fpx)",
+            dropped, benchmark_px, max_allowed_px,
+        )
+    return kept
+
 
 def _resolve_doors_to_gaps(
     yolo_doors: List[Opening],
