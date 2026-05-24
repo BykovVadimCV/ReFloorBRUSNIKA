@@ -61,6 +61,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help='SweetHome3D scale factor (default: 2.2)')
     parser.add_argument('--disable-measurements', action='store_true',
                         help='Disable OCR room measurement')
+    parser.add_argument('--disable-openings', action='store_true',
+                        help='Disable opening detection entirely (no doors or windows)')
     parser.add_argument('--disable-door-arcs', action='store_true',
                         help='Disable door arc detection')
     parser.add_argument('--enable-unet', action='store_true',
@@ -124,6 +126,7 @@ def main() -> None:
         pixels_to_cm=args.pixels_to_cm,
         sh3d_scale_factor=args.scale_factor,
         enable_room_measurement=not args.disable_measurements,
+        enable_opening_detection=not args.disable_openings,
         enable_door_arcs=not args.disable_door_arcs,
         enable_unet=args.enable_unet,
         debug_mode=args.debug,

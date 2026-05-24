@@ -207,6 +207,9 @@ class PipelineConfig:
     # FEATURE FLAGS
     # ============================================================
 
+    # Enable opening detection (doors + windows); set False to skip entirely
+    enable_opening_detection: bool = True
+
     # Enable debug output and visualizations
     debug_mode: bool = False
 

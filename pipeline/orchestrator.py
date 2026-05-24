@@ -404,74 +404,81 @@ class FloorplanPipeline:
 
         # ── Stage 2: Opening Detection (UNIFIED: gap + U-Net with deduplication) ─────
         _notify("detecting openings")
-        logger.info("[%s] Stage 2: Opening detection (gap priority + U-Net supplement)", base_name)
 
-        # Build ocr_bboxes from the labels collected pre-deskew
-        # (no second OCR pass).  Only numeric labels are kept so that
-        # non-numeric room names cannot suppress door/wall detection.
-        ocr_bboxes = []
-        for _src in (ocr_text_labels_early, rotated_ocr_labels):
-            for item in _src:
-                if len(item) < 5:
-                    continue
-                if not _is_numeric_ocr_label(str(item[0])):
-                    continue
-                ocr_bboxes.append((
-                    str(item[0]),
-                    int(item[1]), int(item[2]),
-                    int(item[3]), int(item[4]),
-                ))
+        openings: List[Opening] = []
+        door_arcs: List[Any] = []
+        ocr_bboxes: List = []
 
-        # ALWAYS run traditional gap/algorithmic + YOLO detection (gap doors take priority)
-        yolo_results = None
-        if self._yolo is not None:
-            try:
-                yolo_results = self._yolo.detect(img)
-                result.raw_yolo_results = yolo_results
-            except Exception as e:
-                logger.warning("YOLO detection failed: %s", e)
+        if not self.config.enable_opening_detection:
+            logger.info("[%s] Stage 2: Opening detection disabled (enable_opening_detection=False)", base_name)
+        else:
+            logger.info("[%s] Stage 2: Opening detection (gap priority + U-Net supplement)", base_name)
 
-        pixel_scale = self.config.pixels_to_m
+            # Build ocr_bboxes from the labels collected pre-deskew
+            # (no second OCR pass).  Only numeric labels are kept so that
+            # non-numeric room names cannot suppress door/wall detection.
+            for _src in (ocr_text_labels_early, rotated_ocr_labels):
+                for item in _src:
+                    if len(item) < 5:
+                        continue
+                    if not _is_numeric_ocr_label(str(item[0])):
+                        continue
+                    ocr_bboxes.append((
+                        str(item[0]),
+                        int(item[1]), int(item[2]),
+                        int(item[3]), int(item[4]),
+                    ))
 
-        # ── Solid-wall / no-U-Net path: gap + U-Net combined ─────────────
-        openings, door_arcs = self._run_opening_detection(
-            img=img,
-            walls=result.walls,
-            wall_mask=result.wall_mask,
-            outline_mask=result.outline_mask,
-            wall_rectangles=raw_rectangles,
-            yolo_results=yolo_results,
-            ocr_bboxes=ocr_bboxes,
-            pixel_scale=pixel_scale,
-            base_name=base_name,
-            output_dir=output_dir,
-            wall_rect_polygons=result.wall_rect_polygons,
-        )
+            # ALWAYS run traditional gap/algorithmic + YOLO detection (gap doors take priority)
+            yolo_results = None
+            if self._yolo is not None:
+                try:
+                    yolo_results = self._yolo.detect(img)
+                    result.raw_yolo_results = yolo_results
+                except Exception as e:
+                    logger.warning("YOLO detection failed: %s", e)
 
-        # Supplement with U-Net doors that don't overlap gap detections
-        if unet_door_bboxes or unet_window_bboxes:
-            unet_openings = self._unet_bboxes_to_openings(
-                unet_door_bboxes, unet_window_bboxes
+            pixel_scale = self.config.pixels_to_m
+
+            # ── Solid-wall / no-U-Net path: gap + U-Net combined ─────────────
+            openings, door_arcs = self._run_opening_detection(
+                img=img,
+                walls=result.walls,
+                wall_mask=result.wall_mask,
+                outline_mask=result.outline_mask,
+                wall_rectangles=raw_rectangles,
+                yolo_results=yolo_results,
+                ocr_bboxes=ocr_bboxes,
+                pixel_scale=pixel_scale,
+                base_name=base_name,
+                output_dir=output_dir,
+                wall_rect_polygons=result.wall_rect_polygons,
             )
-            priority_for_door = [o for o in openings if o.opening_type in (OpeningType.GAP, OpeningType.DOOR)]
-            priority_for_window = [o for o in openings if o.opening_type == OpeningType.WINDOW]
 
-            filtered_unet = []
-            overlapping_count = 0
-            for uo in unet_openings:
-                priority_list = priority_for_door if uo.opening_type == OpeningType.DOOR else priority_for_window
-                if any(self._bbox_iou(uo.bbox, po.bbox) > 0.3 for po in priority_list):
-                    overlapping_count += 1
-                else:
-                    filtered_unet.append(uo)
-
-            if filtered_unet:
-                openings.extend(filtered_unet)
-                logger.info(
-                    "[%s] U-Net supplement: added %d/%d openings "
-                    "(%d overlapped gap/door detections)",
-                    base_name, len(filtered_unet), len(unet_openings), overlapping_count,
+            # Supplement with U-Net doors that don't overlap gap detections
+            if unet_door_bboxes or unet_window_bboxes:
+                unet_openings = self._unet_bboxes_to_openings(
+                    unet_door_bboxes, unet_window_bboxes
                 )
+                priority_for_door = [o for o in openings if o.opening_type in (OpeningType.GAP, OpeningType.DOOR)]
+                priority_for_window = [o for o in openings if o.opening_type == OpeningType.WINDOW]
+
+                filtered_unet = []
+                overlapping_count = 0
+                for uo in unet_openings:
+                    priority_list = priority_for_door if uo.opening_type == OpeningType.DOOR else priority_for_window
+                    if any(self._bbox_iou(uo.bbox, po.bbox) > 0.3 for po in priority_list):
+                        overlapping_count += 1
+                    else:
+                        filtered_unet.append(uo)
+
+                if filtered_unet:
+                    openings.extend(filtered_unet)
+                    logger.info(
+                        "[%s] U-Net supplement: added %d/%d openings "
+                        "(%d overlapped gap/door detections)",
+                        base_name, len(filtered_unet), len(unet_openings), overlapping_count,
+                    )
 
         result.openings = openings
         result.door_arcs = door_arcs
