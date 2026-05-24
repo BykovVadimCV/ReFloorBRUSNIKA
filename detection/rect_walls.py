@@ -1183,41 +1183,13 @@ class RectWallDetector:
         raw_wall_mask = wall_mask.copy()
         _px_raw = int(np.count_nonzero(raw_wall_mask))
 
-        # ── Stage 1a: Enclosed-space refinement ───────────────────────
-        _LS("Stage 1a — Enclosed-space refinement")
-        overlap_thr = float(getattr(cfg, "rect_enclosed_overlap_threshold", 0.25))
-        _L("  overlap_threshold = %.2f", overlap_thr)
-        _L("  Logic: enclosed region with NO OCR label AND ≥%.0f%% wall overlap"
-           " → FILL as wall", overlap_thr * 100)
-        _L("         enclosed region with OCR label OR <%.0f%% wall overlap"
-           " → CLEAR to 0", overlap_thr * 100)
-        _ocr_numeric = sum(
-            1 for b in (ocr_bboxes or [])
-            if len(b) >= 5 and str(b[0]).replace(".", "").replace(",", "")
-                                      .replace(" ", "").replace("м²", "")
-                                      .replace("m²", "").strip().isdigit()
-        )
-        _L("  OCR numeric labels (potential room markers): %d", _ocr_numeric)
-        try:
-            _px_pre_refine = int(np.count_nonzero(wall_mask))
-            wall_mask = refine_mask_by_enclosed_spaces(
-                wall_mask, img_bgr, ocr_bboxes,
-                wall_overlap_threshold=overlap_thr,
-                debug_img_path=debug_img_path,
-            )
-            _px_post_refine = int(np.count_nonzero(wall_mask))
-            _delta_refine = _px_post_refine - _px_pre_refine
-            _L("  Before: %d px  →  After: %d px  (Δ %+d px)",
-               _px_pre_refine, _px_post_refine, _delta_refine)
-            if _delta_refine > 0:
-                _L("  Net GAIN: structural cavities enclosed by walls were filled")
-            elif _delta_refine < 0:
-                _L("  Net LOSS: open rooms / labelled regions were cleared")
-            else:
-                _L("  No change")
-        except Exception as _rme:
-            _L("  WARNING: refine_mask_by_enclosed_spaces FAILED (%s) — step skipped", _rme)
-            logger.warning("refine_mask_by_enclosed_spaces failed (%s) — skipping", _rme)
+        # ── Stage 1a: Enclosed-space refinement — REMOVED ────────────
+        # The overlap-fraction heuristic mis-classified both ways (under-
+        # filled cavities, over-filled rooms). Stage 1d (skeleton cap +
+        # directional fill with guards A/B/C/D) is the authoritative
+        # enclosed-space pass and runs unchanged below.
+        _LS("Stage 1a — Enclosed-space refinement (SKIPPED — Stage 1d handles this)")
+        _L("  Stage 1a removed: deferred to Stage 1d skeleton cap pipeline")
 
         # ── Stage 1b: Morphological close ─────────────────────────────
         _LS("Stage 1b — Morphological close (bridge small gaps)")

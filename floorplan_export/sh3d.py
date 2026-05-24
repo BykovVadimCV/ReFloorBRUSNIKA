@@ -189,6 +189,7 @@ class SH3DExporter:
             pixels_to_cm=cfg.pixels_to_cm,
             wall_height_cm=cfg.wall_height_cm,
             scale_factor=cfg.sh3d_scale_factor,
+            preserve_structural_geometry=cfg.use_rect_walls,
         )
 
     def update_scale(self, pixels_to_cm: float) -> None:

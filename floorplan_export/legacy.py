@@ -1320,11 +1320,16 @@ class SweetHome3DExporter:
         snap_tolerance: float = SNAP_TOLERANCE,
         wall_overlap: float = WALL_OVERLAP,
         scale_factor: float = SCALE_FACTOR,
+        preserve_structural_geometry: bool = False,
     ) -> None:
         self.pixels_to_cm = pixels_to_cm
         self.wall_height = wall_height_cm
         self.snap_tolerance = snap_tolerance
         self.wall_overlap = wall_overlap
+        # When True, structural wall endpoints/axes are NEVER modified after
+        # conversion from rect dicts. Use this with the rect_decompose pipeline
+        # so the exporter keeps every wall exactly where the decomposer put it.
+        self.preserve_structural_geometry = preserve_structural_geometry
         self.wall_converter = StructuralWallConverter(pixels_to_cm, min_wall_thickness)
         self.opening_processor = OpeningProcessor(pixels_to_cm)
         self.xml_generator = SH3DXMLGenerator(wall_height_cm, scale_factor)
@@ -1777,17 +1782,23 @@ class SweetHome3DExporter:
         structural_walls: List[Wall],
         opening_walls: List[Wall],
     ) -> None:
-        self._align_walls_to_shared_axes(structural_walls, AXIS_SNAP_TOLERANCE)
-        self._extend_walls_along_axis(
-            structural_walls, T_JUNCTION_SNAP_TOLERANCE, iterations=2
-        )
+        if not self.preserve_structural_geometry:
+            self._align_walls_to_shared_axes(structural_walls, AXIS_SNAP_TOLERANCE)
+            self._extend_walls_along_axis(
+                structural_walls, T_JUNCTION_SNAP_TOLERANCE, iterations=2
+            )
         self._align_opening_walls_to_structural(
             opening_walls, structural_walls, OPENING_AXIS_SNAP_TOLERANCE
         )
         self._extend_walls_along_axis_against(
             opening_walls, all_walls, OPENING_EXTENSION_TOLERANCE, iterations=2
         )
-        self._snap_endpoints_to_corners(all_walls, snap_distance=5.0)
+        if self.preserve_structural_geometry:
+            # Snap only the opening walls; structural walls remain at the
+            # endpoints rect_decompose produced.
+            self._snap_endpoints_to_corners(opening_walls, snap_distance=5.0)
+        else:
+            self._snap_endpoints_to_corners(all_walls, snap_distance=5.0)
         self._connect_walls(all_walls)
 
     def _align_walls_to_shared_axes(
