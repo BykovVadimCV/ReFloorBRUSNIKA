@@ -145,6 +145,15 @@ def _crop_to_floorplan(
         "_crop_to_floorplan: cropped %dx%d → %dx%d (bbox x=%d y=%d w=%d h=%d)",
         w_img, h_img, cropped.shape[1], cropped.shape[0], x, y, w, h,
     )
-    return cropped
+
+    # Pad to square with white background
+    ch, cw = cropped.shape[:2]
+    side = max(ch, cw)
+    pad_top = (side - ch) // 2
+    pad_left = (side - cw) // 2
+    square = np.full((side, side, cropped.shape[2]), 255, dtype=cropped.dtype)
+    square[pad_top:pad_top + ch, pad_left:pad_left + cw] = cropped
+    logger.info("_crop_to_floorplan: padded to %dx%d square", side, side)
+    return square
 
 
