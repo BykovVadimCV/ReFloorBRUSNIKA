@@ -310,8 +310,37 @@ class FloorplanPipeline:
                     os.path.join(output_dir, f"{base_name}_rectdecompose.log")
                     if self.config.debug_mode else None
                 )
+                # ── Brusnika branch (gated) ──────────────────────────────
+                # When the image verifiably matches the Brusnika palette, build
+                # the wall mask from colour + morphology and hand it to the
+                # rect detector in place of the binary U-Net.  When the gate is
+                # False this stays None and detect() runs the U-Net exactly as
+                # before — the original path is left untouched.
+                _brusnika_mask = None
+                if self.config.enable_brusnika_branch:
+                    try:
+                        from detection.brusnika import (
+                            is_brusnika_image, build_brusnika_wall_mask,
+                        )
+                        if is_brusnika_image(img_clean, self.config):
+                            _brusnika_mask = build_brusnika_wall_mask(
+                                img_clean, self.config)
+                            logger.info(
+                                "[%s] Brusnika format detected — using "
+                                "colour-derived wall mask (%d px)",
+                                base_name,
+                                int(np.count_nonzero(_brusnika_mask)),
+                            )
+                    except Exception as _bexc:
+                        logger.warning(
+                            "[%s] Brusnika branch failed (%s) — falling back "
+                            "to U-Net wall mask", base_name, _bexc,
+                        )
+                        _brusnika_mask = None
+
                 _rd_res = _rect_det.detect(
                     img_clean,
+                    wall_mask=_brusnika_mask,
                     ocr_bboxes=_ocr_bboxes_for_rect,
                     debug_img_path=_enclosed_dbg_path,
                     log_file_path=_rectdecompose_log,

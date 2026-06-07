@@ -392,6 +392,47 @@ class PipelineConfig:
     # diagonals not allowed for openings).
     opening_axis_tol_deg: float = 3.0
 
+    # ============================================================
+    # BRUSNIKA-FORMAT BRANCH  (gated colour-based wall mask)
+    # ============================================================
+    # When an input image is *verifiably* a Brusnika-format plan, the wall
+    # mask is built from the brand's fixed colour palette (#8F8880 walls) plus
+    # a thickness-based morphological opening, and handed to the existing
+    # RectWallDetector in place of the binary U-Net mask.  Everything
+    # downstream (rect decompose, openings, export) is unchanged.  The gate
+    # (detection.brusnika.is_brusnika_image) is strict: a non-Brusnika image
+    # leaves wall_mask=None and the original U-Net path runs byte-for-byte.
+
+    # Master switch for the whole branch.  False → behaves exactly as before.
+    enable_brusnika_branch: bool = True
+
+    # Brand wall colour (hex, no '#').
+    brusnika_wall_color_hex: str = "8F8880"
+
+    # Gate thresholds.  Empirically separated with huge margin on the example
+    # set: Brusnika wall-gray fraction ≥10 % and dominant-colour distance 0–1;
+    # every non-Brusnika sample ≤1.4 % and distance ≥46.  Both must hold.
+    brusnika_gate_min_wallgray_frac: float = 0.03
+    brusnika_gate_max_color_dist: int = 12
+    brusnika_gate_color_tol: int = 18
+
+    # Mask building: colour-match tolerance + opening that strips thin line-art.
+    # Kernel/area defaults are tuned at brusnika_ref_width_px and scaled to the
+    # actual input width so behaviour holds across resolutions (production
+    # rasters may differ from the ~929 px example renders).
+    brusnika_ref_width_px: int = 929
+    brusnika_color_tol: int = 22
+    brusnika_open_kernel: int = 5
+    brusnika_open_iterations: int = 1
+    brusnika_min_component_area_px: int = 80
+
+    # Apartment-count badge disk removal (a solid #8F8880 circle in open space).
+    brusnika_remove_badge: bool = True
+    brusnika_badge_min_circularity: float = 0.80
+    brusnika_badge_min_aspect: float = 0.80
+    brusnika_badge_extent_range: tuple = (0.60, 0.85)
+    brusnika_badge_min_area_px: int = 800
+
     def __post_init__(self) -> None:
         """Validate configuration after initialization."""
         assert self.pixels_to_cm > 0, "pixels_to_cm must be positive"
