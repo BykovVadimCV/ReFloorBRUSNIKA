@@ -338,6 +338,19 @@ class PipelineConfig:
     rect_diag_lsd_ratio:  float = 0.05    # fraction of off-axis LSD length
     rect_diag_lsd_min_len: float = 25.0   # ignore LSD segments shorter than this
 
+    # Structural denoise of the raw wall mask (strip AI splatter/speckle).
+    # Kernel/area default to 0 → auto-scaled from the image when 0.
+    rect_denoise_enable:      bool  = True
+    rect_denoise_open_kernel: int   = 0     # MORPH_OPEN kernel px (0 = auto)
+    rect_denoise_min_area_px: int   = 0     # drop components below this (0 = auto)
+
+    # Minor-diagonal suppression: snap small isolated diagonal walls to the
+    # nearest axis when the plan is mostly orthogonal and neighbours are axis-
+    # aligned (only fires in the mixed axis+diagonal case).
+    rect_suppress_minor_diagonals: bool  = True
+    rect_minor_diag_short_frac:    float = 0.5   # "short" = < this × median len
+    rect_minor_diag_max_frac:      float = 0.34  # bail if diagonals > this share
+
     # rect_decompose parameters (defaults requested by the user)
     rect_angle_steps:          int   = 12
     rect_penalty:              float = 0.0

@@ -66,22 +66,28 @@ def _crop_to_floorplan(
     min_fill: float = 0.01,
 ) -> np.ndarray:
     """
-    Auto-crop the image to the bounding box of the largest ink structure.
+    Auto-crop the image to the bounding box of the biggest ink cluster.
 
-    Mirrors the logic in utils/crop_floorplan.py:
+    Steps:
       1. Convert to grayscale.
       2. Gaussian blur + Otsu binarise (auto-invert so ink = 255).
-      3. Morphological close to connect wall outlines.
-      4. Find the largest connected component that passes min_fill.
-      5. Crop with padding.
+      3. Light close to connect broken wall outlines, then connected components.
+      4. Seed with the largest significant component, then iteratively absorb
+         every other significant component whose bbox is within ``margin`` of the
+         growing union — so detached drawing parts (balconies, fixtures,
+         annotations) join the crop while a far-separated legend / title block
+         stays out.  This crops to the whole drawing cluster, not just the
+         largest connected wall loop.
+      5. Crop the union bbox with padding.
+      6. Pad to a square with white space.
 
-    If detection fails (no component found, or component covers nearly
-    the entire image), the original image is returned unchanged.
+    If detection fails (no component found, or it covers nearly the entire
+    image), the original image is returned unchanged.
 
     Args:
         img: BGR image (as loaded by cv2.imread).
         padding: Extra pixels added around the detected bounding box.
-        min_fill: Minimum component area / image area ratio to accept.
+        min_fill: Minimum seed component area / image area ratio to accept.
 
     Returns:
         Cropped BGR image, or the original if cropping fails.
@@ -96,43 +102,72 @@ def _crop_to_floorplan(
     if np.mean(binary) > 127:
         binary = cv2.bitwise_not(binary)
 
-    # Close small gaps so wall outlines connect
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    # Light close so a wall outline broken by small gaps stays one component.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+    num_labels, _labels, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
     if num_labels <= 1:
         logger.debug("_crop_to_floorplan: no foreground components — skipping crop")
         return img
 
-    image_area = img.shape[0] * img.shape[1]
-    areas = stats[1:, cv2.CC_STAT_AREA]  # skip background label 0
-    ranked = np.argsort(areas)[::-1]
+    h_img, w_img = img.shape[:2]
+    image_area = h_img * w_img
 
-    chosen_bbox = None
-    for rank_idx in ranked:
-        label_id = rank_idx + 1
-        area = int(areas[rank_idx])
-        if area / image_area < min_fill:
+    # Keep only components above a small speckle floor — pure noise must never
+    # drag the crop outward.
+    speckle_floor = max(1, int(image_area * 0.0002))
+    comps = []
+    for i in range(1, num_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < speckle_floor:
             continue
-        x = int(stats[label_id, cv2.CC_STAT_LEFT])
-        y = int(stats[label_id, cv2.CC_STAT_TOP])
-        w = int(stats[label_id, cv2.CC_STAT_WIDTH])
-        h = int(stats[label_id, cv2.CC_STAT_HEIGHT])
-        chosen_bbox = (x, y, w, h)
-        break
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        w = int(stats[i, cv2.CC_STAT_WIDTH])
+        h = int(stats[i, cv2.CC_STAT_HEIGHT])
+        comps.append((area, x, y, x + w, y + h))
 
-    if chosen_bbox is None:
+    if not comps:
+        logger.debug("_crop_to_floorplan: no significant components — skipping crop")
+        return img
+
+    # Seed with the largest component; it must clear min_fill.
+    comps.sort(key=lambda c: c[0], reverse=True)
+    seed = comps[0]
+    if seed[0] / image_area < min_fill:
         logger.debug("_crop_to_floorplan: largest component below min_fill — skipping crop")
         return img
 
-    x, y, w, h = chosen_bbox
+    ux1, uy1, ux2, uy2 = seed[1], seed[2], seed[3], seed[4]
 
-    # Skip crop when the component already covers almost the full image
+    # Absorb nearby significant components into the union bbox.  ``margin`` is
+    # the max whitespace gap (per axis) tolerated between drawing parts.
+    margin = max(8, int(round(min(h_img, w_img) * 0.04)))
+    pool = comps[1:]
+    changed = True
+    while changed:
+        changed = False
+        remaining = []
+        for c in pool:
+            _, cx1, cy1, cx2, cy2 = c
+            gap_x = max(0, ux1 - cx2, cx1 - ux2)
+            gap_y = max(0, uy1 - cy2, cy1 - uy2)
+            if gap_x <= margin and gap_y <= margin:
+                ux1, uy1 = min(ux1, cx1), min(uy1, cy1)
+                ux2, uy2 = max(ux2, cx2), max(uy2, cy2)
+                changed = True
+            else:
+                remaining.append(c)
+        pool = remaining
+
+    x, y = ux1, uy1
+    w, h = ux2 - ux1, uy2 - uy1
+
+    # Skip crop when the cluster already covers almost the full image
     # (>= 95% in both dimensions) to avoid pointless padding
-    h_img, w_img = img.shape[:2]
     if w >= 0.95 * w_img and h >= 0.95 * h_img:
-        logger.debug("_crop_to_floorplan: component fills image — skipping crop")
+        logger.debug("_crop_to_floorplan: cluster fills image — skipping crop")
         return img
 
     x1 = max(0, x - padding)

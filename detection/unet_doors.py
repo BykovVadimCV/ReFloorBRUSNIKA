@@ -331,6 +331,63 @@ def _bbox_to_door_wall_segment(
     )
 
 
+def bbox_to_window_wall_segment(
+    bbox: BBox,
+    idx: int,
+    walls: Optional[List[WallSegment]] = None,
+    proximity_px: float = 60.0,
+) -> WallSegment:
+    """
+    Build a window-wall WallSegment from a window bbox (mirror of
+    ``_bbox_to_door_wall_segment``).
+
+    A window sits ON an existing exterior wall, so — unlike a door wall — the
+    generated window-wall is *allowed* to overlap existing structural walls.
+    Its sole job is to guarantee ``ParentWallFinder`` an exact axis-aligned
+    parent for the window object, exactly as door walls do for doors.
+
+    The segment runs axis-aligned along the bbox's longer dimension; thickness
+    is taken from the nearest structural (non-opening) wall, falling back to the
+    bbox's short dimension when no wall is close enough.
+    """
+    x1, y1, x2, y2 = bbox.x1, bbox.y1, bbox.x2, bbox.y2
+    w, h = x2 - x1, y2 - y1
+    if w >= h:                       # horizontal window
+        fallback_thickness = h
+        cy = (y1 + y2) / 2.0
+        outline = [(int(x1), int(cy)), (int(x2), int(cy))]
+    else:                            # vertical window
+        fallback_thickness = w
+        cx = (x1 + x2) / 2.0
+        outline = [(int(cx), int(y1)), (int(cx), int(y2))]
+
+    # Look up nearest structural wall and use its thickness (ignore other
+    # opening-walls so a door/window wall can't seed another's thickness).
+    thickness = fallback_thickness
+    if walls:
+        cx_b, cy_b = bbox.center
+        candidates = [ws for ws in walls
+                      if not ws.is_door_wall and not ws.is_window_wall]
+        if candidates:
+            best = min(candidates,
+                       key=lambda ws: _point_to_centerline_dist(cx_b, cy_b, ws))
+            dist = _point_to_centerline_dist(cx_b, cy_b, best)
+            if dist <= proximity_px:
+                thickness = best.thickness
+
+    return WallSegment(
+        id=f"window-wall-{idx:04d}",
+        bbox=bbox,
+        thickness=float(thickness),
+        is_structural=False,
+        is_outer=False,
+        is_diagonal=False,
+        is_door_wall=False,
+        is_window_wall=True,
+        outline=outline,
+    )
+
+
 def _refine_door_mask_by_enclosed_spaces(
     door_mask: np.ndarray,
     img_bgr: np.ndarray,

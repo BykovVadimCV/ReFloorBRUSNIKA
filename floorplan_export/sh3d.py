@@ -241,9 +241,12 @@ class SH3DExporter:
         # exporter never needs to synthesise or guess wall geometry for doors.
         from floorplan_export.legacy import Wall as _LegacyWall, Point as _LegacyPoint
 
-        regular_walls = [w for w in walls if not w.is_diagonal and not w.is_door_wall]
+        regular_walls = [w for w in walls
+                         if not w.is_diagonal and not w.is_door_wall
+                         and not w.is_window_wall]
         diag_walls    = [w for w in walls if w.is_diagonal]
         door_walls    = [w for w in walls if w.is_door_wall]
+        window_walls  = [w for w in walls if w.is_window_wall]
 
         # Convert regular axis-aligned walls to rect dicts (existing path)
         wall_rects = [wall_segment_to_rect_dict(w) for w in regular_walls]
@@ -281,6 +284,22 @@ class SH3DExporter:
             logger.info("SH3DExporter: %d door-wall segments → extra walls (non-structural)",
                         len(door_walls))
 
+        # Window walls (non-structural — parent for each window opening).  These
+        # may overlap existing structural walls because windows sit ON exterior
+        # walls; the overlap is intentional and harmless (non-structural walls
+        # are ignored by room detection / thickness normalisation).
+        for ww in window_walls:
+            p1, p2 = _wall_centerline(ww)
+            extra_structural.append(_LegacyWall(
+                start=_LegacyPoint(p1[0] * ptcm, p1[1] * ptcm),
+                end=_LegacyPoint(p2[0] * ptcm, p2[1] * ptcm),
+                thickness=max(ww.thickness * ptcm, 2.0),
+                is_structural=False,
+            ))
+        if window_walls:
+            logger.info("SH3DExporter: %d window-wall segments → extra walls (non-structural)",
+                        len(window_walls))
+
         # Separate openings by type
         doors = [o for o in openings if o.opening_type == OpeningType.DOOR]
         windows = [o for o in openings if o.opening_type == OpeningType.WINDOW]
@@ -290,23 +309,19 @@ class SH3DExporter:
         fused_doors = [opening_to_fused_door(d) for d in doors if d.hinge_point is not None]
         plain_doors = [opening_to_rect_dict(d) for d in doors if d.hinge_point is None]
 
-        # ── Windows-as-overlay-walls ─────────────────────────────────────
-        # When the rect-wall pipeline is active, render each window as a
-        # separate wall placed on top of its parent wall (same thickness,
-        # length = window-mask projection). The legacy window-rect path is
-        # skipped so windows don't get cut into the parent walls.
-        window_rects: List[Dict] = []
-        if getattr(self.config, "use_rect_walls", False) and windows:
-            for win in windows:
-                lw = window_opening_to_overlay_wall(win, walls, ptcm)
-                if lw is not None:
-                    extra_structural.append(lw)
+        # ── Windows-as-real-openings ─────────────────────────────────────
+        # Windows are placed as real SH3D window objects (window85x163) on their
+        # parent wall, exactly like doors.  Each window has a dedicated
+        # window-wall segment (injected at orchestrator Stage 3e, routed above
+        # as a non-structural extra wall) so ParentWallFinder always finds an
+        # exact axis-aligned parent; the legacy OpeningProcessor then inserts the
+        # window object into that wall instead of cutting a solid overlay wall.
+        window_rects: List[Dict] = [opening_to_rect_dict(w) for w in windows]
+        if windows:
             logger.info(
-                "SH3DExporter: %d windows → overlay walls on parent walls",
+                "SH3DExporter: %d windows → real window openings on parent walls",
                 len(windows),
             )
-        else:
-            window_rects = [opening_to_rect_dict(w) for w in windows]
 
         gap_rects = [opening_to_rect_dict(g) for g in gaps]
 

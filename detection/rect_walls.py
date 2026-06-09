@@ -303,6 +303,110 @@ def snap_collinear_endpoints(
 
 
 # ---------------------------------------------------------------------------
+# Minor-diagonal suppression
+# ---------------------------------------------------------------------------
+
+def _suppress_minor_diagonals(
+    infos: List[_RectInfo],
+    *,
+    axis_tol_deg: float = DEFAULT_AXIS_TOL_DEG,
+    junction_radius_factor: float = 2.0,
+    junction_radius_floor: float = 12.0,
+    short_frac: float = 0.5,
+    max_diag_frac: float = 0.34,
+) -> int:
+    """
+    Snap small, isolated diagonal walls to the nearest cardinal axis.
+
+    A diagonal wall's centerline is rotated to pure horizontal/vertical about
+    its own midpoint (length preserved) only when ALL of the following hold:
+
+      (a) every wall sharing a junction with it is axis-aligned (no diagonal
+          neighbours) and at least one such neighbour exists;
+      (b) it is short relative to the median wall length
+          (length < ``short_frac`` × median);
+      (c) the plan is mostly orthogonal — diagonal walls are a small minority
+          (≤ ``max_diag_frac`` of all walls).
+
+    Rationale: genuine diagonal architecture comes in runs of mutually-aligned
+    diagonal walls; a lone short diagonal wedged between axis walls in an
+    otherwise-orthogonal plan is almost always a decomposition artefact, so we
+    "keep it to itself" as an axis-aligned segment instead.
+
+    Modifies ``infos`` in place.  Endpoint snapping should be re-run afterwards
+    so a rotated wall still meets its neighbours at the corner.  Returns the
+    number of walls snapped.
+    """
+    if not infos:
+        return 0
+
+    def _dev(a: float) -> float:
+        return min(a % 90.0, 90.0 - (a % 90.0))
+
+    diag_idx = [i for i, info in enumerate(infos)
+                if _dev(info.angle_deg) > axis_tol_deg]
+    if not diag_idx:
+        return 0
+
+    # (c) global orthogonality gate — bail out on genuinely diagonal plans.
+    if len(diag_idx) / len(infos) > max_diag_frac:
+        return 0
+
+    lengths = [_dist(info.p1, info.p2) for info in infos]
+    median_len = float(np.median(lengths)) if lengths else 0.0
+    if median_len <= 0.0:
+        return 0
+
+    snapped = 0
+    for i in diag_idx:
+        a = infos[i]
+        len_a = _dist(a.p1, a.p2)
+
+        # (b) short relative to the typical wall
+        if len_a >= short_frac * median_len:
+            continue
+
+        # (a) every junction neighbour must be axis-aligned
+        jr = max(junction_radius_floor, junction_radius_factor * a.thickness)
+        has_axis_neighbour = False
+        has_diag_neighbour = False
+        for j, b in enumerate(infos):
+            if j == i:
+                continue
+            touch = min(
+                _dist(a.p1, b.p1), _dist(a.p1, b.p2),
+                _dist(a.p2, b.p1), _dist(a.p2, b.p2),
+            )
+            if touch > jr:
+                continue
+            if _dev(b.angle_deg) > axis_tol_deg:
+                has_diag_neighbour = True
+                break
+            has_axis_neighbour = True
+        if has_diag_neighbour or not has_axis_neighbour:
+            continue
+
+        # All conditions met — rotate the centerline to the nearest axis about
+        # its midpoint, preserving length.
+        mid = ((a.p1[0] + a.p2[0]) / 2.0, (a.p1[1] + a.p2[1]) / 2.0)
+        half = len_a / 2.0
+        ang_mod = a.angle_deg % 180.0
+        dev_horizontal = min(ang_mod, 180.0 - ang_mod)
+        dev_vertical = abs(ang_mod - 90.0)
+        if dev_horizontal <= dev_vertical:
+            a.p1 = (mid[0] - half, mid[1])
+            a.p2 = (mid[0] + half, mid[1])
+            a.angle_deg = 0.0
+        else:
+            a.p1 = (mid[0], mid[1] - half)
+            a.p2 = (mid[0], mid[1] + half)
+            a.angle_deg = 90.0
+        snapped += 1
+
+    return snapped
+
+
+# ---------------------------------------------------------------------------
 # Rectangle → WallSegment conversion
 # ---------------------------------------------------------------------------
 
@@ -1183,13 +1287,60 @@ class RectWallDetector:
         raw_wall_mask = wall_mask.copy()
         _px_raw = int(np.count_nonzero(raw_wall_mask))
 
-        # ── Stage 1a: Enclosed-space refinement — REMOVED ────────────
-        # The overlap-fraction heuristic mis-classified both ways (under-
-        # filled cavities, over-filled rooms). Stage 1d (skeleton cap +
-        # directional fill with guards A/B/C/D) is the authoritative
-        # enclosed-space pass and runs unchanged below.
-        _LS("Stage 1a — Enclosed-space refinement (SKIPPED — Stage 1d handles this)")
-        _L("  Stage 1a removed: deferred to Stage 1d skeleton cap pipeline")
+        # ── Stage 1a: Structural denoise (strip AI splatter / speckle) ──
+        # The raw U-Net mask carries ragged noise and isolated blobs that bleed
+        # beyond the true wall structure.  Two conservative, structure-aware
+        # steps clean it before any gap-bridging morphology runs:
+        #
+        #   1. Morphological OPEN with an image-scaled kernel — erodes thin
+        #      tendrils and the narrow bridges that connect splatter to the wall
+        #      body, while leaving thicker wall bodies intact.
+        #   2. Connected-component area floor — drops speckle blobs (including
+        #      splatter just disconnected by step 1) that are too small to be
+        #      part of the wall network.
+        #
+        # Both default ON; kernel and area floor scale with the image so they
+        # behave consistently across resolutions.  (The enclosed-space refine
+        # heuristic that previously lived here was removed — Stage 1d's skeleton
+        # cap pass is the authoritative enclosed-space step.)
+        _LS("Stage 1a — Structural denoise (open + small-component removal)")
+        if getattr(cfg, "rect_denoise_enable", True):
+            _px_pre_dn = int(np.count_nonzero(wall_mask))
+
+            _open_k = int(getattr(cfg, "rect_denoise_open_kernel", 0)) \
+                or max(3, int(round(min(H, W) * 0.006)))
+            if _open_k >= 2:
+                _dn_kernel = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (_open_k, _open_k))
+                wall_mask = cv2.morphologyEx(
+                    wall_mask, cv2.MORPH_OPEN, _dn_kernel, iterations=1)
+                _L("  MORPH_OPEN k=%d: strips tendrils/splatter thinner than ~%d px",
+                   _open_k, _open_k // 2)
+            else:
+                _L("  MORPH_OPEN skipped (kernel < 2 px)")
+
+            _min_area = int(getattr(cfg, "rect_denoise_min_area_px", 0)) \
+                or max(1, int(round(total_px * 0.0005)))
+            _nc, _lbl, _st, _ = cv2.connectedComponentsWithStats(
+                (wall_mask > 0).astype(np.uint8), connectivity=8)
+            _dropped = 0
+            if _nc > 1 and _min_area > 0:
+                _keep = np.zeros(_nc, dtype=bool)
+                for _i in range(1, _nc):
+                    if _st[_i, cv2.CC_STAT_AREA] >= _min_area:
+                        _keep[_i] = True
+                    else:
+                        _dropped += 1
+                wall_mask = np.where(_keep[_lbl], 255, 0).astype(np.uint8)
+            _L("  Component area floor=%d px: dropped %d small blob(s)",
+               _min_area, _dropped)
+
+            _px_post_dn = int(np.count_nonzero(wall_mask))
+            _L("  Before: %d px  →  After: %d px  (removed %d px, %.1f%%)",
+               _px_pre_dn, _px_post_dn, _px_pre_dn - _px_post_dn,
+               100.0 * (_px_pre_dn - _px_post_dn) / max(1, _px_pre_dn))
+        else:
+            _L("  SKIPPED — rect_denoise_enable=False in config")
 
         # ── Stage 1b: Morphological close ─────────────────────────────
         _LS("Stage 1b — Morphological close (bridge small gaps)")
@@ -1631,6 +1782,40 @@ class RectWallDetector:
         if _snapped == 0:
             _L("  No snapping — all endpoint gaps exceeded threshold or"
                " only parallel walls were close enough")
+
+        # ── Stage 4b: Minor-diagonal suppression ──────────────────────
+        # Snap small, isolated diagonal walls to the nearest axis when the plan
+        # is mostly orthogonal and their junction neighbours are all axis-
+        # aligned.  Only fires in the mixed case (real diagonals elsewhere +
+        # a small spurious one locally) — on purely-orthogonal plans Stage 2
+        # already forced axis_only so no diagonals exist to suppress.
+        _LS("Stage 4b — Minor-diagonal suppression")
+        if getattr(cfg, "rect_suppress_minor_diagonals", True):
+            _n_diag_before = sum(
+                1 for i in infos
+                if min(i.angle_deg % 90.0, 90.0 - (i.angle_deg % 90.0)) > axis_tol
+            )
+            _n_diag_snapped = _suppress_minor_diagonals(
+                infos,
+                axis_tol_deg=axis_tol,
+                short_frac=getattr(cfg, "rect_minor_diag_short_frac", 0.5),
+                max_diag_frac=getattr(cfg, "rect_minor_diag_max_frac", 0.34),
+            )
+            _L("  Diagonal walls: %d present → %d snapped to axis",
+               _n_diag_before, _n_diag_snapped)
+            if _n_diag_snapped:
+                # Re-run corner/T-junction snapping so the newly axis-aligned
+                # walls still close the perimeter at their junctions.
+                snap_collinear_endpoints(
+                    infos,
+                    snap_gap_factor=_snap_gf,
+                    snap_gap_floor=_snap_fl,
+                    snap_angle_deg=_snap_ang,
+                    max_extend_frac=_snap_ext,
+                )
+                _L("  Re-ran endpoint snapping after diagonal suppression")
+        else:
+            _L("  SKIPPED — rect_suppress_minor_diagonals=False in config")
 
         # ── Stage 5: WallSegments + output ────────────────────────────
         _LS("Stage 5 — WallSegment conversion + output")

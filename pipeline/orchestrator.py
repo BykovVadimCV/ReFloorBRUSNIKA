@@ -609,6 +609,28 @@ class FloorplanPipeline:
                 base_name, len(_door_walls),
             )
 
+        # ── Stage 3e: Inject window walls ─────────────────────────────
+        # Mirror of Stage 3d for windows: build a thin non-structural wall
+        # matching each window opening so the SH3D exporter always has an exact
+        # parent wall to host the window object.  Unlike door walls these may
+        # overlap existing structural walls — windows sit ON exterior walls.
+        # Built AFTER cleanup (like door walls) so they are not merged/filtered.
+        _window_openings = [
+            o for o in result.openings
+            if o.opening_type == OpeningType.WINDOW
+        ]
+        if _window_openings:
+            from detection.unet_doors import bbox_to_window_wall_segment
+            _window_walls = [
+                bbox_to_window_wall_segment(o.bbox, i, walls=result.walls)
+                for i, o in enumerate(_window_openings)
+            ]
+            result.walls = result.walls + _window_walls
+            logger.info(
+                "[%s] Stage 3e: injected %d window-wall segment(s)",
+                base_name, len(_window_walls),
+            )
+
         # ── Stage 4: SH3D Export ───────────────────────────────────────
         _notify("exporting SH3D")
         logger.info("[%s] Stage 4: SH3D export", base_name)
