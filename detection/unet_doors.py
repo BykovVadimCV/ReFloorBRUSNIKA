@@ -287,42 +287,59 @@ def _bbox_to_door_wall_segment(
     idx: int,
     walls: Optional[List[WallSegment]] = None,
     proximity_px: float = 30.0,
+    thickness: Optional[float] = None,
 ) -> WallSegment:
     """
     Build a door-wall WallSegment from a door bbox.
 
-    The shorter bbox dimension is used as a *fallback* thickness.  When
-    ``walls`` is supplied the nearest non-door structural wall is found and
-    its thickness is used instead — the bbox short-dim after gap-snapping is
-    just the gap height, not the physical wall thickness.
+    Thickness resolution order:
+      1. *thickness* argument when given (e.g. the apartment-average wall
+         thickness so every door reads at a consistent, solid depth).
+      2. the nearest non-door structural wall's thickness when *walls* is
+         supplied — the bbox short-dim after gap-snapping is just the gap
+         height, not the physical wall thickness.
+      3. the shorter bbox dimension as a last-resort fallback.
+
+    The door-wall runs along the bbox's long axis through its centre so it
+    fits the detected opening exactly.
     """
     x1, y1, x2, y2 = bbox.x1, bbox.y1, bbox.x2, bbox.y2
     w, h = x2 - x1, y2 - y1
-    if w >= h:                       # horizontal door
-        fallback_thickness = h
-        cy = (y1 + y2) / 2.0
-        outline = [(int(x1), int(cy)), (int(x2), int(cy))]
-    else:                            # vertical door
-        fallback_thickness = w
-        cx = (x1 + x2) / 2.0
-        outline = [(int(cx), int(y1)), (int(cx), int(y2))]
+    horizontal = w >= h
+    fallback_thickness = h if horizontal else w
 
-    # Look up nearest structural wall and use its thickness
-    thickness = fallback_thickness
-    if walls:
-        cx_b, cy_b = bbox.center
-        candidates = [ws for ws in walls if not ws.is_door_wall]
-        if candidates:
-            best = min(candidates,
-                       key=lambda ws: _point_to_centerline_dist(cx_b, cy_b, ws))
-            dist = _point_to_centerline_dist(cx_b, cy_b, best)
-            if dist <= proximity_px:
-                thickness = best.thickness
+    if thickness is None:
+        # Look up nearest structural wall and use its thickness
+        thickness = fallback_thickness
+        if walls:
+            cx_b, cy_b = bbox.center
+            candidates = [ws for ws in walls if not ws.is_door_wall]
+            if candidates:
+                best = min(candidates,
+                           key=lambda ws: _point_to_centerline_dist(cx_b, cy_b, ws))
+                dist = _point_to_centerline_dist(cx_b, cy_b, best)
+                if dist <= proximity_px:
+                    thickness = best.thickness
+
+    thickness = float(thickness)
+    half_t = thickness / 2.0
+
+    # Build the outline (centerline) and a bbox that is exactly *thickness*
+    # wide around it, so the door-wall fits its opening exactly and reads at
+    # the resolved thickness rather than the raw (possibly thin) bbox.
+    if horizontal:
+        cy = (y1 + y2) / 2.0
+        outline = [(int(x1), int(round(cy))), (int(x2), int(round(cy)))]
+        seg_bbox = BBox(float(x1), cy - half_t, float(x2), cy + half_t)
+    else:
+        cx = (x1 + x2) / 2.0
+        outline = [(int(round(cx)), int(y1)), (int(round(cx)), int(y2))]
+        seg_bbox = BBox(cx - half_t, float(y1), cx + half_t, float(y2))
 
     return WallSegment(
         id=f"door-wall-{idx:04d}",
-        bbox=bbox,
-        thickness=float(thickness),
+        bbox=seg_bbox,
+        thickness=thickness,
         is_structural=False,
         is_outer=False,
         is_diagonal=False,

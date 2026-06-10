@@ -35,7 +35,11 @@ from detection.walls import (
     snap_walls,
     wall_rectangle_to_segment,
 )
-from detection.openings import OpeningPipeline
+from detection.openings import (
+    OpeningPipeline,
+    average_wall_thickness,
+    filter_back_to_back_doors,
+)
 from floorplan_export.sh3d import SH3DExporter
 from floorplan_export.visualization import FloorplanVisualizer
 
@@ -570,6 +574,15 @@ class FloorplanPipeline:
                         base_name, len(filtered_unet), len(unet_openings), overlapping_count,
                     )
 
+        # ── Stage 2a: Spatial filter — no back-to-back doors ───────────
+        # Runs after every door source (gap, YOLO, U-Net, supplement) has been
+        # merged so doors stacked on the same doorway are removed once, here.
+        if openings:
+            openings = filter_back_to_back_doors(
+                openings,
+                separation_factor=self.config.min_door_separation_factor,
+            )
+
         result.openings = openings
         result.door_arcs = door_arcs
 
@@ -603,14 +616,28 @@ class FloorplanPipeline:
         # The SH3D exporter routes them as non-structural extra walls so
         # ParentWallFinder always finds an exact parent — no synthetic wall
         # creation or thickness guessing in the exporter.
-        _door_walls = list(
-            getattr(self.opening_detector, '_debug_door_wall_segments', [])
-        )
-        if _door_walls:
+        #
+        # One door-wall is built for EVERY door opening (YOLO, gap, U-Net),
+        # all at the apartment-average wall thickness so doors render solid and
+        # consistent (not thin/awkward) and each fits its opening exactly.
+        _door_openings = [
+            o for o in result.openings
+            if o.opening_type == OpeningType.DOOR
+        ]
+        if _door_openings:
+            from detection.unet_doors import _bbox_to_door_wall_segment
+            _avg_t = average_wall_thickness(result.walls)
+            _door_walls = [
+                _bbox_to_door_wall_segment(
+                    o.bbox, i, walls=result.walls, thickness=_avg_t,
+                )
+                for i, o in enumerate(_door_openings)
+            ]
             result.walls = result.walls + _door_walls
             logger.info(
-                "[%s] Stage 3d: injected %d door-wall segment(s)",
-                base_name, len(_door_walls),
+                "[%s] Stage 3d: injected %d door-wall segment(s) "
+                "at avg thickness %.1f px",
+                base_name, len(_door_walls), _avg_t,
             )
 
         # ── Stage 3e: Inject window walls ─────────────────────────────

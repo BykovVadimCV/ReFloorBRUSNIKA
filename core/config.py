@@ -414,6 +414,14 @@ class PipelineConfig:
     # diagonals not allowed for openings).
     opening_axis_tol_deg: float = 3.0
 
+    # Back-to-back door spatial filter.  Two doors are treated as the same
+    # doorway (and the lower-confidence one dropped) when the distance between
+    # their centres is below this fraction of the average of their long sides.
+    # Prevents doors stacked on the same opening / immediately against each
+    # other.  Legitimately separate adjacent doors (centres ~one door-width
+    # apart) are kept.
+    min_door_separation_factor: float = 0.6
+
     # ============================================================
     # BRUSNIKA-FORMAT BRANCH  (gated colour-based wall mask)
     # ============================================================
@@ -426,7 +434,9 @@ class PipelineConfig:
     # leaves wall_mask=None and the original U-Net path runs byte-for-byte.
 
     # Master switch for the whole branch.  False → behaves exactly as before.
-    enable_brusnika_branch: bool = True
+    # Disabled for now: the colour-based Brusnika path is off so every image
+    # runs the standard U-Net wall pipeline.
+    enable_brusnika_branch: bool = False
 
     # Brand wall colour (hex, no '#').
     brusnika_wall_color_hex: str = "8F8880"

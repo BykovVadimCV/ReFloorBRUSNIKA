@@ -230,6 +230,56 @@ def deduplicate_openings(
     return kept
 
 
+def filter_back_to_back_doors(
+    openings: List[Opening],
+    separation_factor: float = 0.6,
+) -> List[Opening]:
+    """Drop doors that sit back-to-back on the same doorway.
+
+    Two doors are considered the same opening when the distance between their
+    centres is below ``separation_factor`` × the average of their long sides.
+    This removes doors stacked on one another (e.g. the same doorway detected
+    from both sides, or a YOLO door and a U-Net door on the same gap that
+    survived IoU dedup) while keeping genuinely separate adjacent doors, whose
+    centres are roughly a full door-width apart.
+
+    Non-door openings are passed through untouched.  Among conflicting doors
+    the higher-confidence one is kept.
+    """
+    doors = [o for o in openings if o.opening_type == OpeningType.DOOR]
+    others = [o for o in openings if o.opening_type != OpeningType.DOOR]
+    if len(doors) <= 1:
+        return openings
+
+    # Greedy: process highest-confidence doors first; a candidate is dropped
+    # when it conflicts with an already-kept door.
+    doors.sort(key=lambda o: o.confidence, reverse=True)
+    kept: List[Opening] = []
+    dropped = 0
+    for cand in doors:
+        cx, cy = cand.bbox.center
+        c_long = max(cand.bbox.width, cand.bbox.height)
+        conflict = False
+        for k in kept:
+            kx, ky = k.bbox.center
+            k_long = max(k.bbox.width, k.bbox.height)
+            min_sep = separation_factor * 0.5 * (c_long + k_long)
+            if math.hypot(cx - kx, cy - ky) < min_sep:
+                conflict = True
+                break
+        if conflict:
+            dropped += 1
+        else:
+            kept.append(cand)
+
+    if dropped:
+        logger.info(
+            "OpeningPipeline: dropped %d back-to-back door(s) "
+            "(separation_factor=%.2f)", dropped, separation_factor,
+        )
+    return others + kept
+
+
 # ============================================================
 # UNIFIED OPENING DETECTION PIPELINE
 # ============================================================
@@ -366,6 +416,10 @@ class OpeningPipeline:
         all_openings: List[Opening] = []
         self._debug_yolo_doors_raw = []   # reset before each run
 
+        # Apartment-average wall thickness — doors are given this thickness so
+        # they read as solid, consistent openings rather than thin slivers.
+        avg_wall_t = average_wall_thickness(walls)
+
         # ── Step 1: YOLO detection ─────────────────────────────────────
         yolo_doors: List[Opening] = []
         yolo_windows: List[Opening] = []
@@ -461,8 +515,12 @@ class OpeningPipeline:
         # re-projecting keeps them centred and gives unmatched doors (no gap,
         # e.g. when wall filtering is disabled and walls stay solid) the same
         # flush placement a U-Net door receives — a smooth continuation of the
-        # wall rather than the offset YOLO leaf-bbox.
-        yolo_doors = [_snap_opening_to_wall(d, walls) for d in yolo_doors]
+        # wall rather than the offset YOLO leaf-bbox.  Doors take the
+        # apartment-average wall thickness so they are not thin/awkward.
+        yolo_doors = [
+            _snap_opening_to_wall(d, walls, thickness=avg_wall_t)
+            for d in yolo_doors
+        ]
 
         all_openings.extend(yolo_doors)
         all_openings.extend(geo_gaps)
@@ -697,20 +755,45 @@ def _point_to_centerline_dist(px: float, py: float, wall: WallSegment) -> float:
     return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
 
 
+def average_wall_thickness(
+    walls: List[WallSegment],
+    fallback: float = 10.0,
+) -> float:
+    """Mean thickness of the apartment's real (structural, axis-aligned) walls.
+
+    Door-, window- and diagonal walls are excluded so the figure reflects the
+    actual partition/load-bearing walls.  Returns *fallback* when there are no
+    qualifying walls.
+    """
+    ts = [
+        ws.thickness for ws in walls
+        if not ws.is_door_wall and not ws.is_window_wall
+        and not ws.is_diagonal and ws.thickness > 0
+    ]
+    if not ts:
+        return fallback
+    return float(sum(ts) / len(ts))
+
+
 def _snap_opening_to_wall(
     op: Opening,
     walls: List[WallSegment],
     proximity_px: float = 80.0,
+    thickness: Optional[float] = None,
 ) -> Opening:
     """Project a YOLO opening onto its host wall's centerline.
 
     YOLO door bboxes include the swinging leaf and YOLO window bboxes sit on
     the drawn window symbol — both leave the opening floating slightly in
     front of the actual wall gap.  This re-projects the cross-wall axis so the
-    opening is centred on the host wall's centerline and exactly as thick as
-    that wall, i.e. a smooth continuation of the wall (the same placement a
-    gap-snapped U-Net door gets).  The along-wall span (the opening width) is
-    preserved.
+    opening is centred on the host wall's centerline and as thick as that wall
+    (or *thickness* when given), i.e. a smooth continuation of the wall (the
+    same placement a gap-snapped U-Net door gets).  The along-wall span (the
+    opening width) is preserved so it fits its space exactly.
+
+    When *thickness* is supplied it overrides the host wall's own thickness —
+    used to give every door the apartment-average wall thickness so doors are
+    not rendered thin and awkward.
 
     The host wall is the nearest non-door / non-window, axis-aligned wall of
     the *same orientation* as the opening, within ``proximity_px`` of the
@@ -737,7 +820,7 @@ def _snap_opening_to_wall(
         (hx1, hy1), (hx2, hy2) = best.outline[0], best.outline[1]
     else:
         (hx1, hy1), (hx2, hy2) = best.centerline
-    half_t = best.thickness / 2.0
+    half_t = (thickness if thickness is not None else best.thickness) / 2.0
 
     if horizontal:
         axis = (hy1 + hy2) / 2.0
