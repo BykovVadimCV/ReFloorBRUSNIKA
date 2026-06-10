@@ -344,6 +344,11 @@ class PipelineConfig:
     rect_denoise_open_kernel: int   = 0     # MORPH_OPEN kernel px (0 = auto)
     rect_denoise_min_area_px: int   = 0     # drop components below this (0 = auto)
 
+    # Hatch-fill probe: if less than this fraction of the wall mask would
+    # survive the denoise MORPH_OPEN, the mask is stroke-textured (hatched
+    # wall style) and is consolidated with a MORPH_CLOSE before denoising.
+    rect_hatch_survival_thr:  float = 0.45
+
     # Minor-diagonal suppression: snap small isolated diagonal walls to the
     # nearest axis when the plan is mostly orthogonal and neighbours are axis-
     # aligned (only fires in the mixed axis+diagonal case).

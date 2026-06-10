@@ -166,12 +166,33 @@ class DoorFusion:
                             best_ydist = d
                             matched_yi = yi
 
+                # Opening geometry. The arc's circle centre is the physical
+                # hinge; the wall-attached contour endpoint (arc.hinge) is the
+                # far jamb. The wall opening is the segment between them, so
+                # its width equals the arc RADIUS (the door leaf), not 2r.
+                # When the arc matched a geometric gap, the gap's bbox is the
+                # most precise wall-aligned geometry — adopt it outright.
+                hinge_pt = (int(arc.center[0]), int(arc.center[1]))
+                jamb_pt = (int(arc.hinge[0]), int(arc.hinge[1]))
+                if matched_gi >= 0:
+                    g = norm_gaps[matched_gi]
+                    door_center = (int(g[0] + g[2] / 2), int(g[1] + g[3] / 2))
+                    door_width = int(max(g[2], g[3]))
+                    wall_normal = 90.0 if g[2] >= g[3] else 0.0
+                else:
+                    door_center = (
+                        int(round((hinge_pt[0] + jamb_pt[0]) / 2)),
+                        int(round((hinge_pt[1] + jamb_pt[1]) / 2)),
+                    )
+                    door_width = int(round(arc.radius_px))
+                    wall_normal = arc.wall_normal_deg
+
                 fd = FusedDoor(
                     id=next_id,
-                    hinge=arc.hinge,
-                    center=arc.center,
-                    width_px=int(arc.radius_px * 2),
-                    wall_normal_deg=arc.wall_normal_deg,
+                    hinge=hinge_pt,
+                    center=door_center,
+                    width_px=door_width,
+                    wall_normal_deg=wall_normal,
                     direction=arc.direction,
                     swing_clockwise=arc.swing_clockwise,
                     confidence=arc.confidence,

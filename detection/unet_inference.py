@@ -1586,6 +1586,13 @@ def _subprocess_entry():
         "window_bboxes": [list(map(int, b)) for b in result["window_bboxes"]],
         "wall_mask_b64": mask_b64,
     }
+
+    # pred_mask carries class indices 0..3 — small values survive a
+    # grayscale PNG round-trip losslessly. Needed by the diagonal
+    # pre-processor (cluster painting uses per-class regions).
+    if result.get("pred_mask") is not None:
+        _, pred_png = cv2.imencode(".png", result["pred_mask"].astype(np.uint8))
+        out["pred_mask_b64"] = base64.b64encode(pred_png.tobytes()).decode()
     real_stdout.write(json.dumps(out, default=lambda o: int(o)).encode())
     real_stdout.flush()
 
@@ -1651,13 +1658,19 @@ def run_unet_subprocess(
         wall_mask = cv2.imdecode(
             np.frombuffer(png_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
 
+        pred_mask = None
+        if out.get("pred_mask_b64"):
+            pred_bytes = base64.b64decode(out["pred_mask_b64"])
+            pred_mask = cv2.imdecode(
+                np.frombuffer(pred_bytes, np.uint8), cv2.IMREAD_GRAYSCALE)
+
         return {
             "wall_bboxes": [tuple(b) for b in out["wall_bboxes"]],
             "door_bboxes": [tuple(b) for b in out["door_bboxes"]],
             "window_bboxes": [tuple(b) for b in out["window_bboxes"]],
             "wall_mask": wall_mask,
             "wall_contours": [],  # not serialized, regenerated if needed
-            "pred_mask": None,
+            "pred_mask": pred_mask,
         }
     finally:
         if os.path.exists(tmp_path):

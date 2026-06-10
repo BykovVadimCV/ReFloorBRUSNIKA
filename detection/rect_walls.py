@@ -301,6 +301,66 @@ def snap_collinear_endpoints(
             else:
                 b.p2 = meet
 
+    # ── Second pass: T-junctions (endpoint → mid-span of another wall) ──
+    # The endpoint-pair pass above only closes corners where two wall ENDS
+    # nearly meet. A wall ending just short of another wall's SIDE has no
+    # nearby endpoint, so it stayed open and exported as a disconnected
+    # slab. Extend such endpoints along their own wall line until they
+    # reach the crossing wall's centerline.
+    for i in range(n):
+        a = infos[i]
+        len_a = _dist(a.p1, a.p2)
+        if len_a < 1e-6:
+            continue
+        gap_a = max(snap_gap_floor, snap_gap_factor * a.thickness)
+
+        for key in ('p1', 'p2'):
+            pa = getattr(a, key)
+            other = a.p2 if key == 'p1' else a.p1
+            best_meet = None
+            best_ext = float('inf')
+
+            for j in range(n):
+                if j == i:
+                    continue
+                b = infos[j]
+                if _angle_dist(a.angle_deg, b.angle_deg) <= snap_angle_deg:
+                    continue
+                len_b = _dist(b.p1, b.p2)
+                if len_b < 1e-6:
+                    continue
+
+                meet = _line_intersection(a.p1, a.p2, b.p1, b.p2)
+                if meet is None:
+                    continue
+                # Meet must land within b's span (a genuine T, not a far
+                # extension past b's end).
+                t = (((meet[0] - b.p1[0]) * (b.p2[0] - b.p1[0])
+                      + (meet[1] - b.p1[1]) * (b.p2[1] - b.p1[1]))
+                     / (len_b * len_b))
+                if t < -0.05 or t > 1.05:
+                    continue
+                # Extend outward only: the meet must lie beyond pa as seen
+                # from the opposite endpoint (never fold the wall back).
+                if _dist(other, meet) < len_a - 1e-6:
+                    continue
+                # Allowed extension: cross the face gap plus half of b's
+                # body to reach its centerline.
+                ext = _dist(pa, meet)
+                max_ext = max(gap_a,
+                              snap_gap_factor * b.thickness,
+                              snap_gap_floor) + b.thickness / 2.0
+                if ext > max_ext or ext >= best_ext:
+                    continue
+                best_ext = ext
+                best_meet = meet
+
+            if best_meet is not None and best_ext > 1e-6:
+                if key == 'p1':
+                    a.p1 = best_meet
+                else:
+                    a.p2 = best_meet
+
 
 # ---------------------------------------------------------------------------
 # Minor-diagonal suppression
@@ -1312,6 +1372,34 @@ class RectWallDetector:
             if _open_k >= 2:
                 _dn_kernel = cv2.getStructuringElement(
                     cv2.MORPH_ELLIPSE, (_open_k, _open_k))
+
+                # ── Hatch-fill probe ───────────────────────────────────
+                # Walls drawn as diagonal-stroke hatching produce a mask of
+                # thin parallel stripes. The OPEN below would erase them
+                # wholesale ("filtering throws away major wall chunks") and
+                # the leftover stripes would trip the LSD diagonal gate.
+                # Probe first: if the OPEN would remove most of the mask,
+                # the mask is stroke-textured, so consolidate the strokes
+                # into solid wall bodies with a CLOSE before denoising.
+                _probe = cv2.morphologyEx(
+                    wall_mask, cv2.MORPH_OPEN, _dn_kernel, iterations=1)
+                _survive = (int(np.count_nonzero(_probe))
+                            / max(1, int(np.count_nonzero(wall_mask))))
+                _hatch_thr = float(getattr(cfg, "rect_hatch_survival_thr", 0.45))
+                if _survive < _hatch_thr:
+                    _close_k = max(2 * _open_k + 1, 7)
+                    _hk = cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE, (_close_k, _close_k))
+                    wall_mask = cv2.morphologyEx(
+                        wall_mask, cv2.MORPH_CLOSE, _hk, iterations=2)
+                    _L("  Hatch probe: only %.0f%% of mask would survive OPEN "
+                       "(< %.0f%%) → stroke-textured mask; consolidated with "
+                       "CLOSE k=%d ×2 before denoise",
+                       _survive * 100, _hatch_thr * 100, _close_k)
+                else:
+                    _L("  Hatch probe: %.0f%% of mask survives OPEN — solid "
+                       "mask, no consolidation needed", _survive * 100)
+
                 wall_mask = cv2.morphologyEx(
                     wall_mask, cv2.MORPH_OPEN, _dn_kernel, iterations=1)
                 _L("  MORPH_OPEN k=%d: strips tendrils/splatter thinner than ~%d px",

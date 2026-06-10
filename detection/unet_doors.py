@@ -336,7 +336,7 @@ def bbox_to_window_wall_segment(
     idx: int,
     walls: Optional[List[WallSegment]] = None,
     proximity_px: float = 60.0,
-) -> WallSegment:
+) -> Optional[WallSegment]:
     """
     Build a window-wall WallSegment from a window bbox (mirror of
     ``_bbox_to_door_wall_segment``).
@@ -346,39 +346,55 @@ def bbox_to_window_wall_segment(
     Its sole job is to guarantee ``ParentWallFinder`` an exact axis-aligned
     parent for the window object, exactly as door walls do for doors.
 
-    The segment runs axis-aligned along the bbox's longer dimension; thickness
-    is taken from the nearest structural (non-opening) wall, falling back to the
-    bbox's short dimension when no wall is close enough.
+    The segment runs axis-aligned along the bbox's longer dimension and is
+    PROJECTED onto the host wall's centerline so it never floats beside the
+    real wall. Returns None when no same-orientation, non-diagonal structural
+    wall lies within ``proximity_px`` — such a window has no host wall and is
+    almost certainly a false detection; the caller should drop it.
     """
     x1, y1, x2, y2 = bbox.x1, bbox.y1, bbox.x2, bbox.y2
     w, h = x2 - x1, y2 - y1
-    if w >= h:                       # horizontal window
-        fallback_thickness = h
-        cy = (y1 + y2) / 2.0
-        outline = [(int(x1), int(cy)), (int(x2), int(cy))]
-    else:                            # vertical window
-        fallback_thickness = w
-        cx = (x1 + x2) / 2.0
-        outline = [(int(cx), int(y1)), (int(cx), int(y2))]
+    window_horizontal = w >= h
 
-    # Look up nearest structural wall and use its thickness (ignore other
-    # opening-walls so a door/window wall can't seed another's thickness).
-    thickness = fallback_thickness
-    if walls:
-        cx_b, cy_b = bbox.center
-        candidates = [ws for ws in walls
-                      if not ws.is_door_wall and not ws.is_window_wall]
-        if candidates:
-            best = min(candidates,
-                       key=lambda ws: _point_to_centerline_dist(cx_b, cy_b, ws))
-            dist = _point_to_centerline_dist(cx_b, cy_b, best)
-            if dist <= proximity_px:
-                thickness = best.thickness
+    if walls is None:
+        walls = []
+    candidates = [
+        ws for ws in walls
+        if not ws.is_door_wall and not ws.is_window_wall
+        and not ws.is_diagonal
+        and ws.is_horizontal == window_horizontal
+    ]
+    if not candidates:
+        return None
+
+    cx_b, cy_b = bbox.center
+    best = min(candidates,
+               key=lambda ws: _point_to_centerline_dist(cx_b, cy_b, ws))
+    if _point_to_centerline_dist(cx_b, cy_b, best) > proximity_px:
+        return None
+
+    # Project the window span onto the host wall's centerline axis.
+    if best.outline and len(best.outline) >= 2:
+        (hx1, hy1), (hx2, hy2) = best.outline[0], best.outline[1]
+    else:
+        (hx1, hy1), (hx2, hy2) = best.centerline
+    if window_horizontal:
+        host_axis = (hy1 + hy2) / 2.0
+        outline = [(int(x1), int(round(host_axis))),
+                   (int(x2), int(round(host_axis)))]
+        seg_bbox = BBox(float(x1), host_axis - best.thickness / 2.0,
+                        float(x2), host_axis + best.thickness / 2.0)
+    else:
+        host_axis = (hx1 + hx2) / 2.0
+        outline = [(int(round(host_axis)), int(y1)),
+                   (int(round(host_axis)), int(y2))]
+        seg_bbox = BBox(host_axis - best.thickness / 2.0, float(y1),
+                        host_axis + best.thickness / 2.0, float(y2))
 
     return WallSegment(
         id=f"window-wall-{idx:04d}",
-        bbox=bbox,
-        thickness=float(thickness),
+        bbox=seg_bbox,
+        thickness=float(best.thickness),
         is_structural=False,
         is_outer=False,
         is_diagonal=False,
@@ -645,11 +661,15 @@ class UNetDoorDetector:
             import torch
             from detection.unet_inference import build_model_from_checkpoint
 
-            dev_str = self.device or ("cuda" if __import__("torch").cuda.is_available() else "cpu")
-            self._torch_device = __import__("torch").device(dev_str)
+            dev_str = self.device or ("cuda" if torch.cuda.is_available() else "cpu")
+            self._torch_device = torch.device(dev_str)
             self._model, self._num_classes = build_model_from_checkpoint(
                 str(ckpt), self._torch_device
             )
+            # build_model_from_checkpoint does not guarantee device placement —
+            # without this .to() the model stays on CPU while inference inputs
+            # go to CUDA, and every detect() call fails with a device mismatch.
+            self._model = self._model.to(self._torch_device)
             self._model.eval()
             logger.info(
                 "UNetDoorDetector: loaded %s  (%d classes)",

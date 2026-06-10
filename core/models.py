@@ -250,6 +250,10 @@ class Opening:
     swing_clockwise: bool = True
     arc_radius_px: Optional[float] = None
 
+    # Direction perpendicular to the host wall in degrees (None = unknown).
+    # Horizontal wall (opening runs along x) → 90/270; vertical wall → 0/180.
+    wall_normal_deg: Optional[float] = None
+
     # Wall association
     parent_wall_id: Optional[str] = None
 
@@ -525,15 +529,15 @@ class FusedDoor:
     source: str = "arc"  # "arc" | "yolo_gap" | "yolo_only"
 
     def to_opening(self, pixels_to_cm: float = 1.0) -> Opening:
-        """Convert to unified Opening format."""
-        half_width = self.width_px / 2
+        """Convert to unified Opening format (wall-aligned bbox)."""
         cx, cy = self.center
-        bbox = BBox(
-            cx - half_width,
-            cy - half_width,
-            cx + half_width,
-            cy + half_width,
-        )
+        half_w = self.width_px / 2.0
+        half_t = max(2.0, self.width_px / 8.0)
+        horizontal_wall = abs(math.sin(math.radians(self.wall_normal_deg))) > 0.707
+        if horizontal_wall:
+            bbox = BBox(cx - half_w, cy - half_t, cx + half_w, cy + half_t)
+        else:
+            bbox = BBox(cx - half_t, cy - half_w, cx + half_t, cy + half_w)
         return Opening(
             bbox=bbox,
             opening_type=OpeningType.DOOR,
@@ -541,6 +545,7 @@ class FusedDoor:
             hinge_point=self.hinge,
             swing_direction=SwingDirection(self.direction) if self.direction in ('left', 'right') else SwingDirection.UNKNOWN,
             swing_clockwise=self.swing_clockwise,
+            wall_normal_deg=self.wall_normal_deg,
             source=self.source,
         )
 

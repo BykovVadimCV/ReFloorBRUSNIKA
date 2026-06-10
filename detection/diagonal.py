@@ -496,9 +496,16 @@ def _transform_labels(labels: List[Tuple], M: np.ndarray) -> List[Tuple]:
 def _run_unet(img_bgr: np.ndarray, ckpt_path: str,
                img_size: int = UNET_DEFAULT_SIZE
                ) -> Optional[Dict[str, Any]]:
-    """Run the project U-Net on a BGR image. Returns its native dict, or None."""
+    """Run the project U-Net on a BGR image. Returns its native dict, or None.
+
+    Inference runs in an isolated subprocess: torch CPU kernels can die with
+    an Illegal Instruction (0xC000001D) on some CPU/library combinations,
+    and in-process that takes the whole pipeline down before any output is
+    written. In a child process the crash is contained — this function then
+    returns None and the caller degrades to the no-deskew path.
+    """
     try:
-        from detection.unet_inference import run_unet_pipeline
+        from detection.unet_inference import run_unet_subprocess
     except Exception as exc:
         logger.info("[diagonal] U-Net module unavailable: %s", exc)
         return None
@@ -507,7 +514,7 @@ def _run_unet(img_bgr: np.ndarray, ckpt_path: str,
         return None
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     try:
-        return run_unet_pipeline(rgb, ckpt_path, img_size=img_size)
+        return run_unet_subprocess(rgb, ckpt_path, img_size=img_size)
     except Exception as exc:
         logger.warning("[diagonal] U-Net inference failed: %s", exc)
         return None
@@ -586,6 +593,10 @@ def preprocess_floorplan(
 
     wall_mask = unet['wall_mask']
     pred_mask = unet['pred_mask']
+    if pred_mask is None:
+        # Subprocess protocol may omit pred_mask; degrade gracefully — the
+        # cluster-painting step simply finds no class regions.
+        pred_mask = np.zeros_like(wall_mask)
 
     # 6 + 7. LSD on text-erased gray, filter, cluster
     gray = cv2.cvtColor(img_clean, cv2.COLOR_BGR2GRAY)

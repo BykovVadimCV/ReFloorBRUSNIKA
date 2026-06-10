@@ -135,6 +135,9 @@ def opening_to_rect_dict(op: Opening) -> Dict[str, float]:
         'y1': op.bbox.y1,
         'x2': op.bbox.x2,
         'y2': op.bbox.y2,
+        # Detector provenance — lets the exporter skip re-snapping openings
+        # that were already precisely placed (e.g. "unet_door").
+        'source': op.source,
     }
 
 
@@ -159,7 +162,13 @@ def opening_to_fused_door(op: Opening):
     fd = _FusedDoorCompat()
     fd.center = (int(op.bbox.center_x), int(op.bbox.center_y))
     fd.width_px = int(max(op.bbox.width, op.bbox.height))
-    fd.wall_normal_deg = 0.0  # Will be computed from parent wall
+    # Wall normal: prefer the detector-supplied value; otherwise derive from
+    # the bbox orientation (long side runs along the wall, so a horizontal
+    # bbox sits in a horizontal wall whose normal points along y = 90°).
+    if getattr(op, 'wall_normal_deg', None) is not None:
+        fd.wall_normal_deg = float(op.wall_normal_deg)
+    else:
+        fd.wall_normal_deg = 90.0 if op.bbox.is_horizontal else 0.0
     fd.hinge = op.hinge_point
     fd.swing_clockwise = op.swing_clockwise
     fd.direction = op.swing_direction.value if op.swing_direction else "unknown"

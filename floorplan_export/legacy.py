@@ -784,12 +784,17 @@ class OpeningProcessor:
 
         # FIX: derive opening width from the fused door's detected pixel width
         width_cm = fused_door.width_px * self.pixels_to_cm
-        is_horizontal = abs(math.cos(math.radians(fused_door.wall_normal_deg))) > 0.707
+        # wall_normal_deg points PERPENDICULAR to the wall: a horizontal wall
+        # (door runs along x) has a vertical normal, so |sin| ≈ 1.
+        is_horizontal = abs(math.sin(math.radians(fused_door.wall_normal_deg))) > 0.707
 
         ow = width_cm                       # ← actual detected gap width
         oh = DEFAULT_DOOR_HEIGHT
         elev = 0.0
-        wt, wd = 0.51724136, 0.06896552
+        # wallThickness is a FRACTION of piece depth in SH3D semantics.
+        # depth is set to the parent wall thickness below, so the wall
+        # occupies the full piece depth (1.0) with no front offset (0.0).
+        wt, wd = 1.0, 0.0
         model, icon = '1/door/door.obj', '0'
 
         parent = parent_finder.find_parent(center, width_cm, is_horizontal)
@@ -823,20 +828,23 @@ class OpeningProcessor:
                                            cx_cm + half_perp, cy_cm + half)
             pid, depth = new_wall.wall_id, thickness
 
-        fused_angle = math.radians(fused_door.wall_normal_deg) if hasattr(fused_door, 'wall_normal_deg') else angle
+        # The piece angle follows the WALL direction (parent.angle when a
+        # parent was found, axis angle otherwise) — never the wall normal,
+        # which is perpendicular and would rotate the door 90° out of the wall.
         hinge_px = fused_door.hinge if fused_door.hinge else (cx, cy)
 
         opening = Opening(
             opening_type=OpeningType.DOOR,
             center=center,
             width=ow, height=oh, depth=depth,
-            angle=fused_angle, elevation=elev,
+            angle=angle, elevation=elev,
             parent_wall_id=pid,
             wall_thickness=wt, wall_distance=wd,
             model=model, icon=icon,
             hinge=hinge_px,
             swing_clockwise=fused_door.swing_clockwise,
             wall_normal_deg=fused_door.wall_normal_deg,
+            source=getattr(fused_door, 'source', ''),
         )
         return opening, new_wall
 
@@ -860,23 +868,27 @@ class OpeningProcessor:
         # ──────────────────────────────────────────────────
         gap_width = bbox_w if is_horizontal else bbox_h
 
+        # wallThickness is a FRACTION of piece depth in SH3D semantics; depth
+        # is set to the parent wall thickness, so 1.0/0.0 makes the opening
+        # cut the full wall with no front offset.
         if opening_type == OpeningType.WINDOW:
             ow = gap_width
             oh = DEFAULT_WINDOW_HEIGHT
             elev = DEFAULT_WINDOW_ELEVATION
-            wt, wd = 0.7352941, 0.0
+            wt, wd = 1.0, 0.0
             model, icon = '3/window85x163/window85x163.obj', '2'
         elif opening_type == OpeningType.GAP:
+            # A gap is a doorless passage: full-height cut, floor-level.
             ow = gap_width
-            oh = DEFAULT_WINDOW_HEIGHT
-            elev = DEFAULT_WINDOW_ELEVATION
-            wt, wd = 0.51724136, 0.06896552
-            model, icon = '3/window85x163/window85x163.obj', '2'
+            oh = DEFAULT_DOOR_HEIGHT
+            elev = 0.0
+            wt, wd = 1.0, 0.0
+            model, icon = '1/door/door.obj', '0'
         else:
             ow = gap_width
             oh = DEFAULT_DOOR_HEIGHT
             elev = 0.0
-            wt, wd = 0.51724136, 0.06896552
+            wt, wd = 1.0, 0.0
             model, icon = '1/door/door.obj', '0'
 
         parent = parent_finder.find_parent(center, max(bbox_w, bbox_h), is_horizontal)
@@ -912,6 +924,7 @@ class OpeningProcessor:
             parent_wall_id=pid,
             wall_thickness=wt, wall_distance=wd,
             model=model, icon=icon,
+            source=str(rect.get('source', '')) if isinstance(rect, dict) else '',
         )
         return opening, new_wall
 
@@ -1587,10 +1600,14 @@ class SweetHome3DExporter:
                     ow.start.x, ow.end.x = best_pair[0], best_pair[1]
                     # Snap perpendicular coordinate to detection bbox centre
                     ow.start.y = ow.end.y = det_cy
+                    # The opening centre is the midpoint of the bridged gap —
+                    # using the detection centre would decenter the door
+                    # whenever the gap is asymmetric around the detection.
+                    gap_mid_x = (best_pair[0] + best_pair[1]) / 2
                     for o in openings:
                         if o.parent_wall_id == ow.wall_id:
                             o.width = best_gap
-                            o.center = Point(det_cx, det_cy)
+                            o.center = Point(gap_mid_x, det_cy)
                 else:
                     to_remove.add(ow.wall_id)
 
@@ -1660,10 +1677,13 @@ class SweetHome3DExporter:
                         ow.start.y, ow.end.y = best_pair[1], best_pair[0]
                     # Snap perpendicular coordinate to detection bbox centre
                     ow.start.x = ow.end.x = det_cx
+                    # Centre the opening on the bridged gap (see horizontal
+                    # branch above).
+                    gap_mid_y = (best_pair[0] + best_pair[1]) / 2
                     for o in openings:
                         if o.parent_wall_id == ow.wall_id:
                             o.width = best_gap
-                            o.center = Point(det_cx, det_cy)
+                            o.center = Point(det_cx, gap_mid_y)
                 else:
                     to_remove.add(ow.wall_id)
 
@@ -2062,9 +2082,11 @@ class SweetHome3DExporter:
             parent = wall_by_id.get(o.parent_wall_id)
             if not parent:
                 continue
-            # Align angle to parent wall (unless fused door set a precise angle)
-            if o.hinge is None:
-                o.angle = parent.angle
+            # Align angle to the parent wall for ALL openings. Hinged (arc)
+            # doors used to be exempt to preserve "precise" arc orientation,
+            # but openings only sit on axis-aligned walls, so the parent's
+            # angle is always the correct one.
+            o.angle = parent.angle
             # Project opening centre onto the parent wall centerline
             # but do NOT replace it with the wall midpoint and do NOT
             # resize to the wall length.

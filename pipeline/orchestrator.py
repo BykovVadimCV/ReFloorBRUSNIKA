@@ -386,15 +386,10 @@ class FloorplanPipeline:
                     "[%s] Rect-wall detection failed (%s) — falling back to "
                     "legacy U-Net/colour path", base_name, exc,
                 )
-                # Fall through to the legacy path with normal vars
+                # Fall through to the legacy path with normal vars.
+                # NOTE: img_clean must stay alive here — the legacy fallback
+                # below still needs it; it is freed after wall detection.
                 result.walls = []
-            finally:
-                # Free the cleaned image; downstream stages use `img`
-                # (un-erased deskewed image) for opening detection.
-                try:
-                    del img_clean
-                except NameError:
-                    pass
 
         # Legacy path runs only when the new detector is disabled or
         # produced no walls.
@@ -424,12 +419,78 @@ class FloorplanPipeline:
             _notify("detecting walls")
             logger.info("[%s] Stage 1: Colour-based wall detection", base_name)
             detection, raw_rectangles = self._run_wall_detection(img_clean)
-            del img_clean  # free ~75MB
 
             result.walls = detection.walls
             result.wall_mask = detection.wall_mask
             result.outline_mask = detection.outline_mask
 
+        # Free the cleaned image; downstream stages use `img`
+        # (un-erased deskewed image) for opening detection.
+        try:
+            del img_clean
+        except NameError:
+            pass
+
+
+        # ── Stage 1b: Room Measurement + Scale Calibration ────────────────
+        # Runs BEFORE opening detection so the gap/arc detectors' metric
+        # filters (min/max opening width in meters, arc radius bounds) use
+        # the calibrated scale instead of the config default.
+        _notify("OCR / scale calibration")
+        logger.info("[%s] Stage 1b: Room measurement", base_name)
+        measurements, ocr_labels, pixels_to_cm = self._run_room_measurement(
+            image_path=image_path,
+            img=img,
+            walls=result.walls,
+            outline_mask=result.outline_mask,
+            output_dir=output_dir,
+        )
+
+        result.raw_measurements = measurements
+        result.ocr_labels = ocr_labels
+        result.pixels_to_cm = pixels_to_cm
+
+        if measurements:
+            ps = measurements.pixel_scale
+            if ps and ps > 0:
+                pixels_to_cm = ps * 100.0
+                if 0.1 < pixels_to_cm < 20.0:
+                    result.pixel_scale = ps
+                    result.pixels_to_cm = pixels_to_cm
+                    self.config = self.config.copy_with(pixels_to_cm=pixels_to_cm)
+                    self.exporter.update_scale(pixels_to_cm)
+                    self.visualizer.pixels_to_cm = pixels_to_cm
+                else:
+                    logger.warning("Room-area scale out of bounds (%.4f), ignoring",
+                                   pixels_to_cm)
+
+        # Reuse OCR labels collected in pre-stage (no re-run needed).
+        logger.info("[%s] Stage 1b2: OCR text label collection (reusing pre-stage)",
+                    base_name)
+        ocr_text_labels = ocr_text_labels_early
+        if ocr_text_labels:
+            ocr_labels = ocr_text_labels
+            result.ocr_labels = ocr_labels
+
+        # ── Stage 1b3: Wall-length scale calibration (rotated labels) ────
+        # Uses rotated OCR labels collected in pre-stage (no re-run).
+        logger.info("[%s] Stage 1b3: Wall-length scale calibration", base_name)
+        wl_ptcm = _calibrate_scale_from_wall_lengths(
+            img=img,
+            walls=result.walls,
+            normal_labels=ocr_text_labels,
+            rotated_labels=rotated_ocr_labels,
+            debug_dir=output_dir,
+            rotated_labels_in_image_coords=True,
+        )
+        if wl_ptcm is not None and 0.1 < wl_ptcm < 20.0:
+            logger.info("[%s] Wall-length calibration: pixels_to_cm %.4f -> %.4f",
+                        base_name, result.pixels_to_cm, wl_ptcm)
+            result.pixels_to_cm = wl_ptcm
+            result.pixel_scale = wl_ptcm / 100.0
+            self.config = self.config.copy_with(pixels_to_cm=wl_ptcm)
+            self.exporter.update_scale(wl_ptcm)
+            self.visualizer.pixels_to_cm = wl_ptcm
 
         # ── Stage 2: Opening Detection (UNIFIED: gap + U-Net with deduplication) ─────
         _notify("detecting openings")
@@ -531,63 +592,6 @@ class FloorplanPipeline:
                     base_name, _drop_n,
                 )
 
-        # ── Stage 3: Room Measurement + Scale Calibration (primary) ───────
-        _notify("OCR / scale calibration")
-        logger.info("[%s] Stage 3: Room measurement", base_name)
-        measurements, ocr_labels, pixels_to_cm = self._run_room_measurement(
-            image_path=image_path,
-            img=img,
-            walls=result.walls,
-            outline_mask=result.outline_mask,
-            output_dir=output_dir,
-        )
-
-        result.raw_measurements = measurements
-        result.ocr_labels = ocr_labels
-        result.pixels_to_cm = pixels_to_cm
-
-        if measurements:
-            ps = measurements.pixel_scale
-            if ps and ps > 0:
-                pixels_to_cm = ps * 100.0
-                if 0.1 < pixels_to_cm < 20.0:
-                    result.pixel_scale = ps
-                    result.pixels_to_cm = pixels_to_cm
-                    self.config = self.config.copy_with(pixels_to_cm=pixels_to_cm)
-                    self.exporter.update_scale(pixels_to_cm)
-                    self.visualizer.pixels_to_cm = pixels_to_cm
-                else:
-                    logger.warning("Room-area scale out of bounds (%.4f), ignoring",
-                                   pixels_to_cm)
-
-        # Reuse OCR labels collected in pre-stage (no re-run needed).
-        logger.info("[%s] Stage 3b: OCR text label collection (reusing pre-stage)",
-                    base_name)
-        ocr_text_labels = ocr_text_labels_early
-        if ocr_text_labels:
-            ocr_labels = ocr_text_labels
-            result.ocr_labels = ocr_labels
-
-        # ── Stage 3b2: Wall-length scale calibration (rotated labels) ────
-        # Uses rotated OCR labels collected in pre-stage (no re-run).
-        logger.info("[%s] Stage 3b2: Wall-length scale calibration", base_name)
-        wl_ptcm = _calibrate_scale_from_wall_lengths(
-            img=img,
-            walls=result.walls,
-            normal_labels=ocr_text_labels,
-            rotated_labels=rotated_ocr_labels,
-            debug_dir=output_dir,
-            rotated_labels_in_image_coords=True,
-        )
-        if wl_ptcm is not None and 0.1 < wl_ptcm < 20.0:
-            logger.info("[%s] Wall-length calibration: pixels_to_cm %.4f -> %.4f",
-                        base_name, result.pixels_to_cm, wl_ptcm)
-            result.pixels_to_cm = wl_ptcm
-            result.pixel_scale = wl_ptcm / 100.0
-            self.config = self.config.copy_with(pixels_to_cm=wl_ptcm)
-            self.exporter.update_scale(wl_ptcm)
-            self.visualizer.pixels_to_cm = wl_ptcm
-
         # ── Stage 3c: Wall cleanup ────────────────────────────────────
         logger.info("[%s] Stage 3c: Wall cleanup", base_name)
         result.walls = cleanup_walls(result.walls)
@@ -621,10 +625,25 @@ class FloorplanPipeline:
         ]
         if _window_openings:
             from detection.unet_doors import bbox_to_window_wall_segment
-            _window_walls = [
-                bbox_to_window_wall_segment(o.bbox, i, walls=result.walls)
-                for i, o in enumerate(_window_openings)
-            ]
+            _window_walls = []
+            _hostless_ids = set()
+            for i, o in enumerate(_window_openings):
+                _seg = bbox_to_window_wall_segment(o.bbox, i, walls=result.walls)
+                if _seg is None:
+                    # No same-orientation structural wall near the window —
+                    # almost certainly a false detection; drop the window
+                    # rather than synthesising a free-floating wall panel.
+                    _hostless_ids.add(o.id)
+                    continue
+                _window_walls.append(_seg)
+            if _hostless_ids:
+                result.openings = [
+                    o for o in result.openings if o.id not in _hostless_ids
+                ]
+                logger.info(
+                    "[%s] Stage 3e: dropped %d window(s) with no host wall",
+                    base_name, len(_hostless_ids),
+                )
             result.walls = result.walls + _window_walls
             logger.info(
                 "[%s] Stage 3e: injected %d window-wall segment(s)",
@@ -930,7 +949,7 @@ class FloorplanPipeline:
         dropped list for diagnostics without re-running the filter.
         """
         if not openings or not walls:
-            return 0
+            return 0, []
 
         def _seg_dist(px: float, py: float,
                       a: Tuple[float, float], b: Tuple[float, float]) -> float:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, List, Optional, Tuple
 
 import numpy as np
@@ -91,6 +92,22 @@ def window_to_unified(win) -> Opening:
     )
 
 
+def _fused_door_bbox(fd) -> BBox:
+    """
+    Wall-aligned bbox for a fused door: the long side is the door width along
+    the wall, the short side a nominal quarter-width (the true wall thickness
+    is unknown at this point; the exporter re-derives it from the parent wall).
+    """
+    cx, cy = fd.center
+    half_w = fd.width_px / 2.0
+    half_t = max(2.0, fd.width_px / 8.0)
+    normal = getattr(fd, "wall_normal_deg", None) or 0.0
+    horizontal_wall = abs(math.sin(math.radians(normal))) > 0.707
+    if horizontal_wall:
+        return BBox(cx - half_w, cy - half_t, cx + half_w, cy + half_t)
+    return BBox(cx - half_t, cy - half_w, cx + half_t, cy + half_w)
+
+
 def fused_door_to_unified(fd: FusedDoor) -> Opening:
     """
     Convert a FusedDoor (from doordetector.py) to unified Opening.
@@ -101,10 +118,6 @@ def fused_door_to_unified(fd: FusedDoor) -> Opening:
     Returns:
         Unified Opening object
     """
-    cx, cy = fd.center
-    half = fd.width_px / 2
-    bbox = BBox(cx - half, cy - half, cx + half, cy + half)
-
     direction = SwingDirection.UNKNOWN
     if fd.direction == "left":
         direction = SwingDirection.LEFT
@@ -112,12 +125,13 @@ def fused_door_to_unified(fd: FusedDoor) -> Opening:
         direction = SwingDirection.RIGHT
 
     return Opening(
-        bbox=bbox,
+        bbox=_fused_door_bbox(fd),
         opening_type=OpeningType.DOOR,
         confidence=fd.confidence,
         hinge_point=fd.hinge,
         swing_direction=direction,
         swing_clockwise=fd.swing_clockwise,
+        wall_normal_deg=fd.wall_normal_deg,
         source=fd.source,
     )
 
@@ -189,14 +203,29 @@ def deduplicate_openings(
     kept: List[Opening] = []
     for candidate in sorted_ops:
         cb = candidate.bbox.to_xyxy()
-        duplicate = False
+        dup_of: Optional[Opening] = None
         for existing in kept:
             eb = existing.bbox.to_xyxy()
             if iou_xyxy(cb, eb) > iou_threshold:
-                duplicate = True
+                dup_of = existing
                 break
-        if not duplicate:
+        if dup_of is None:
             kept.append(candidate)
+        elif (dup_of.opening_type == OpeningType.GAP
+              and candidate.opening_type == OpeningType.DOOR):
+            # A door suppressed by a co-located gap: keep the gap's precise
+            # wall-aligned geometry, but promote it to a DOOR carrying the
+            # door's swing metadata — otherwise the doorway exports as a
+            # bare passage and the detected door is lost.
+            dup_of.opening_type = OpeningType.DOOR
+            if dup_of.hinge_point is None:
+                dup_of.hinge_point = candidate.hinge_point
+            if dup_of.swing_direction == SwingDirection.UNKNOWN:
+                dup_of.swing_direction = candidate.swing_direction
+                dup_of.swing_clockwise = candidate.swing_clockwise
+            if dup_of.wall_normal_deg is None:
+                dup_of.wall_normal_deg = candidate.wall_normal_deg
+            dup_of.confidence = max(dup_of.confidence, candidate.confidence)
 
     return kept
 
@@ -694,10 +723,6 @@ def _legacy_fused_door_to_unified(fd) -> Opening:
     doordetector.FusedDoor (which has different field names).
     """
     # Legacy FusedDoor fields: hinge, center, width_px, direction, swing_clockwise, confidence, source
-    cx, cy = fd.center
-    half = fd.width_px / 2
-    bbox = BBox(cx - half, cy - half, cx + half, cy + half)
-
     direction = SwingDirection.UNKNOWN
     d = getattr(fd, 'direction', 'unknown')
     if d == 'left':
@@ -706,11 +731,12 @@ def _legacy_fused_door_to_unified(fd) -> Opening:
         direction = SwingDirection.RIGHT
 
     return Opening(
-        bbox=bbox,
+        bbox=_fused_door_bbox(fd),
         opening_type=OpeningType.DOOR,
         confidence=float(getattr(fd, 'confidence', 1.0)),
         hinge_point=fd.hinge,
         swing_direction=direction,
         swing_clockwise=bool(getattr(fd, 'swing_clockwise', True)),
+        wall_normal_deg=getattr(fd, 'wall_normal_deg', None),
         source=getattr(fd, 'source', 'arc'),
     )
