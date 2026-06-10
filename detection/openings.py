@@ -394,6 +394,9 @@ class OpeningPipeline:
                     for w in raw.windows
                 ]
 
+        # Snap YOLO windows onto their host wall so they are a smooth
+        # continuation of the wall instead of floating in front of the gap.
+        yolo_windows = [_snap_opening_to_wall(w, walls) for w in yolo_windows]
         all_openings.extend(yolo_windows)
         # Snapshot raw YOLO doors before any resolution / deduplication
         self._debug_yolo_doors_raw = list(yolo_doors)
@@ -452,6 +455,14 @@ class OpeningPipeline:
         if yolo_doors and geo_gaps:
             yolo_doors, geo_gaps = _resolve_doors_to_gaps(
                 yolo_doors, geo_gaps, match_margin=25)
+
+        # Snap every YOLO door onto its host wall's centerline.  Doors that
+        # matched a geometric gap above already carry a wall-aligned bbox;
+        # re-projecting keeps them centred and gives unmatched doors (no gap,
+        # e.g. when wall filtering is disabled and walls stay solid) the same
+        # flush placement a U-Net door receives — a smooth continuation of the
+        # wall rather than the offset YOLO leaf-bbox.
+        yolo_doors = [_snap_opening_to_wall(d, walls) for d in yolo_doors]
 
         all_openings.extend(yolo_doors)
         all_openings.extend(geo_gaps)
@@ -665,6 +676,86 @@ def _resolve_doors_to_gaps(
         g for i, g in enumerate(geo_gaps) if i not in claimed_gap_indices
     ]
     return updated_doors, unclaimed_gaps
+
+
+def _point_to_centerline_dist(px: float, py: float, wall: WallSegment) -> float:
+    """Minimum distance from (px, py) to the wall's centerline segment."""
+    if wall.outline and len(wall.outline) >= 2:
+        ax, ay = float(wall.outline[0][0]), float(wall.outline[0][1])
+        bx, by = float(wall.outline[1][0]), float(wall.outline[1][1])
+    else:
+        cl = wall.centerline
+        (ax, ay), (bx, by) = (
+            (float(cl[0][0]), float(cl[0][1])),
+            (float(cl[1][0]), float(cl[1][1])),
+        )
+    dx, dy = bx - ax, by - ay
+    l2 = dx * dx + dy * dy
+    if l2 < 1e-9:
+        return math.hypot(px - ax, py - ay)
+    t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / l2))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _snap_opening_to_wall(
+    op: Opening,
+    walls: List[WallSegment],
+    proximity_px: float = 80.0,
+) -> Opening:
+    """Project a YOLO opening onto its host wall's centerline.
+
+    YOLO door bboxes include the swinging leaf and YOLO window bboxes sit on
+    the drawn window symbol — both leave the opening floating slightly in
+    front of the actual wall gap.  This re-projects the cross-wall axis so the
+    opening is centred on the host wall's centerline and exactly as thick as
+    that wall, i.e. a smooth continuation of the wall (the same placement a
+    gap-snapped U-Net door gets).  The along-wall span (the opening width) is
+    preserved.
+
+    The host wall is the nearest non-door / non-window, axis-aligned wall of
+    the *same orientation* as the opening, within ``proximity_px`` of the
+    opening centre.  If no such wall exists the opening is returned unchanged.
+    """
+    bbox = op.bbox
+    horizontal = bbox.width >= bbox.height
+
+    candidates = [
+        ws for ws in walls
+        if not ws.is_door_wall and not ws.is_window_wall
+        and not ws.is_diagonal
+        and ws.is_horizontal == horizontal
+    ]
+    if not candidates:
+        return op
+
+    cx, cy = bbox.center
+    best = min(candidates, key=lambda ws: _point_to_centerline_dist(cx, cy, ws))
+    if _point_to_centerline_dist(cx, cy, best) > proximity_px:
+        return op
+
+    if best.outline and len(best.outline) >= 2:
+        (hx1, hy1), (hx2, hy2) = best.outline[0], best.outline[1]
+    else:
+        (hx1, hy1), (hx2, hy2) = best.centerline
+    half_t = best.thickness / 2.0
+
+    if horizontal:
+        axis = (hy1 + hy2) / 2.0
+        new_bbox = BBox(bbox.x1, axis - half_t, bbox.x2, axis + half_t)
+    else:
+        axis = (hx1 + hx2) / 2.0
+        new_bbox = BBox(axis - half_t, bbox.y1, axis + half_t, bbox.y2)
+
+    return Opening(
+        bbox=new_bbox,
+        opening_type=op.opening_type,
+        confidence=op.confidence,
+        source=op.source,
+        hinge_point=op.hinge_point,
+        swing_direction=op.swing_direction,
+        swing_clockwise=op.swing_clockwise,
+        wall_normal_deg=op.wall_normal_deg,
+    )
 
 
 def _segment_to_wall_rect(seg: WallSegment):

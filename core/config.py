@@ -67,7 +67,7 @@ class PipelineConfig:
     # ============================================================
 
     # Confidence threshold for YOLO detections
-    yolo_confidence: float = 0.25
+    yolo_confidence: float = 0.65
 
     # IoU threshold for YOLO NMS
     yolo_iou_threshold: float = 0.45
@@ -396,11 +396,15 @@ class PipelineConfig:
     cap_fill_max_area_px: int = 5000
 
     # Door + OCR-text wall-mask filter (mirrors test_cap.py)
-    # When True, after the cap step the wall mask is filtered to remove
-    # door/window pixel regions (from epoch_040, dilated by door_margin and
-    # with wall pixels preserved) and OCR text bbox regions (dilated by
-    # text_margin).  The filtered mask is what rect_decompose sees.
-    enable_wall_door_text_filter: bool = True
+    # DISABLED BY DEFAULT.  This filter used to erase wall-mask pixels under
+    # door/window predictions and OCR text boxes, carving holes into walls and
+    # shredding the wall structure.  Wall filtering must never *shrink* walls —
+    # walls stay solid and openings are placed as objects on top of them (see
+    # _snap_opening_to_wall in detection/openings.py).  The only mask
+    # refinement that remains active is the additive enclosed-space cap fill
+    # (Stage 1d), which expands walls to seal enclosures and never removes
+    # pixels.  Leave this False unless you specifically need the old behaviour.
+    enable_wall_door_text_filter: bool = False
     wall_filter_door_margin: int = 10
     wall_filter_text_margin: int = 5
     wall_filter_include_windows: bool = True

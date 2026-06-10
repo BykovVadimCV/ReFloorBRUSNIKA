@@ -39,8 +39,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help='Output directory (default: output)')
     parser.add_argument('--yolo-model', default='weights/best.pt',
                         help='Path to YOLOv9 .pt weights (default: weights/best.pt)')
-    parser.add_argument('--yolo-conf', type=float, default=0.25,
-                        help='YOLO confidence threshold (default: 0.25)')
+    parser.add_argument('--yolo-conf', type=float, default=0.65,
+                        help='YOLO confidence threshold (default: 0.65)')
     parser.add_argument('--device', default='cpu',
                         help='Inference device: cpu | cuda | 0 | 1 (default: cpu)')
     parser.add_argument('--wall-color', default='8E8780',
