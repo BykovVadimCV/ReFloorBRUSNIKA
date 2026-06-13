@@ -1090,9 +1090,12 @@ class FloorplanPipeline:
         if self.config.enable_door_arcs and self.opening_detector._arc_detector is not None:
             try:
                 from detection.gap import Opening as GapOpening
+                # Doorway candidates for arc matching: wall-line breaks are now
+                # promoted to DOOR (see OpeningPipeline.detect Step 6), so feed
+                # both doors and any residual gaps as candidate openings.
                 geo_gaps = [
                     o for o in openings
-                    if o.opening_type == OpeningType.GAP
+                    if o.opening_type in (OpeningType.GAP, OpeningType.DOOR)
                 ]
                 raw_gaps = []
                 for i, g in enumerate(geo_gaps):

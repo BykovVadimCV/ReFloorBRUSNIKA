@@ -226,6 +226,20 @@ def deduplicate_openings(
             if dup_of.wall_normal_deg is None:
                 dup_of.wall_normal_deg = candidate.wall_normal_deg
             dup_of.confidence = max(dup_of.confidence, candidate.confidence)
+        elif (dup_of.opening_type == OpeningType.DOOR
+              and candidate.opening_type == OpeningType.DOOR):
+            # Two doors on the same opening: the kept one inherits any swing
+            # metadata it is missing from its duplicate, so the surviving door
+            # carries hinge/swing regardless of which one ranked higher.
+            if dup_of.hinge_point is None and candidate.hinge_point is not None:
+                dup_of.hinge_point = candidate.hinge_point
+            if (dup_of.swing_direction == SwingDirection.UNKNOWN
+                    and candidate.swing_direction != SwingDirection.UNKNOWN):
+                dup_of.swing_direction = candidate.swing_direction
+                dup_of.swing_clockwise = candidate.swing_clockwise
+            if dup_of.wall_normal_deg is None and candidate.wall_normal_deg is not None:
+                dup_of.wall_normal_deg = candidate.wall_normal_deg
+            dup_of.confidence = max(dup_of.confidence, candidate.confidence)
 
     return kept
 
@@ -321,7 +335,7 @@ class OpeningPipeline:
             yolo_model: Optional pre-loaded YOLODoorWindowDetector instance.
                         If None, uses the one from the YOLO adapter.
         """
-        from detection.gap import GapDetector
+        from detection.wall_line_gaps import WallLineGapDetector
         from detection.windowdetector import WindowDetector
         from detection.door_arc import DoorArcDetector
         from detection.door_fusion import DoorFusion
@@ -329,14 +343,15 @@ class OpeningPipeline:
         cfg = self.config
         pixel_scale = cfg.pixels_to_m  # meters per pixel
 
-        self._gap_detector = GapDetector(
+        # Doorway detection: breaks within continuous wall lines (not pairwise
+        # ray casting).  A break must be flanked by wall material on both sides
+        # along the same line, so wall terminations / corridor mouths are no
+        # longer mistaken for openings.  See detection/wall_line_gaps.py.
+        self._gap_detector = WallLineGapDetector(
             min_gap_width_m=cfg.min_opening_width_m,
             max_gap_width_m=cfg.max_opening_width_m,
-            max_extension_length=300,
             merge_distance=8,
-            yolo_iou_threshold=0.0,
-            min_opening_aspect_ratio=4.0,   # was 5.0 — accept slightly squarer gaps
-            max_non_white_ratio=0.45,        # was 0.35 — tolerate furniture overlapping gap
+            max_non_white_ratio=0.45,        # tolerate furniture overlapping gap
         )
         self._window_detector = WindowDetector()
         self._arc_detector = DoorArcDetector(
@@ -608,12 +623,62 @@ class OpeningPipeline:
         )
 
         # ── Step 5: Final deduplication ───────────────────────────────
-        return deduplicate_openings(all_openings, iou_threshold=cfg.iou_threshold)
+        # Co-located gap+door collapse here: the gap keeps its precise
+        # wall-aligned bbox and absorbs the door's swing metadata.
+        deduped = deduplicate_openings(all_openings, iou_threshold=cfg.iou_threshold)
+
+        # ── Step 6: Promote leftover wall-line breaks to doors ────────
+        # Every validated break is a genuine in-wall opening.  Standalone
+        # breaks (no door symbol matched them in dedup) are promoted to plain
+        # doors so the exporter gives them a door leaf rather than a bare
+        # passage; breaks a window already represents are dropped.
+        return _promote_gaps_to_doors(deduped)
 
 
 # ============================================================
 # INTERNAL HELPERS
 # ============================================================
+
+def _promote_gaps_to_doors(
+    openings: List[Opening],
+    window_iou_threshold: float = 0.30,
+) -> List[Opening]:
+    """Turn leftover wall-line GAP breaks into doors, yielding to windows.
+
+    A GAP break that overlaps a detected WINDOW is dropped — the window already
+    represents that opening (and keeping the gap would shadow the window during
+    deduplication, since gaps outrank windows).  Every other GAP becomes a
+    plain DOOR (no hinge) so the exporter renders a door leaf rather than a bare
+    passage; door swing metadata, when present, is supplied later by YOLO/arc
+    fusion via ``deduplicate_openings``.
+    """
+    gaps = [o for o in openings if o.opening_type == OpeningType.GAP]
+    if not gaps:
+        return openings
+
+    windows = [o for o in openings if o.opening_type == OpeningType.WINDOW]
+    result: List[Opening] = []
+    dropped = 0
+    promoted = 0
+    for o in openings:
+        if o.opening_type != OpeningType.GAP:
+            result.append(o)
+            continue
+        gb = o.bbox.to_xyxy()
+        if any(iou_xyxy(gb, w.bbox.to_xyxy()) > window_iou_threshold for w in windows):
+            dropped += 1
+            continue
+        o.opening_type = OpeningType.DOOR
+        promoted += 1
+        result.append(o)
+
+    if promoted or dropped:
+        logger.info(
+            "OpeningPipeline: promoted %d wall-line break(s) to doors "
+            "(%d dropped as window-claimed)", promoted, dropped,
+        )
+    return result
+
 
 def _cap_openings_by_door_benchmark(
     openings: List[Opening],
