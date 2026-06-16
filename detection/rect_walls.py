@@ -467,6 +467,60 @@ def _suppress_minor_diagonals(
 
 
 # ---------------------------------------------------------------------------
+# Near-axis straightening (unconditional)
+# ---------------------------------------------------------------------------
+
+def _straighten_near_axis_walls(
+    infos: List[_RectInfo],
+    *,
+    max_dev_deg: float = 7.0,
+) -> int:
+    """
+    Force every wall whose centerline lies within ``max_dev_deg`` of a cardinal
+    axis to be exactly horizontal or vertical.
+
+    Unlike :func:`_suppress_minor_diagonals`, this is **unconditional**: it does
+    not look at neighbours, relative length, or the global diagonal fraction, and
+    it accepts whatever change in mask coverage results.  A wall tilted by only a
+    few degrees is almost always a decomposition wobble on a wall the architect
+    drew straight; leaving it at, say, 4° gets it classified ``is_diagonal`` by
+    everything downstream (parent-wall finding, opening placement, and the
+    ``_drop_diagonal_openings`` filter all reject diagonals), which silently
+    drops doors/windows that sit on it.
+
+    The centerline is rotated about its own midpoint to the nearest axis with
+    its length preserved.  Modifies ``infos`` in place; endpoint snapping should
+    be re-run afterwards so a straightened wall still meets its neighbours at the
+    corner.  Returns the number of walls straightened.
+    """
+    if max_dev_deg <= 0.0:
+        return 0
+
+    straightened = 0
+    for a in infos:
+        ang_mod = a.angle_deg % 180.0
+        dev_horizontal = min(ang_mod, 180.0 - ang_mod)
+        dev_vertical = abs(ang_mod - 90.0)
+        dev = min(dev_horizontal, dev_vertical)
+        if dev <= 1e-9 or dev > max_dev_deg:
+            continue
+
+        mid = ((a.p1[0] + a.p2[0]) / 2.0, (a.p1[1] + a.p2[1]) / 2.0)
+        half = _dist(a.p1, a.p2) / 2.0
+        if dev_horizontal <= dev_vertical:
+            a.p1 = (mid[0] - half, mid[1])
+            a.p2 = (mid[0] + half, mid[1])
+            a.angle_deg = 0.0
+        else:
+            a.p1 = (mid[0], mid[1] - half)
+            a.p2 = (mid[0], mid[1] + half)
+            a.angle_deg = 90.0
+        straightened += 1
+
+    return straightened
+
+
+# ---------------------------------------------------------------------------
 # Rectangle → WallSegment conversion
 # ---------------------------------------------------------------------------
 
@@ -1857,6 +1911,26 @@ class RectWallDetector:
             p1, p2, thick, wall_ang = rect_centerline(r)
             infos.append(_RectInfo(p1=p1, p2=p2, thickness=thick,
                                    angle_deg=wall_ang, rect=r))
+
+        # ── Stage 4a: Near-axis straightening ─────────────────────────
+        # BEFORE any snapping: force walls tilted by less than
+        # rect_straighten_max_dev_deg (default 7°) to exact 0°/90°,
+        # unconditionally and regardless of the resulting coverage change.
+        # A wall the architect drew straight but the decomposer placed a few
+        # degrees off would otherwise be classified is_diagonal downstream,
+        # which makes parent-wall finding / opening placement reject it and
+        # silently drops the doors and windows sitting on it.
+        _straighten_dev = getattr(cfg, "rect_straighten_max_dev_deg", 7.0)
+        if _straighten_dev > 0.0:
+            _n_straightened = _straighten_near_axis_walls(
+                infos, max_dev_deg=_straighten_dev,
+            )
+            _L("  Stage 4a — Near-axis straightening (<%.1f° → axis): "
+               "%d wall(s) straightened (coverage change ignored)",
+               _straighten_dev, _n_straightened)
+        else:
+            _L("  Stage 4a — Near-axis straightening SKIPPED "
+               "(rect_straighten_max_dev_deg=%.1f)", _straighten_dev)
 
         _snap_gf  = getattr(cfg, "rect_snap_gap_factor",     DEFAULT_SNAP_GAP_FACTOR)
         _snap_fl  = getattr(cfg, "rect_snap_gap_floor",       DEFAULT_SNAP_GAP_FLOOR)

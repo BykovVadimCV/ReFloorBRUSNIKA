@@ -358,6 +358,14 @@ class PipelineConfig:
     # wall style) and is consolidated with a MORPH_CLOSE before denoising.
     rect_hatch_survival_thr:  float = 0.45
 
+    # Near-axis straightening: any wall whose centerline lies within this many
+    # degrees of a cardinal axis is forced to exact 0°/90° (rotated about its
+    # midpoint, length preserved) — unconditionally, regardless of the change in
+    # mask coverage.  Catches the few-degree decomposition wobble that would
+    # otherwise flag a straight wall as is_diagonal and drop the doors/windows
+    # sitting on it.  Set to 0 to disable.
+    rect_straighten_max_dev_deg: float = 7.0
+
     # Minor-diagonal suppression: snap small isolated diagonal walls to the
     # nearest axis when the plan is mostly orthogonal and neighbours are axis-
     # aligned (only fires in the mixed axis+diagonal case).
