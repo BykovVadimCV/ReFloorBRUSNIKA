@@ -101,10 +101,10 @@ def _initialize_pipeline() -> None:
         enable_unet=True,
         # Rect-decomposition tuning — set explicitly so the served pipeline
         # always uses these regardless of dataclass-default drift:
-        #   • a new rectangle may overlap already-placed walls by ≤15%
-        #   • stop once 97% of wall pixels are covered
-        rect_max_overlap=0.15,
-        rect_coverage_stop=0.97,
+        #   • overlap requirement disabled (rects may overlap freely)
+        #   • stop once 93% of wall pixels are covered
+        rect_max_overlap=1.0,
+        rect_coverage_stop=0.93,
     )
     pipeline = FloorplanPipeline(config)
     pipeline.initialize()

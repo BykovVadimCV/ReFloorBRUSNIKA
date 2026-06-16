@@ -369,15 +369,15 @@ class PipelineConfig:
     rect_angle_steps:          int   = 12
     rect_penalty:              float = 0.0
     rect_max_grid_dim:         int   = 200
-    rect_coverage_stop:        float = 0.97
+    rect_coverage_stop:        float = 0.93
     rect_bleed_weight:         float = 15.0
     rect_initial_bleed_weight: float = 15.0
     rect_bleed_decay:          float = 0.0
     rect_axis_gap:             float = 0.0
     # Hard overlap cap: reject any candidate rectangle more than this fraction
     # of whose own area is already covered by previously-placed rectangles.
-    # 0.15 = a new rect may overlap existing walls by at most 15%.
-    rect_max_overlap:          float = 0.15
+    # 1.0 = disabled (no overlap requirement).
+    rect_max_overlap:          float = 1.0
 
     # Diagonal-rectangle disincentives (applied inside rd.decompose).  A
     # candidate whose angle deviates from 0°/90° by more than
