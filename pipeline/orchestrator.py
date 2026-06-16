@@ -45,7 +45,11 @@ from floorplan_export.visualization import FloorplanVisualizer
 
 logger = logging.getLogger(__name__)
 
-from pipeline.preprocess import _deskew_image, _crop_to_floorplan
+from pipeline.preprocess import (
+    _deskew_image,
+    _crop_to_floorplan,
+    _upscale_to_min_long_side,
+)
 from pipeline.scale_calibration import (
     _calibrate_scale_from_wall_lengths,
     _polygon_area_from_tuples,
@@ -183,6 +187,15 @@ class FloorplanPipeline:
         _raw_img = cv2.imread(image_path)
         if _raw_img is None:
             raise ValueError(f"Cannot read input image: {image_path}")
+        # ── Pre-stage 0 (pre-everything): upscale small inputs ────────────
+        # Any image whose longest side is below the threshold is enlarged
+        # (aspect-preserving) before crop / deskew / OCR / U-Net so detection
+        # has enough resolution to work with.  Scale calibration runs later on
+        # this same enlarged image, so metric measurements stay consistent.
+        _raw_img = _upscale_to_min_long_side(
+            _raw_img,
+            getattr(self.config, "upscale_min_long_side_px", 1200),
+        )
         _cropped_img = _crop_to_floorplan(_raw_img)
         if _cropped_img.shape != _raw_img.shape:
             logger.info(

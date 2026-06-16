@@ -21,6 +21,15 @@ class PipelineConfig:
     """
 
     # ============================================================
+    # INPUT
+    # ============================================================
+
+    # Minimum longest-side resolution (px) for an input image.  Any image whose
+    # longest dimension is below this is upscaled (aspect-preserving) before any
+    # processing so detection has enough resolution.  Set 0 to disable.
+    upscale_min_long_side_px: int = 1200
+
+    # ============================================================
     # SCALE
     # ============================================================
 

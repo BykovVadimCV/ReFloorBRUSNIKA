@@ -99,6 +99,12 @@ def _initialize_pipeline() -> None:
         yolo_weights_path=SERVER_CONFIG["yolo_model_path"],
         yolo_device=SERVER_CONFIG["device"],
         enable_unet=True,
+        # Rect-decomposition tuning — set explicitly so the served pipeline
+        # always uses these regardless of dataclass-default drift:
+        #   • a new rectangle may overlap already-placed walls by ≤15%
+        #   • stop once 93% of wall pixels are covered
+        rect_max_overlap=0.15,
+        rect_coverage_stop=0.93,
     )
     pipeline = FloorplanPipeline(config)
     pipeline.initialize()

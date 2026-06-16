@@ -8,6 +8,34 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def _upscale_to_min_long_side(
+    img: np.ndarray, min_long_side: int = 1200
+) -> np.ndarray:
+    """Upscale *img* so its longest side is at least *min_long_side* px.
+
+    Detection (U-Net, LSD, OCR) is unreliable on small inputs, so any image
+    whose longest dimension is below the threshold is enlarged — preserving
+    aspect ratio — before anything else touches it.  Images already at or above
+    the threshold are returned unchanged (we never downscale here).
+    Cubic interpolation keeps thin wall strokes reasonably crisp.
+    """
+    if img is None or img.size == 0 or min_long_side <= 0:
+        return img
+    h, w = img.shape[:2]
+    long_side = max(h, w)
+    if long_side >= min_long_side:
+        return img
+    scale = min_long_side / float(long_side)
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    upscaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    logger.info(
+        "Upscale: %dx%d → %dx%d (longest side %d → %d px, ×%.2f)",
+        w, h, new_w, new_h, long_side, max(new_w, new_h), scale,
+    )
+    return upscaled
+
+
 def _deskew_image(img: np.ndarray, max_angle: float = 5.0) -> np.ndarray:
     """Rotate image so that dominant lines snap to X/Y axes.
 
