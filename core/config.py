@@ -365,7 +365,10 @@ class PipelineConfig:
     rect_initial_bleed_weight: float = 15.0
     rect_bleed_decay:          float = 0.0
     rect_axis_gap:             float = 0.0
-    rect_max_overlap:          float = 1.0
+    # Hard overlap cap: reject any candidate rectangle more than this fraction
+    # of whose own area is already covered by previously-placed rectangles.
+    # 0.15 = a new rect may overlap existing walls by at most 15%.
+    rect_max_overlap:          float = 0.15
 
     # Diagonal-rectangle disincentives (applied inside rd.decompose).  A
     # candidate whose angle deviates from 0°/90° by more than
