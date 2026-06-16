@@ -1698,6 +1698,112 @@ class SweetHome3DExporter:
                     'removed': best_pair is None,
                 })
 
+        # ──────────────────────────────────────────────────────────────
+        # Second pass — fill the FULL flanking gap for openings that were
+        # NOT snapped above.  Doors that matched a parent wall (fused arc /
+        # U-Net / YOLO doors, and gap doors that found a co-linear host) keep
+        # their raw detection width and centre.  For swing-leaf or
+        # half-detected doors that leaves the piece ending in the MIDDLE of
+        # the doorway — "half open" — instead of spanning it.  Here we
+        # re-measure the clear gap between the two flanking STRUCTURAL walls
+        # and resize + recentre the opening to bridge it edge-to-edge.
+        #
+        # The result is bounded by a ratio window so a door sitting on a
+        # genuinely solid wall (no door-sized gap nearby) is left untouched —
+        # only doors whose measured doorway is plausibly the same opening get
+        # reworked.
+        # ──────────────────────────────────────────────────────────────
+        GAP_FILL_MIN_RATIO = 0.5    # ignore measured gaps below half the door
+        GAP_FILL_MAX_RATIO = 2.5    # ...or above 2.5× it (that's a room, not a gap)
+        wall_by_id_all = {w.wall_id: w for w in structural_walls}
+        synth_ids = {ow.wall_id for ow in opening_walls}
+
+        def _closest_flank_gap(door_bb, is_horizontal):
+            """Clear inner-edge gap between the nearest flanking structural
+            walls on either side of the door bbox, or None."""
+            dw = door_bb[2] - door_bb[0]
+            dh = door_bb[3] - door_bb[1]
+            ext_bb = (door_bb[0] - dw * DOOR_BBOX_EXTEND_RATIO,
+                      door_bb[1] - dh * DOOR_BBOX_EXTEND_RATIO,
+                      door_bb[2] + dw * DOOR_BBOX_EXTEND_RATIO,
+                      door_bb[3] + dh * DOOR_BBOX_EXTEND_RATIO)
+            det_cx = (door_bb[0] + door_bb[2]) / 2
+            det_cy = (door_bb[1] + door_bb[3]) / 2
+            lo_list: List[Tuple[float, float]] = []
+            hi_list: List[Tuple[float, float]] = []
+            for sw, swbb in sw_bboxes:
+                # Only real structural walls flank a doorway — never other
+                # door/window opening walls (which are non-structural).
+                if not getattr(sw, 'is_structural', True):
+                    continue
+                ovl = _overlap(ext_bb, swbb)
+                if is_horizontal:
+                    perp = swbb[3] > door_bb[1] and swbb[1] < door_bb[3]
+                    sw_c = (swbb[0] + swbb[2]) / 2
+                    le = _inner_edge_h(sw, 'L')
+                    re = _inner_edge_h(sw, 'R')
+                    if (perp and 0 <= door_bb[0] - le <= PROXIMITY_CM) or (ovl and sw_c < det_cx):
+                        lo_list.append((max(0.0, door_bb[0] - le), le))
+                    if (perp and 0 <= re - door_bb[2] <= PROXIMITY_CM) or (ovl and sw_c >= det_cx):
+                        hi_list.append((max(0.0, re - door_bb[2]), re))
+                else:
+                    perp = swbb[2] > door_bb[0] and swbb[0] < door_bb[2]
+                    sw_c = (swbb[1] + swbb[3]) / 2
+                    te = _inner_edge_v(sw, 'T')
+                    be = _inner_edge_v(sw, 'B')
+                    if (perp and 0 <= door_bb[1] - te <= PROXIMITY_CM) or (ovl and sw_c < det_cy):
+                        lo_list.append((max(0.0, door_bb[1] - te), te))
+                    if (perp and 0 <= be - door_bb[3] <= PROXIMITY_CM) or (ovl and sw_c >= det_cy):
+                        hi_list.append((max(0.0, be - door_bb[3]), be))
+            if not lo_list or not hi_list:
+                return None
+            lo_list.sort(key=lambda t: t[0])
+            hi_list.sort(key=lambda t: t[0])
+            lo_edge = lo_list[0][1]
+            hi_edge = hi_list[0][1]
+            gap = hi_edge - lo_edge
+            if gap <= MIN_GAP_CM:
+                return None
+            if is_horizontal:
+                clear = _gap_is_clear(lo_edge, det_cy, hi_edge, det_cy)
+            else:
+                clear = _gap_is_clear(det_cx, lo_edge, det_cx, hi_edge)
+            if not clear:
+                return None
+            return gap, lo_edge, hi_edge
+
+        for o in openings:
+            if o.opening_type not in (OpeningType.DOOR, OpeningType.GAP):
+                continue
+            if o.parent_wall_id in synth_ids or o.parent_wall_id in to_remove:
+                continue
+            if o.width is None or o.width <= 0:
+                continue
+            parent = wall_by_id_all.get(o.parent_wall_id)
+            if parent is None or parent.is_diagonal:
+                continue
+            is_h = parent.is_horizontal
+            half_w = o.width / 2.0
+            half_t = max(parent.thickness, 2.0) / 2.0
+            cx, cy = o.center.x, o.center.y
+            if is_h:
+                door_bb = (cx - half_w, cy - half_t, cx + half_w, cy + half_t)
+            else:
+                door_bb = (cx - half_t, cy - half_w, cx + half_t, cy + half_w)
+            res = _closest_flank_gap(door_bb, is_h)
+            if res is None:
+                continue
+            gap, lo_edge, hi_edge = res
+            ratio = gap / o.width
+            if ratio < GAP_FILL_MIN_RATIO or ratio > GAP_FILL_MAX_RATIO:
+                continue
+            mid = (lo_edge + hi_edge) / 2.0
+            o.width = gap
+            if is_h:
+                o.center = Point(mid, parent.get_centerline_y())
+            else:
+                o.center = Point(parent.get_centerline_x(), mid)
+
         if to_remove:
             opening_walls[:] = [w for w in opening_walls if w.wall_id not in to_remove]
             openings[:] = [o for o in openings if o.parent_wall_id not in to_remove]

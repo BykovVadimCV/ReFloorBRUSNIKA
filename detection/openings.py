@@ -244,21 +244,61 @@ def deduplicate_openings(
     return kept
 
 
+def _door_is_horizontal(o: Opening) -> bool:
+    return o.bbox.width >= o.bbox.height
+
+
+def _door_along_overlap_frac(a: Opening, b: Opening) -> float:
+    """Fraction of the shorter door's along-wall span that overlaps the other.
+
+    "Along-wall" is the door's long axis (x for horizontal doors, y for
+    vertical).  ~1.0 means the two doors occupy the same position along the
+    wall (stacked); ~0.0 means they are side-by-side further down the wall.
+    """
+    ax1, ay1, ax2, ay2 = a.bbox.to_xyxy()
+    bx1, by1, bx2, by2 = b.bbox.to_xyxy()
+    if _door_is_horizontal(a):
+        lo, hi = max(ax1, bx1), min(ax2, bx2)
+        span = min(ax2 - ax1, bx2 - bx1)
+    else:
+        lo, hi = max(ay1, by1), min(ay2, by2)
+        span = min(ay2 - ay1, by2 - by1)
+    return max(0.0, hi - lo) / span if span > 0 else 0.0
+
+
+def _door_perp_gap(a: Opening, b: Opening) -> float:
+    """Distance between the two doors' centres along the cross-wall axis."""
+    ax, ay = a.bbox.center
+    bx, by = b.bbox.center
+    return abs(ay - by) if _door_is_horizontal(a) else abs(ax - bx)
+
+
 def filter_back_to_back_doors(
     openings: List[Opening],
     separation_factor: float = 0.6,
+    tiny_room_factor: float = 1.0,
+    min_along_overlap: float = 0.6,
 ) -> List[Opening]:
-    """Drop doors that sit back-to-back on the same doorway.
+    """Drop doors that sit back-to-back on the same doorway or enclose a sliver.
 
-    Two doors are considered the same opening when the distance between their
-    centres is below ``separation_factor`` × the average of their long sides.
-    This removes doors stacked on one another (e.g. the same doorway detected
-    from both sides, or a YOLO door and a U-Net door on the same gap that
-    survived IoU dedup) while keeping genuinely separate adjacent doors, whose
-    centres are roughly a full door-width apart.
+    Two situations are suppressed (the lower-confidence door is dropped):
 
-    Non-door openings are passed through untouched.  Among conflicting doors
-    the higher-confidence one is kept.
+    1. **Stacked doorway** — the distance between the two centres is below
+       ``separation_factor`` × the average of their long sides.  This removes
+       doors detected twice on one opening (e.g. from both sides, or a YOLO and
+       a U-Net door on the same gap that survived IoU dedup).
+
+    2. **Tiny-room back-to-back** — two doors that *face the same direction*
+       (same orientation), are aligned along the wall (along-wall overlap ≥
+       ``min_along_overlap``) and are separated *only perpendicularly* by less
+       than ``tiny_room_factor`` × the average of their long sides.  Such a pair
+       walls off a sliver "room" no wider than a door — almost always a
+       detection artefact in a corridor rather than a real room.  Doors facing
+       each other across a genuine hallway are kept because they sit at
+       different positions along the corridor (low along-wall overlap), and
+       doors side-by-side along one wall are kept for the same reason.
+
+    Non-door openings are passed through untouched.
     """
     doors = [o for o in openings if o.opening_type == OpeningType.DOOR]
     others = [o for o in openings if o.opening_type != OpeningType.DOOR]
@@ -269,7 +309,8 @@ def filter_back_to_back_doors(
     # when it conflicts with an already-kept door.
     doors.sort(key=lambda o: o.confidence, reverse=True)
     kept: List[Opening] = []
-    dropped = 0
+    dropped_stacked = 0
+    dropped_tiny = 0
     for cand in doors:
         cx, cy = cand.bbox.center
         c_long = max(cand.bbox.width, cand.bbox.height)
@@ -277,19 +318,29 @@ def filter_back_to_back_doors(
         for k in kept:
             kx, ky = k.bbox.center
             k_long = max(k.bbox.width, k.bbox.height)
-            min_sep = separation_factor * 0.5 * (c_long + k_long)
-            if math.hypot(cx - kx, cy - ky) < min_sep:
+            avg_long = 0.5 * (c_long + k_long)
+            # (1) stacked / duplicate doorway
+            if math.hypot(cx - kx, cy - ky) < separation_factor * avg_long:
                 conflict = True
+                dropped_stacked += 1
                 break
-        if conflict:
-            dropped += 1
-        else:
+            # (2) same-direction tiny-room back-to-back
+            if (tiny_room_factor > 0.0
+                    and _door_is_horizontal(cand) == _door_is_horizontal(k)
+                    and _door_along_overlap_frac(cand, k) >= min_along_overlap):
+                perp = _door_perp_gap(cand, k)
+                if 0.0 < perp < tiny_room_factor * avg_long:
+                    conflict = True
+                    dropped_tiny += 1
+                    break
+        if not conflict:
             kept.append(cand)
 
-    if dropped:
+    if dropped_stacked or dropped_tiny:
         logger.info(
-            "OpeningPipeline: dropped %d back-to-back door(s) "
-            "(separation_factor=%.2f)", dropped, separation_factor,
+            "OpeningPipeline: dropped %d stacked + %d tiny-room back-to-back "
+            "door(s) (separation_factor=%.2f, tiny_room_factor=%.2f)",
+            dropped_stacked, dropped_tiny, separation_factor, tiny_room_factor,
         )
     return others + kept
 

@@ -452,6 +452,9 @@ def decompose(
     axis_gap:             float = 0.0,
     max_overlap:          float = 0.5,
     max_spill_fraction:   float = 0.15,
+    diag_axis_tol:        float = 8.0,
+    diag_score_penalty:   float = 0.0,
+    diag_overlap_penalty: float = 0.0,
     refine:               bool  = True,
     verbose:              bool  = True,
 ) -> List[Rect]:
@@ -507,6 +510,24 @@ def decompose(
                            Hard-rejects any candidate — before and after
                            refinement — whose outside-pixel ratio exceeds this
                            limit.  Set to 1.0 to disable.
+    diag_axis_tol        : a candidate whose angle deviates from the nearest
+                           cardinal axis (0°/90°) by more than this many degrees
+                           is treated as *diagonal* and subjected to the two
+                           penalties below.  Axis-aligned candidates are never
+                           penalised.  Ignored when axis_only is True (no
+                           diagonal candidates exist).
+    diag_score_penalty   : fraction (0..1) by which a diagonal candidate's pixel
+                           gain is discounted when ranking it against axis
+                           candidates and against the placement threshold.  E.g.
+                           0.4 means a diagonal rect must cover ≈67% more wall
+                           than an axis rect to win.  Default 0.0 (disabled) so
+                           the CLI / other callers keep the old behaviour.
+    diag_overlap_penalty : extra per-pixel penalty applied to a diagonal
+                           candidate for every one of its pixels that overlaps
+                           the union of already-placed rectangles.  Heavily
+                           disincentivises thin diagonal rectangles laid over
+                           existing (already-covered) straight walls just to
+                           grab a few residual pixels.  Default 0.0 (disabled).
     refine               : if True, hill-climb each placed rectangle.
     verbose              : print live progress.
 
@@ -530,6 +551,29 @@ def decompose(
     chosen: List[Rect] = []
     step = 0
 
+    def _axis_dev(angle: float) -> float:
+        """Deviation (deg) of `angle` from the nearest cardinal axis (0°/90°)."""
+        a = angle % 90.0
+        return min(a, 90.0 - a)
+
+    def _adjusted_score(rect: Rect, raw: int) -> float:
+        """Penalty-adjusted score used for ranking and the placement threshold.
+
+        Axis-aligned rectangles are returned unchanged.  Diagonal ones are
+        discounted (``diag_score_penalty``) and additionally charged for every
+        pixel they lay over already-placed rectangles (``diag_overlap_penalty``)
+        — so a thin diagonal rect smeared across an existing straight wall to
+        mop up a few leftover pixels scores badly and loses to an axis rect.
+        """
+        if _axis_dev(rect.angle) <= diag_axis_tol:
+            return float(raw)
+        adj = raw * (1.0 - diag_score_penalty)
+        if diag_overlap_penalty > 0.0 and placed_union.any():
+            pix = rasterise(rect, H, W)
+            ov = int(np.count_nonzero(pix & placed_union))
+            adj -= diag_overlap_penalty * ov
+        return adj
+
     while True:
         n_left   = int(np.count_nonzero(remaining))
         if n_left == 0 or (total - n_left) / total >= coverage_stop:
@@ -551,7 +595,8 @@ def decompose(
         angles = build_angle_list(remaining, angle_steps,
                                   axis_only=axis_only, axis_gap=axis_gap)
 
-        best_score: int            = min_gain - 1
+        best_score: int            = 0       # raw pixel gain of the winner
+        best_adj:   float          = float(min_gain) - 1.0   # penalty-adjusted
         best_rect:  Optional[Rect] = None
 
         for i, angle in enumerate(angles):
@@ -559,17 +604,23 @@ def decompose(
                 _progress(step, len(chosen), covered, total, min_gain,
                           f"angle {angle:5.1f}° ({i+1}/{len(angles)})  bw={current_bleed:.1f}")
             rect, s = best_rect_at_angle(remaining, outside, angle, max_grid_dim, current_bleed)
-            if rect is not None and s > best_score:
-                # Hard-reject if the rect bleeds too much outside the mask.
-                if max_spill_fraction < 1.0:
-                    if _spill_fraction(rect, outside, H, W) > max_spill_fraction:
-                        continue
-                # Reject candidates that overlap previously-placed rectangles
-                # by more than max_overlap of their own area.
-                if max_overlap < 1.0 and chosen:
-                    if _overlap_fraction(rect, placed_union, H, W) > max_overlap:
-                        continue
-                best_score, best_rect = s, rect
+            if rect is None:
+                continue
+            adj = _adjusted_score(rect, s)
+            # Rank by the penalty-adjusted score so axis rects beat near-equal
+            # diagonal ones and diagonal-over-existing-wall rects are demoted.
+            if adj < min_gain or adj <= best_adj:
+                continue
+            # Hard-reject if the rect bleeds too much outside the mask.
+            if max_spill_fraction < 1.0:
+                if _spill_fraction(rect, outside, H, W) > max_spill_fraction:
+                    continue
+            # Reject candidates that overlap previously-placed rectangles
+            # by more than max_overlap of their own area.
+            if max_overlap < 1.0 and chosen:
+                if _overlap_fraction(rect, placed_union, H, W) > max_overlap:
+                    continue
+            best_adj, best_score, best_rect = adj, s, rect
 
         if best_rect is None:
             if verbose:
@@ -582,7 +633,10 @@ def decompose(
             best_rect, best_score = refine_rect(
                 best_rect, remaining, outside, H, W,
                 bleed_weight=current_bleed, axis_only=axis_only)
-            if best_score < min_gain:
+            # Refinement optimises the raw score and may rotate the rect; the
+            # diagonal penalties are re-applied here so a rect that drifted
+            # off-axis still has to clear the threshold on its adjusted score.
+            if _adjusted_score(best_rect, best_score) < min_gain:
                 if verbose:
                     print(f"\n✗ Refined rect ({best_score}px) below threshold — done.")
                 break

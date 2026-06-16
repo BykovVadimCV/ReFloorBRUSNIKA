@@ -367,6 +367,22 @@ class PipelineConfig:
     rect_axis_gap:             float = 0.0
     rect_max_overlap:          float = 1.0
 
+    # Diagonal-rectangle disincentives (applied inside rd.decompose).  A
+    # candidate whose angle deviates from 0°/90° by more than
+    # rect_diag_axis_tol degrees is "diagonal" and is penalised so the
+    # decomposer prefers axis-aligned walls and stops abusing thin diagonal
+    # rectangles to mop up residual pixels over straight walls.
+    #   rect_diag_score_penalty   — discount (0..1) on a diagonal rect's pixel
+    #                               gain when ranking it (must out-cover an axis
+    #                               rect by this margin to win).
+    #   rect_diag_overlap_penalty — extra per-pixel charge for each diagonal
+    #                               pixel laid over an already-placed rectangle
+    #                               (heavily punishes diagonals over existing
+    #                               walls).
+    rect_diag_axis_tol:        float = 8.0
+    rect_diag_score_penalty:   float = 0.4
+    rect_diag_overlap_penalty: float = 6.0
+
     # Endpoint snapping (tiny nudge to close perimeter — NOT wall merging)
     rect_snap_gap_factor:       float = 0.3   # gap ≤ factor × thickness (was 2.0)
     rect_snap_gap_floor:        float = 5.0   # but never below this many pixels
@@ -421,6 +437,15 @@ class PipelineConfig:
     # other.  Legitimately separate adjacent doors (centres ~one door-width
     # apart) are kept.
     min_door_separation_factor: float = 0.6
+
+    # Same-direction back-to-back suppression.  Two doors of the same
+    # orientation that are aligned along the wall but separated only
+    # perpendicularly by less than this fraction of their average long side
+    # enclose a door-width "tiny room" — almost always a corridor artefact —
+    # and the lower-confidence one is dropped.  Doors across a real hallway sit
+    # at different along-wall positions and are unaffected.  Set 0 to disable.
+    door_tiny_room_factor: float = 1.0
+    door_tiny_room_min_overlap: float = 0.6
 
     # ============================================================
     # BRUSNIKA-FORMAT BRANCH  (gated colour-based wall mask)

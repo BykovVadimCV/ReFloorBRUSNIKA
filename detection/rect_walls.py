@@ -1729,6 +1729,9 @@ class RectWallDetector:
         _p_axis_gap    = getattr(cfg, "rect_axis_gap",             0.0)
         _p_max_overlap = getattr(cfg, "rect_max_overlap",          1.0)
         _p_max_spill   = getattr(cfg, "rect_max_spill",            0.15)
+        _p_diag_tol    = getattr(cfg, "rect_diag_axis_tol",        8.0)
+        _p_diag_spen   = getattr(cfg, "rect_diag_score_penalty",   0.4)
+        _p_diag_open   = getattr(cfg, "rect_diag_overlap_penalty", 6.0)
 
         _L("  Wall pixels entering decompose: %d / %d  (%.2f%%)",
            total_wall_px, total_px, 100.0 * total_wall_px / max(1, total_px))
@@ -1743,6 +1746,10 @@ class RectWallDetector:
         _L("  rect_penalty=%.2f  angle_steps=%d  axis_only=%s  axis_gap=%.1f"
            "  max_grid_dim=%d",
            _p_penalty, _p_angle_steps, force_axis_only, _p_axis_gap, _p_max_grid)
+        if not force_axis_only:
+            _L("  diagonal penalties : axis_tol=%.1f°  score_penalty=%.2f"
+               "  overlap_penalty=%.1f/px (demote thin diagonals over walls)",
+               _p_diag_tol, _p_diag_spen, _p_diag_open)
         _LL.append("\n--- rd.decompose verbose output (start) ---\n")
 
         _verbose_buf = io.StringIO()
@@ -1760,6 +1767,9 @@ class RectWallDetector:
                 axis_gap             = _p_axis_gap,
                 max_overlap          = _p_max_overlap,
                 max_spill_fraction   = _p_max_spill,
+                diag_axis_tol        = _p_diag_tol,
+                diag_score_penalty   = _p_diag_spen,
+                diag_overlap_penalty = _p_diag_open,
                 refine               = True,
                 verbose              = True,
             )

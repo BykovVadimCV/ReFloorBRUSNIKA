@@ -581,6 +581,8 @@ class FloorplanPipeline:
             openings = filter_back_to_back_doors(
                 openings,
                 separation_factor=self.config.min_door_separation_factor,
+                tiny_room_factor=getattr(self.config, "door_tiny_room_factor", 1.0),
+                min_along_overlap=getattr(self.config, "door_tiny_room_min_overlap", 0.6),
             )
 
         result.openings = openings
