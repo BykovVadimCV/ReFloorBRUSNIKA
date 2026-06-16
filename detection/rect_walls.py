@@ -59,8 +59,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_AXIS_TOL_DEG    = 3.0      # walls within ±this of 0/90 are axis-aligned
-DEFAULT_DIAG_LSD_RATIO  = 0.05     # if ≥5% of LSD line-length is diagonal,
-                                   # allow diagonal rectangles
+DEFAULT_DIAG_LSD_RATIO  = 0.12     # if ≥12% of LSD line-length is diagonal,
+                                   # allow diagonal rectangles (else axis-only)
+DEFAULT_DIAG_LSD_AXIS_TOL = 7.0    # LSD lines within ±this of 0/90 do NOT count
+                                   # as diagonal evidence — they get straightened
+                                   # (see rect_straighten_max_dev_deg) anyway, so
+                                   # they must not flip the plan into diagonal mode
 DEFAULT_DIAG_LSD_MIN_LEN = 25.0    # min LSD segment length to count
 DEFAULT_SNAP_GAP_FACTOR  = 2.0     # extend if gap ≤ factor × max_thickness
 DEFAULT_SNAP_GAP_FLOOR   = 6.0     # but never below this many pixels
@@ -1752,11 +1756,19 @@ class RectWallDetector:
         axis_tol  = getattr(cfg, "rect_axis_tol_deg",     DEFAULT_AXIS_TOL_DEG)
         diag_thr  = getattr(cfg, "rect_diag_lsd_ratio",   DEFAULT_DIAG_LSD_RATIO)
         diag_minl = getattr(cfg, "rect_diag_lsd_min_len", DEFAULT_DIAG_LSD_MIN_LEN)
-        _L("  axis_tol=%.1f°  diag_ratio_thr=%.1f%%  min_segment_len=%.0f px",
-           axis_tol, diag_thr * 100, diag_minl)
+        # The LSD test uses its OWN, more permissive axis tolerance (not the
+        # tight classification tol): a line within rect_diag_lsd_axis_tol of an
+        # axis is near-axis wobble that Stage 4a straightens, so it must not be
+        # counted as diagonal evidence and flip the whole plan into the costly
+        # (and artefact-prone) diagonal decomposition path.
+        diag_axis_tol = getattr(cfg, "rect_diag_lsd_axis_tol",
+                                DEFAULT_DIAG_LSD_AXIS_TOL)
+        _L("  diag_axis_tol=%.1f°  diag_ratio_thr=%.1f%%  min_segment_len=%.0f px"
+           "  (classification axis_tol=%.1f°)",
+           diag_axis_tol, diag_thr * 100, diag_minl, axis_tol)
         has_diagonals = detect_has_diagonals(
             wall_mask,
-            axis_tol_deg=axis_tol, diag_ratio_thr=diag_thr,
+            axis_tol_deg=diag_axis_tol, diag_ratio_thr=diag_thr,
             min_segment_len=diag_minl,
         )
         force_axis_only = not has_diagonals

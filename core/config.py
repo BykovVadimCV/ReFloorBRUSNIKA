@@ -342,9 +342,15 @@ class PipelineConfig:
     rect_unet_ckpt_path: str = "weights/epoch_20.pth"
     rect_unet_img_size:  int = 1024
 
-    # Diagonal-presence test (LSD on the wall mask)
-    rect_axis_tol_deg:    float = 3.0     # angles within ±this of 0/90 = axis
-    rect_diag_lsd_ratio:  float = 0.05    # fraction of off-axis LSD length
+    # Diagonal-presence test (LSD on the wall mask).  Tuned to lean toward
+    # axis-only mode: a higher ratio threshold needs more diagonal evidence
+    # before allowing diagonal rectangles, and the test counts a line as
+    # "diagonal" only past rect_diag_lsd_axis_tol (wider than the classification
+    # tol — near-axis lines are straightened by Stage 4a, not decomposed
+    # diagonally).
+    rect_axis_tol_deg:    float = 3.0     # angles within ±this of 0/90 = axis (classification)
+    rect_diag_lsd_ratio:  float = 0.12    # off-axis LSD length fraction to allow diagonals
+    rect_diag_lsd_axis_tol: float = 7.0   # LSD lines within ±this of axis aren't diagonal evidence
     rect_diag_lsd_min_len: float = 25.0   # ignore LSD segments shorter than this
 
     # Structural denoise of the raw wall mask (strip AI splatter/speckle).
