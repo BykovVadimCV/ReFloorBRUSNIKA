@@ -2212,6 +2212,16 @@ class SweetHome3DExporter:
                 if neighbor:
                     connected_thicknesses.append(neighbor.thickness)
             o.depth = min(connected_thicknesses)
+            # Keep the gap wall the opening spawns on as thick as the opening
+            # itself.  A door/passage hosted by a synthesised non-structural
+            # "gap wall" gets its depth from the thinnest connected wall
+            # (above); leaving the gap wall at its original (apartment-average)
+            # thickness makes the wall read fatter than its own door.  Apply
+            # the door-thickness result back to the gap wall so the two stay
+            # consistent.  Structural walls are never touched.
+            if (not parent.is_structural
+                    and o.opening_type in (OpeningType.DOOR, OpeningType.GAP)):
+                parent.thickness = o.depth
 
     def _write_sh3d_file(self, output_path: str, xml_content: str) -> None:
         if not output_path.endswith('.sh3d'):

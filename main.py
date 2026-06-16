@@ -76,6 +76,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help='Wall-snapping strength multiplier (default: 1.0). '
                              'Values > 1 snap more aggressively; '
                              '0 disables all snapping.')
+    # ── Rectangle-decomposition tuning (override config defaults) ──────
+    parser.add_argument('--rect-max-overlap', type=float, default=None,
+                        metavar='F',
+                        help='Max fraction of a new rectangle that may already '
+                             'be covered by placed walls (0..1; 1.0 = no overlap '
+                             'limit). Omit to use config default.')
+    parser.add_argument('--rect-coverage-stop', type=float, default=None,
+                        metavar='F',
+                        help='Stop decomposition once this fraction of wall '
+                             'pixels is covered (0..1). Omit to use config '
+                             'default.')
     return parser
 
 
@@ -138,6 +149,16 @@ def main() -> None:
         rect_snap_gap_factor=2.0 * _s,
         rect_snap_gap_floor=6.0 * _s,
     )
+
+    # Apply optional rect-decompose overrides only when the flag was given,
+    # so omitting them keeps the PipelineConfig defaults (single-sourced).
+    _rect_overrides = {}
+    if args.rect_max_overlap is not None:
+        _rect_overrides['rect_max_overlap'] = args.rect_max_overlap
+    if args.rect_coverage_stop is not None:
+        _rect_overrides['rect_coverage_stop'] = args.rect_coverage_stop
+    if _rect_overrides:
+        config = config.copy_with(**_rect_overrides)
 
     pipeline = FloorplanPipeline(config)
     pipeline.initialize()
