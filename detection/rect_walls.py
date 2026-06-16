@@ -14,7 +14,7 @@ The new wall-detection pipeline:
         ▼
     rect_decompose.decompose()
         │   • initial_bleed_weight=10, bleed_weight=1.5
-        │   • coverage_stop=0.93, max_overlap=0.15
+        │   • coverage_stop=0.97, max_overlap=0.15
         │   • axis_only=True when no diagonals detected
         │   • axis_gap snaps near-axis features to 0/45/90/135
         ▼
@@ -1299,8 +1299,8 @@ class RectWallDetector:
            getattr(cfg, "rect_max_spill", 0.15),
            getattr(cfg, "rect_max_spill", 0.15) * 100)
         _L("  rect_coverage_stop         : %.2f  (stop at %.0f%% wall-px covered)",
-           getattr(cfg, "rect_coverage_stop", 0.93),
-           getattr(cfg, "rect_coverage_stop", 0.93) * 100)
+           getattr(cfg, "rect_coverage_stop", 0.97),
+           getattr(cfg, "rect_coverage_stop", 0.97) * 100)
         _L("  rect_max_overlap           : %.2f",
            getattr(cfg, "rect_max_overlap", 0.15))
         _L("  bleed_weight / initial     : %.1f / %.1f  decay=%.1f",
@@ -1722,7 +1722,7 @@ class RectWallDetector:
         _p_angle_steps = getattr(cfg, "rect_angle_steps",          12)
         _p_penalty     = getattr(cfg, "rect_penalty",              0.0)
         _p_max_grid    = getattr(cfg, "rect_max_grid_dim",         200)
-        _p_cov_stop    = getattr(cfg, "rect_coverage_stop",        0.93)
+        _p_cov_stop    = getattr(cfg, "rect_coverage_stop",        0.97)
         _p_bleed_w     = getattr(cfg, "rect_bleed_weight",         15.0)
         _p_init_bleed  = getattr(cfg, "rect_initial_bleed_weight", 15.0)
         _p_bleed_decay = getattr(cfg, "rect_bleed_decay",          0.0)
