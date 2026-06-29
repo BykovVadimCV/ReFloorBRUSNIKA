@@ -120,6 +120,8 @@ class FloorplanPipeline:
                     iou_threshold=self.config.yolo_iou_threshold,
                     device=self.config.yolo_device,
                     max_door_area_fraction=self.config.yolo_max_area_fraction,
+                    window_conf_threshold=getattr(
+                        self.config, "yolo_window_confidence", None),
                 )
                 logger.info("YOLO model loaded from %s", self.config.yolo_weights_path)
             except Exception as e:
@@ -665,6 +667,10 @@ class FloorplanPipeline:
             o for o in result.openings
             if o.opening_type == OpeningType.WINDOW
         ]
+        logger.info(
+            "[%s] Stage 3e: %d window opening(s) detected before host-wall check",
+            base_name, len(_window_openings),
+        )
         if _window_openings:
             from detection.unet_doors import bbox_to_window_wall_segment
             _window_walls = []

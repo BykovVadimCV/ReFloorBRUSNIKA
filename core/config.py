@@ -78,6 +78,11 @@ class PipelineConfig:
     # Confidence threshold for YOLO detections
     yolo_confidence: float = 0.65
 
+    # Separate (lower) confidence threshold for the YOLO window class.
+    # Windows are drawn faintly and score lower than doors, so the door
+    # threshold otherwise suppresses them entirely.
+    yolo_window_confidence: float = 0.40
+
     # IoU threshold for YOLO NMS
     yolo_iou_threshold: float = 0.45
 

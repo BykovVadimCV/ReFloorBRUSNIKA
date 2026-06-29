@@ -1,4 +1,5 @@
 """SweetHome3D exporter: flood-fill room detection, opening sizing, and SH3D ZIP packaging."""
+import logging
 import math
 import uuid
 import zipfile
@@ -11,6 +12,82 @@ from xml.etree import ElementTree as ET
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
+
+
+def _point_in_polygon(x: float, y: float, pts: List["Point"]) -> bool:
+    """Ray-casting point-in-polygon test. ``pts`` are Point objects (cm)."""
+    n = len(pts)
+    if n < 3:
+        return False
+    inside = False
+    j = n - 1
+    for i in range(n):
+        xi, yi = pts[i].x, pts[i].y
+        xj, yj = pts[j].x, pts[j].y
+        if ((yi > y) != (yj > y)) and \
+           (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def _assign_room_names_from_ocr(
+    rooms: List["Room"],
+    ocr_labels: Optional[List],
+    pixels_to_cm: float,
+) -> int:
+    """
+    Name each detected room from the OCR label(s) falling inside it.
+
+    ``ocr_labels`` are ``(text, x1, y1, x2, y2)`` tuples in the same
+    (deskewed) image-pixel space as the walls; room polygons are in cm, so
+    label centres are scaled by ``pixels_to_cm`` before the inside test.
+
+    Preference: a non-numeric label (a real room name such as "Кухня") wins;
+    otherwise the largest numeric value inside the room is taken as its area
+    and formatted as "<area> м²".  Rooms with no enclosed label keep their
+    default "Room N" name.  Returns the number of rooms (re)named.
+    """
+    if not rooms or not ocr_labels or not pixels_to_cm or pixels_to_cm <= 0:
+        return 0
+    try:
+        from core.ocr_utils import parse_area_m2, is_numeric_ocr_label
+    except Exception:
+        return 0
+
+    assigned = 0
+    for room in rooms:
+        if len(room.points) < 3:
+            continue
+        name_text: Optional[str] = None
+        best_area: Optional[float] = None
+        for item in ocr_labels:
+            if len(item) < 5:
+                continue
+            text = str(item[0]).strip()
+            if not text:
+                continue
+            cx = ((float(item[1]) + float(item[3])) / 2.0) * pixels_to_cm
+            cy = ((float(item[2]) + float(item[4])) / 2.0) * pixels_to_cm
+            if not _point_in_polygon(cx, cy, room.points):
+                continue
+            if not is_numeric_ocr_label(text):
+                name_text = text          # real room name — highest priority
+                break
+            area_val = parse_area_m2(text)
+            if area_val is not None and (best_area is None or area_val > best_area):
+                best_area = area_val
+        if name_text is None and best_area is not None:
+            name_text = f"{best_area:g} м²"
+        if name_text:
+            room.name = name_text
+            assigned += 1
+    logger.info("Room naming: assigned OCR names to %d/%d rooms",
+                assigned, len(rooms))
+    return assigned
+
 
 # ============================================================
 # Встроенные 3D-ресурсы (base64 / OBJ)
@@ -1411,6 +1488,13 @@ class SweetHome3DExporter:
         rooms = RoomOverlapRemover(
             min_area_threshold=50.0, overlap_threshold=0.50
         ).remove_overlaps(rooms)
+
+        # Name rooms from OCR labels (room names / areas) that fall inside each
+        # room polygon, so the SH3D carries the real room identity instead of a
+        # generic "Room N".  Falls back silently when no labels are available.
+        _assign_room_names_from_ocr(
+            rooms, ocr_labels, self.wall_converter.pixels_to_cm,
+        )
 
         xml = self.xml_generator.generate(
             walls=all_walls, openings=openings, rooms=rooms, name=output_path

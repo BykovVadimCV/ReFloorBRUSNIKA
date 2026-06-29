@@ -167,7 +167,8 @@ class YOLODoorWindowDetector:
                  conf_threshold: float = 0.25,
                  iou_threshold: float = 0.45,
                  device: str = "cpu",
-                 max_door_area_fraction: float = 0.05):
+                 max_door_area_fraction: float = 0.05,
+                 window_conf_threshold: Optional[float] = None):
         """
         Инициализация YOLO-детектора.
 
@@ -187,6 +188,14 @@ class YOLODoorWindowDetector:
         """
         self.model_path = Path(model_path)
         self.conf_threshold = conf_threshold
+        # Windows are drawn as faint, low-contrast symbols and the model scores
+        # them lower than doors; allow a separate (typically lower) threshold so
+        # window recall is not capped by the door threshold.  Defaults to the
+        # door threshold when not supplied.
+        self.window_conf_threshold = (
+            window_conf_threshold if window_conf_threshold is not None
+            else conf_threshold
+        )
         self.iou_threshold = iou_threshold
         self.max_door_area_fraction = max_door_area_fraction
         self.device = select_device(device)
@@ -271,7 +280,10 @@ class YOLODoorWindowDetector:
             pred = self.model(im, augment=False, visualize=False)
 
         # Этап 4: Non-Maximum Suppression
-        pred = non_max_suppression(pred, self.conf_threshold, self.iou_threshold, classes=None, agnostic=False)
+        # Run NMS at the lower of the two class thresholds so low-confidence
+        # windows survive; doors are re-filtered at their own threshold below.
+        nms_conf = min(self.conf_threshold, self.window_conf_threshold)
+        pred = non_max_suppression(pred, nms_conf, self.iou_threshold, classes=None, agnostic=False)
 
         # Этап 5: Обработка результатов
         all_detections = []
@@ -318,11 +330,15 @@ class YOLODoorWindowDetector:
                 bbox_mask = np.zeros((h0, w0), dtype=np.uint8)
                 cv2.rectangle(bbox_mask, (x1, y1), (x2, y2), 255, -1)
 
-                # Классификация по типу объекта
+                # Классификация по типу объекта (per-class confidence gate)
                 if class_id == 0:  # Дверь
+                    if conf_val < self.conf_threshold:
+                        continue
                     doors.append(detection)
                     combined_door_mask = cv2.bitwise_or(combined_door_mask, bbox_mask)
                 elif class_id == 1:  # Окно
+                    if conf_val < self.window_conf_threshold:
+                        continue
                     windows.append(detection)
                     combined_window_mask = cv2.bitwise_or(combined_window_mask, bbox_mask)
 
