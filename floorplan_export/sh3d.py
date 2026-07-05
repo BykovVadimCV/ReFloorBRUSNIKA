@@ -199,6 +199,8 @@ class SH3DExporter:
             wall_height_cm=cfg.wall_height_cm,
             scale_factor=cfg.sh3d_scale_factor,
             preserve_structural_geometry=cfg.use_rect_walls,
+            split_doorways=getattr(cfg, "room_split_doorways", True),
+            max_doorway_cm=getattr(cfg, "room_max_doorway_cm", 110.0),
         )
 
     def update_scale(self, pixels_to_cm: float) -> None:

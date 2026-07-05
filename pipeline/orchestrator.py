@@ -123,6 +123,8 @@ class FloorplanPipeline:
                     max_door_area_fraction=self.config.yolo_max_area_fraction,
                     window_conf_threshold=getattr(
                         self.config, "yolo_window_confidence", None),
+                    door_conf_threshold=getattr(
+                        self.config, "yolo_door_confidence", None),
                 )
                 logger.info("YOLO model loaded from %s", self.config.yolo_weights_path)
             except Exception as e:

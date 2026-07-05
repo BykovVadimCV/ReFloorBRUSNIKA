@@ -92,6 +92,12 @@ class PipelineConfig:
     # threshold otherwise suppresses them entirely.
     yolo_window_confidence: float = 0.40
 
+    # Separate (lower) confidence threshold for the YOLO door class.  Brusnika
+    # interior doors (sliding/pocket/thin-leaf) score well below 0.65, so the
+    # default gate misses most doorways (input 14: 2 of ~7 at 0.65 → 8 at 0.35).
+    # Downstream wall-pair/gap validation rejects the extra false positives.
+    yolo_door_confidence: float = 0.35
+
     # IoU threshold for YOLO NMS
     yolo_iou_threshold: float = 0.45
 
@@ -203,6 +209,19 @@ class PipelineConfig:
 
     # Flood fill border step for exterior detection
     flood_fill_border_step: int = 10
+
+    # Split rooms that the wall raster leaves merged because a doorway between
+    # them has no detected door/opening to seal it.  Rooms are separated at
+    # narrow "necks" (doorways) by an erosion-seeded watershed in the room
+    # raster — self-contained, so it recovers rooms even when door-detection
+    # recall is poor (see inputs 13/14, where most rooms merged into one blob).
+    room_split_doorways: bool = True
+
+    # Widest passage (cm) treated as a doorway to cut.  The erosion radius is
+    # half this; interior channels wider than this are considered genuine open
+    # plan and are NOT split.  Room "waists" narrower than this could be
+    # over-split, so keep it near a real max door width.
+    room_max_doorway_cm: float = 110.0
 
     # ============================================================
     # EXPORT

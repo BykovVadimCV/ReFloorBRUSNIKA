@@ -1028,18 +1028,23 @@ class RoomDetector:
         wall_dilation_px: int = 4,
         contour_simplify_ratio: float = 0.003,   # less aggressive simplification
         snap_tolerance_cm: float = 18.0,          # max snap distance
+        split_doorways: bool = True,
+        max_doorway_cm: float = 110.0,
     ) -> None:
         self.resolution = resolution
         self.min_room_area_cm2 = min_room_area_cm2
         self.wall_dilation_px = wall_dilation_px
         self.contour_simplify_ratio = contour_simplify_ratio
         self.snap_tolerance_cm = snap_tolerance_cm
+        self.split_doorways = split_doorways
+        self.max_doorway_cm = max_doorway_cm
 
     # ---- public API ----
     def detect(
         self,
         walls: List[Wall],
         enclosed_labels: Optional[np.ndarray] = None,
+        openings: Optional[List[Opening]] = None,
     ) -> List[Room]:
         if len(walls) < 3:
             return []
@@ -1048,9 +1053,113 @@ class RoomDetector:
         self._wall_geom = self._compute_wall_geom(walls)
 
         mask, origin = self._rasterize_walls(walls)
+        # Seal every DETECTED opening (door/window/gap) into the wall raster.
+        # Opening-walls normally seal detected passages already, but a thin or
+        # slightly-misplaced opening-wall can leave a 1-px leak; painting the
+        # full opening footprint here guarantees a crisp cut.
+        if openings:
+            self._seal_openings(mask, openings, origin)
         interior = self._extract_interior(mask)
+        # Separate rooms still joined through UNDETECTED doorways.
+        if self.split_doorways:
+            interior = self._split_at_necks(interior)
         rooms = self._components_to_rooms(interior, origin, enclosed_labels, mask)
         return rooms
+
+    # ---- seal detected openings into the wall raster ----
+    def _seal_openings(
+        self,
+        mask: np.ndarray,
+        openings: List[Opening],
+        origin: Tuple[float, float],
+    ) -> None:
+        """Paint each opening's footprint as wall so its passage is sealed.
+
+        The opening is a rectangle centred at ``opening.center``, ``width`` long
+        along the wall direction (``angle``) and ``depth`` (parent wall
+        thickness) across it — exactly the doorway hole in the wall.
+        """
+        min_x, min_y = origin
+        res = self.resolution
+        h_px, w_px = mask.shape[:2]
+        for op in openings:
+            try:
+                cx, cy = op.center.x, op.center.y
+                length = float(op.width)
+                thick = float(op.depth) if op.depth else 0.0
+                if length <= 0:
+                    continue
+                # A doorway must be blocked across the full wall thickness; use a
+                # generous floor so a thin/under-measured depth still seals.
+                thick = max(thick, 8.0)
+                ang = float(op.angle)
+                dx, dy = math.cos(ang), math.sin(ang)      # along wall
+                nx, ny = -dy, dx                            # across wall
+                hl, ht = length / 2.0, thick / 2.0
+                corners_cm = [
+                    (cx + dx * hl + nx * ht, cy + dy * hl + ny * ht),
+                    (cx + dx * hl - nx * ht, cy + dy * hl - ny * ht),
+                    (cx - dx * hl - nx * ht, cy - dy * hl - ny * ht),
+                    (cx - dx * hl + nx * ht, cy - dy * hl + ny * ht),
+                ]
+                pts = np.array(
+                    [[int((x - min_x) / res), int((y - min_y) / res)]
+                     for x, y in corners_cm],
+                    dtype=np.int32,
+                )
+                if pts[:, 0].max() < 0 or pts[:, 1].max() < 0:
+                    continue
+                if pts[:, 0].min() >= w_px or pts[:, 1].min() >= h_px:
+                    continue
+                cv2.fillConvexPoly(mask, pts, 255)
+            except Exception:
+                continue
+
+    # ---- split rooms merged through undetected doorways ----
+    def _split_at_necks(self, interior: np.ndarray) -> np.ndarray:
+        """Cut narrow doorway "necks" so merged rooms become separate blobs.
+
+        A doorway with no detected door leaves the two rooms it joins connected
+        by a channel roughly one door-width wide.  Eroding the interior by half
+        the max doorway width detaches every such channel while leaving the much
+        larger room bodies as separate "cores"; a watershed then re-grows the
+        cores back to the wall faces and the ridge lines between neighbouring
+        cores become the cut.  Channels wider than ``max_doorway_cm`` (genuine
+        open-plan openings) survive erosion joined, so they are NOT split.
+        """
+        res = self.resolution
+        neck_px = (self.max_doorway_cm / res) / 2.0
+        if neck_px < 1:
+            return interior
+
+        # "Erode by neck_px" == keep pixels farther than neck_px from any wall.
+        # The distance transform gives this in O(n), vastly faster than a
+        # morphological erode with a ~neck_px-radius kernel on a large raster.
+        dist = cv2.distanceTransform(interior, cv2.DIST_L2, 3)
+        cores = (dist > neck_px).astype(np.uint8) * 255
+
+        n_cores, core_lbls = cv2.connectedComponents(cores)
+        # n_cores counts the background label; need >=2 real cores to split.
+        if n_cores <= 2:
+            return interior
+
+        # Watershed markers: 1..n for cores, a separate label for exterior,
+        # 0 for the unknown band (the eroded-away channels + room rims).
+        markers = core_lbls.astype(np.int32).copy()
+        bg_label = n_cores
+        markers[interior == 0] = bg_label
+
+        img3 = cv2.cvtColor(interior, cv2.COLOR_GRAY2BGR)
+        cv2.watershed(img3, markers)
+
+        # Watershed marks the basin boundary as a 1-px ridge (-1).  A single-pixel
+        # gap still leaks under 8-connectivity, so thicken the ridge to guarantee
+        # the two rooms become separate connected components.
+        ridge = (markers == -1).astype(np.uint8)
+        ridge = cv2.dilate(ridge, np.ones((3, 3), np.uint8), iterations=2)
+        cut = interior.copy()
+        cut[ridge > 0] = 0
+        return cut
 
     # ---- wall geometry for snap ----
     @staticmethod
@@ -1411,11 +1520,16 @@ class SweetHome3DExporter:
         wall_overlap: float = WALL_OVERLAP,
         scale_factor: float = SCALE_FACTOR,
         preserve_structural_geometry: bool = False,
+        split_doorways: bool = True,
+        max_doorway_cm: float = 110.0,
     ) -> None:
         self.pixels_to_cm = pixels_to_cm
         self.wall_height = wall_height_cm
         self.snap_tolerance = snap_tolerance
         self.wall_overlap = wall_overlap
+        # Room-detector doorway-splitting knobs (threaded to RoomDetector below).
+        self.split_doorways = split_doorways
+        self.max_doorway_cm = max_doorway_cm
         # When True, structural wall endpoints/axes are NEVER modified after
         # conversion from rect dicts. Use this with the rect_decompose pipeline
         # so the exporter keeps every wall exactly where the decomposer put it.
@@ -1483,7 +1597,11 @@ class SweetHome3DExporter:
             wall_dilation_px=3,
             contour_simplify_ratio=0.003,
             snap_tolerance_cm=18.0,
-        ).detect(all_walls, enclosed_labels=enclosed_labels)
+            split_doorways=self.split_doorways,
+            max_doorway_cm=self.max_doorway_cm,
+        ).detect(
+            all_walls, enclosed_labels=enclosed_labels, openings=openings,
+        )
 
         rooms = RoomOverlapRemover(
             min_area_threshold=50.0, overlap_threshold=0.50

@@ -168,7 +168,8 @@ class YOLODoorWindowDetector:
                  iou_threshold: float = 0.45,
                  device: str = "cpu",
                  max_door_area_fraction: float = 0.05,
-                 window_conf_threshold: Optional[float] = None):
+                 window_conf_threshold: Optional[float] = None,
+                 door_conf_threshold: Optional[float] = None):
         """
         Инициализация YOLO-детектора.
 
@@ -188,6 +189,16 @@ class YOLODoorWindowDetector:
         """
         self.model_path = Path(model_path)
         self.conf_threshold = conf_threshold
+        # Doors on Brusnika plans (sliding/pocket/thin-leaf symbols) frequently
+        # score well below the default gate, so most interior doorways are missed
+        # (e.g. input 14: only 2 of ~7).  A separate, typically lower door
+        # threshold recovers them; downstream gap/wall-pair validation
+        # (_snap_doors_to_wall_gaps) and the back-to-back filter reject the
+        # false positives this admits.  Defaults to conf_threshold.
+        self.door_conf_threshold = (
+            door_conf_threshold if door_conf_threshold is not None
+            else conf_threshold
+        )
         # Windows are drawn as faint, low-contrast symbols and the model scores
         # them lower than doors; allow a separate (typically lower) threshold so
         # window recall is not capped by the door threshold.  Defaults to the
@@ -280,9 +291,9 @@ class YOLODoorWindowDetector:
             pred = self.model(im, augment=False, visualize=False)
 
         # Этап 4: Non-Maximum Suppression
-        # Run NMS at the lower of the two class thresholds so low-confidence
-        # windows survive; doors are re-filtered at their own threshold below.
-        nms_conf = min(self.conf_threshold, self.window_conf_threshold)
+        # Run NMS at the lowest class threshold so low-confidence doors/windows
+        # survive; each class is re-filtered at its own threshold below.
+        nms_conf = min(self.door_conf_threshold, self.window_conf_threshold)
         pred = non_max_suppression(pred, nms_conf, self.iou_threshold, classes=None, agnostic=False)
 
         # Этап 5: Обработка результатов
@@ -332,7 +343,7 @@ class YOLODoorWindowDetector:
 
                 # Классификация по типу объекта (per-class confidence gate)
                 if class_id == 0:  # Дверь
-                    if conf_val < self.conf_threshold:
+                    if conf_val < self.door_conf_threshold:
                         continue
                     doors.append(detection)
                     combined_door_mask = cv2.bitwise_or(combined_door_mask, bbox_mask)

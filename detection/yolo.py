@@ -63,6 +63,10 @@ class YOLODetector:
             iou_threshold=self.config.yolo_iou_threshold,
             device=self.config.yolo_device,
             max_door_area_fraction=self.config.yolo_max_area_fraction,
+            window_conf_threshold=getattr(
+                self.config, "yolo_window_confidence", None),
+            door_conf_threshold=getattr(
+                self.config, "yolo_door_confidence", None),
         )
 
     @property

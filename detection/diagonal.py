@@ -513,6 +513,18 @@ def _run_unet(img_bgr: np.ndarray, ckpt_path: str,
         logger.info("[diagonal] U-Net checkpoint not found: %s", ckpt_path)
         return None
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    # Escape hatch: on some machines the isolated subprocess itself dies (e.g.
+    # exit 139) even though in-process inference is fine — the opposite of the
+    # case the subprocess guards against.  Set REFLOOR_UNET_INPROCESS=1 to run
+    # the model in-process instead, which unblocks those environments (and E2E
+    # validation).  Default keeps the safe subprocess isolation.
+    if os.environ.get("REFLOOR_UNET_INPROCESS", "").strip() in ("1", "true", "True"):
+        try:
+            from detection.unet_inference import run_unet_pipeline
+            return run_unet_pipeline(rgb, ckpt_path, img_size=img_size)
+        except Exception as exc:
+            logger.warning("[diagonal] in-process U-Net failed: %s", exc)
+            return None
     try:
         return run_unet_subprocess(rgb, ckpt_path, img_size=img_size)
     except Exception as exc:
