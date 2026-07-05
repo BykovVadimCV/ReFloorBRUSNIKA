@@ -49,6 +49,7 @@ from pipeline.preprocess import (
     _deskew_image,
     _crop_to_floorplan,
     _upscale_to_min_long_side,
+    _pad_image,
 )
 from pipeline.scale_calibration import (
     _calibrate_scale_from_wall_lengths,
@@ -207,6 +208,31 @@ class FloorplanPipeline:
                 _cropped_img.shape[1], _cropped_img.shape[0],
             )
         del _raw_img
+
+        # ── Pre-stage 0a2: pad floorplan with a white border ──────────
+        # Runs AFTER crop on purpose: crop trims to the ink bbox, so any margin
+        # added earlier would just be trimmed straight back off.  Framing the
+        # cropped drawing in white gives perimeter walls background context on
+        # both sides so the U-Net stops dropping them (see input 12).  Mirrors
+        # the deskew step: the padded image is physically resaved to
+        # <input_dir>/padded/<basename> and that pixel buffer feeds everything
+        # downstream.
+        _cropped_img = _pad_image(
+            _cropped_img,
+            ratio=getattr(self.config, "pad_border_ratio", 0.06),
+            min_px=getattr(self.config, "pad_border_min_px", 40),
+        )
+        try:
+            _pad_dir = os.path.join(
+                os.path.dirname(image_path) or ".", "padded")
+            os.makedirs(_pad_dir, exist_ok=True)
+            _pad_path = os.path.join(_pad_dir, os.path.basename(image_path))
+            cv2.imwrite(_pad_path, _cropped_img)
+            logger.info("[%s] Pre-stage 0a2: padded image saved → %s",
+                        base_name, _pad_path)
+        except Exception as _pad_exc:
+            logger.warning("[%s] Pre-stage 0a2: could not save padded image: %s",
+                           base_name, _pad_exc)
 
         # ── Pre-stage 0b: diagonal pre-processor ──────────────────────
         # Handles small-skew correction, OCR, U-Net, LSD clustering, and

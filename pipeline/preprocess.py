@@ -36,6 +36,40 @@ def _upscale_to_min_long_side(
     return upscaled
 
 
+def _pad_image(
+    img: np.ndarray,
+    ratio: float = 0.06,
+    min_px: int = 40,
+    color: tuple = (255, 255, 255),
+) -> np.ndarray:
+    """Add a uniform white border around *img*.
+
+    Floorplans whose perimeter walls run to (or near) the image edge give the
+    U-Net no background context on the outside of those walls, so the outer
+    walls are frequently missed and the room loop never closes (see input 12,
+    where the whole perimeter was lost).  Framing the drawing in white puts
+    background on *both* sides of every perimeter wall, which recovers the outer
+    walls and lets enclosed-space detection close the boundary.
+
+    The border width is ``max(min_px, ratio * longest_side)``.  ``ratio <= 0``
+    disables padding and returns the image unchanged.
+    """
+    if img is None or img.size == 0 or ratio <= 0:
+        return img
+    h, w = img.shape[:2]
+    pad = max(int(min_px), int(round(max(h, w) * ratio)))
+    if pad <= 0:
+        return img
+    padded = cv2.copyMakeBorder(
+        img, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=color
+    )
+    logger.info(
+        "Pad: %dx%d → %dx%d (border %d px each side)",
+        w, h, padded.shape[1], padded.shape[0], pad,
+    )
+    return padded
+
+
 def _deskew_image(img: np.ndarray, max_angle: float = 5.0) -> np.ndarray:
     """Rotate image so that dominant lines snap to X/Y axes.
 

@@ -29,6 +29,15 @@ class PipelineConfig:
     # processing so detection has enough resolution.  Set 0 to disable.
     upscale_min_long_side_px: int = 1200
 
+    # Uniform white border added around the cropped floorplan before U-Net /
+    # deskew, expressed as a fraction of the image's longest side (with a pixel
+    # floor).  Perimeter walls that run to the image edge give the U-Net no
+    # background context outside them and are frequently missed, which breaks the
+    # outer room loop; the margin puts white on both sides of every perimeter
+    # wall so it is detected and the boundary can close.  Set ratio 0 to disable.
+    pad_border_ratio: float = 0.06
+    pad_border_min_px: int = 40
+
     # ============================================================
     # SCALE
     # ============================================================
