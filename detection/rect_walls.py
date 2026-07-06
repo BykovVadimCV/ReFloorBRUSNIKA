@@ -110,6 +110,113 @@ def rect_centerline(
 
 
 # ---------------------------------------------------------------------------
+# Parallel-sliver merge (post-decomposition cleanup)
+# ---------------------------------------------------------------------------
+
+def _rect_aabb(rect: "rd.Rect") -> Tuple[float, float, float, float]:
+    """Axis-aligned bounding box (x1, y1, x2, y2) of a rect."""
+    c = rect.corners()
+    return (float(c[:, 0].min()), float(c[:, 1].min()),
+            float(c[:, 0].max()), float(c[:, 1].max()))
+
+
+def merge_parallel_slivers(
+    rects: List["rd.Rect"],
+    *,
+    axis_tol_deg: float = 3.0,
+    gap: float = 2.0,
+    thin_overlap_frac: float = 0.5,
+    long_overlap_frac: float = 0.15,
+) -> List["rd.Rect"]:
+    """Union axis-aligned rects that are duplicate slivers of the same wall.
+
+    The greedy largest-rectangle decomposition carves one thick wall into
+    several overlapping parallel rectangles (see input/12: the right exterior
+    wall becomes ~10 stacked slivers).  This union-merges axis-aligned rects
+    that
+
+      * share orientation (both horizontal or both vertical by AABB aspect),
+      * overlap within *gap* px,
+      * overlap on their **thin** axis by ≥ ``thin_overlap_frac`` of the thinner
+        rect — i.e. sit on the same wall LINE, so a perpendicular corner (which
+        overlaps only in a small square) is never merged, and two distinct
+        parallel walls separated by a gap are never merged, AND
+      * overlap on their **long** axis by ≥ ``long_overlap_frac`` of the shorter.
+
+    Each connected group (union-find, so chains of slivers collapse
+    transitively) becomes one axis-aligned rect spanning the group's union AABB.
+    Diagonal / off-axis rects are passed through untouched so diagonal walls are
+    never disturbed.
+    """
+    if len(rects) < 2:
+        return list(rects)
+
+    def _is_axis(r: "rd.Rect") -> bool:
+        a = r.angle % 90.0
+        return min(a, 90.0 - a) <= axis_tol_deg
+
+    axis_idx = [i for i, r in enumerate(rects) if _is_axis(r)]
+    passthrough = [r for i, r in enumerate(rects) if not _is_axis(r)]
+    if len(axis_idx) < 2:
+        return list(rects)
+
+    boxes = {i: _rect_aabb(rects[i]) for i in axis_idx}
+    horiz = {i: (boxes[i][2] - boxes[i][0]) >= (boxes[i][3] - boxes[i][1])
+             for i in axis_idx}
+
+    parent = {i: i for i in axis_idx}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a_pos, i in enumerate(axis_idx):
+        ax1, ay1, ax2, ay2 = boxes[i]
+        for j in axis_idx[a_pos + 1:]:
+            if horiz[i] != horiz[j]:
+                continue
+            bx1, by1, bx2, by2 = boxes[j]
+            # bbox overlap within gap
+            if (ax2 + gap < bx1 or bx2 + gap < ax1 or
+                    ay2 + gap < by1 or by2 + gap < ay1):
+                continue
+            if horiz[i]:
+                thin_ov = min(ay2, by2) - max(ay1, by1)
+                long_ov = min(ax2, bx2) - max(ax1, bx1)
+                thin_min = min(ay2 - ay1, by2 - by1)
+                long_min = min(ax2 - ax1, bx2 - bx1)
+            else:
+                thin_ov = min(ax2, bx2) - max(ax1, bx1)
+                long_ov = min(ay2, by2) - max(ay1, by1)
+                thin_min = min(ax2 - ax1, bx2 - bx1)
+                long_min = min(ay2 - ay1, by2 - by1)
+            if (thin_min > 0 and long_min > 0 and
+                    thin_ov >= thin_overlap_frac * thin_min and
+                    long_ov >= long_overlap_frac * long_min):
+                parent[find(i)] = find(j)
+
+    groups: dict = {}
+    for i in axis_idx:
+        groups.setdefault(find(i), []).append(i)
+
+    merged: List["rd.Rect"] = []
+    for members in groups.values():
+        if len(members) == 1:
+            merged.append(rects[members[0]])
+            continue
+        x1 = min(boxes[m][0] for m in members)
+        y1 = min(boxes[m][1] for m in members)
+        x2 = max(boxes[m][2] for m in members)
+        y2 = max(boxes[m][3] for m in members)
+        merged.append(rd.Rect((x1 + x2) / 2.0, (y1 + y2) / 2.0,
+                              x2 - x1, y2 - y1, 0.0))
+
+    return merged + passthrough
+
+
+# ---------------------------------------------------------------------------
 # Diagonal-presence test (LSD over wall mask)
 # ---------------------------------------------------------------------------
 
@@ -1377,7 +1484,7 @@ class RectWallDetector:
         if wall_mask is None:
             _L("  Source : running binary U-Net (%s)",
                getattr(cfg, "rect_unet_ckpt_path", "weights/epoch_20.pth"))
-            wall_mask = self._run_binary_unet(img_bgr)
+            wall_mask = self._run_binary_unet(img_bgr, ocr_bboxes=ocr_bboxes)
             if wall_mask is not None:
                 _n = int(np.count_nonzero(wall_mask))
                 _L("  Output : %d wall px / %d  (%.1f%%)",
@@ -1916,6 +2023,28 @@ class RectWallDetector:
             except Exception as _de:
                 _L("  WARNING: could not save diagnostic image: %s", _de)
 
+        # ── Stage 3b: Merge parallel slivers ──────────────────────────
+        # The greedy decomposition carves thick walls into stacks of
+        # overlapping parallel rectangles (compact plans like input/12 shred
+        # the exterior wall into ~10 slivers).  Union same-line duplicates back
+        # into one wall before endpoint snapping so downstream sees clean walls.
+        _LS("Stage 3b — Parallel-sliver merge")
+        if getattr(cfg, "enable_rect_sliver_merge", True):
+            _n_before_merge = len(rects)
+            rects = merge_parallel_slivers(
+                rects,
+                axis_tol_deg=axis_tol,
+                gap=getattr(cfg, "rect_sliver_merge_gap", 2.0),
+                thin_overlap_frac=getattr(
+                    cfg, "rect_sliver_thin_overlap_frac", 0.5),
+                long_overlap_frac=getattr(
+                    cfg, "rect_sliver_long_overlap_frac", 0.15),
+            )
+            _L("  Merged %d rect(s) → %d  (%d slivers collapsed)",
+               _n_before_merge, len(rects), _n_before_merge - len(rects))
+        else:
+            _L("  SKIPPED — enable_rect_sliver_merge=False in config")
+
         # ── Stage 4: Snap endpoints ────────────────────────────────────
         _LS("Stage 4 — Endpoint snapping (corner/T-junction only)")
         infos: List[_RectInfo] = []
@@ -2057,7 +2186,9 @@ class RectWallDetector:
     # ------------------------------------------------------------------
     # U-Net (binary, epoch_20.pth)
     # ------------------------------------------------------------------
-    def _run_binary_unet(self, img_bgr: np.ndarray) -> Optional[np.ndarray]:
+    def _run_binary_unet(
+        self, img_bgr: np.ndarray, ocr_bboxes: Optional[List] = None
+    ) -> Optional[np.ndarray]:
         """
         Run the binary wall U-Net following the standard inference protocol:
 
@@ -2092,6 +2223,34 @@ class RectWallDetector:
         h_orig, w_orig = img_bgr.shape[:2]
         # Dynamic size: average of image dimensions instead of fixed 1024
         size       = (h_orig + w_orig) // 2
+        _size_src  = "dynamic (H+W)//2"
+        # Optional: normalize the input dimension so the dominant wall stroke
+        # lands at ~unet_target_wall_px in the resized tensor (compact plans
+        # render walls proportionally thick).  Gated off by default.
+        if getattr(self.config, "enable_wall_thickness_norm", False):
+            try:
+                from core.scale_norm import unet_size_for_wall_thickness
+                _norm_size, _wt, _src = unet_size_for_wall_thickness(
+                    img_bgr,
+                    target_wall_px=getattr(self.config,
+                                           "unet_target_wall_px", 30.0),
+                    ocr_bboxes=ocr_bboxes,
+                    wall_to_glyph=getattr(self.config,
+                                          "wall_to_glyph_ratio", 1.8),
+                    size_min=getattr(self.config, "unet_size_min", 512),
+                )
+                logger.info(
+                    "Wall-thickness norm: wt~%s px (%s) → U-Net size %d "
+                    "(was %d)",
+                    f"{_wt:.1f}" if _wt else "n/a", _src, _norm_size, size,
+                )
+                size = _norm_size
+                _size_src = f"wall-thickness-norm ({_src})"
+            except Exception as _wtn_exc:
+                logger.warning(
+                    "Wall-thickness norm failed (%s) — using dynamic size",
+                    _wtn_exc,
+                )
         confidence = getattr(self.config, "unet_confidence",    0.5)
         device     = torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
@@ -2146,9 +2305,10 @@ class RectWallDetector:
 
         logger.info(
             "Binary U-Net (%s): %.1f%% wall pixels  (conf≥%.2f, %d classes, "
-            "input_size=%d px [dynamic: (%d+%d)//2])",
+            "input_size=%d px [%s], native (%d+%d)//2=%d)",
             ckpt_path.name,
             100.0 * int(np.count_nonzero(wall_mask)) / wall_mask.size,
-            confidence, _num_classes, size, h_orig, w_orig,
+            confidence, _num_classes, size, _size_src,
+            h_orig, w_orig, (h_orig + w_orig) // 2,
         )
         return wall_mask

@@ -375,6 +375,31 @@ class PipelineConfig:
     rect_unet_ckpt_path: str = "weights/epoch_20.pth"
     rect_unet_img_size:  int = 1024
 
+    # Wall-thickness scale normalization for the binary wall U-Net.
+    # When enabled, the U-Net input dimension is chosen so the dominant wall
+    # stroke lands at ~unet_target_wall_px in the resized tensor, instead of the
+    # dynamic (H+W)//2.  Aimed at compact plans whose walls render
+    # proportionally thick (see input/12).  OFF by default: the effect depends
+    # on the checkpoint (helps 4-class epoch_040, mixed on binary epoch_20) and
+    # must be validated per-model on GPU (E2E SIGILLs on CPU).  See
+    # core/scale_norm.py.
+    enable_wall_thickness_norm: bool = False
+    unet_target_wall_px: float = 30.0
+    unet_size_min: int = 512
+    wall_to_glyph_ratio: float = 1.8
+
+    # Parallel-sliver merge: the greedy rect decomposition carves a thick wall
+    # into a stack of overlapping parallel rectangles (compact plans like
+    # input/12 shred the exterior wall into ~10 slivers).  This unions same-wall-
+    # line duplicates back into one rect before endpoint snapping.  Only merges
+    # axis-aligned rects whose thin spans overlap (true duplicates), so diagonal
+    # walls and distinct parallel walls are left intact.  See
+    # detection/rect_walls.py:merge_parallel_slivers.
+    enable_rect_sliver_merge: bool = True
+    rect_sliver_merge_gap: float = 2.0
+    rect_sliver_thin_overlap_frac: float = 0.5
+    rect_sliver_long_overlap_frac: float = 0.15
+
     # Diagonal-presence test (LSD on the wall mask).  Tuned to lean toward
     # axis-only mode: a higher ratio threshold needs more diagonal evidence
     # before allowing diagonal rectangles, and the test counts a line as
