@@ -2224,10 +2224,23 @@ class RectWallDetector:
         # Dynamic size: average of image dimensions instead of fixed 1024
         size       = (h_orig + w_orig) // 2
         _size_src  = "dynamic (H+W)//2"
+        # Optional: fixed training-size resize (Colab val_transform protocol).
+        # Resize every image to the exact square the binary model was trained
+        # at (rect_unet_img_size), so the wall stroke lands back in the model's
+        # trained thickness distribution.  Helps compact plans (input/12) whose
+        # walls render proportionally thick under the dynamic (H+W)//2 size.
+        # Takes precedence over wall-thickness-norm.  Gated off by default.
+        if getattr(self.config, "enable_unet_fixed_size", False):
+            size      = int(getattr(self.config, "rect_unet_img_size", 1024))
+            _size_src = "fixed (rect_unet_img_size)"
+            logger.info(
+                "U-Net fixed-size resize: %d px (native (%d+%d)//2=%d)",
+                size, h_orig, w_orig, (h_orig + w_orig) // 2,
+            )
         # Optional: normalize the input dimension so the dominant wall stroke
         # lands at ~unet_target_wall_px in the resized tensor (compact plans
         # render walls proportionally thick).  Gated off by default.
-        if getattr(self.config, "enable_wall_thickness_norm", False):
+        elif getattr(self.config, "enable_wall_thickness_norm", False):
             try:
                 from core.scale_norm import unet_size_for_wall_thickness
                 _norm_size, _wt, _src = unet_size_for_wall_thickness(

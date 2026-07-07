@@ -373,7 +373,22 @@ class PipelineConfig:
 
     # Binary wall U-Net checkpoint
     rect_unet_ckpt_path: str = "weights/epoch_20.pth"
+
+    # Fixed U-Net input size (square) used ONLY when enable_unet_fixed_size is
+    # True.  This is the resolution the binary wall model was trained at; feeding
+    # the image at exactly this size lands the wall stroke back in the model's
+    # trained thickness distribution.  Ignored when the fixed-size toggle is off.
     rect_unet_img_size:  int = 1024
+
+    # Fixed-size resize toggle for the binary wall U-Net.
+    # OFF (default): the U-Net input dimension is the dynamic (H+W)//2 of the
+    # native image.  This over-samples compact plans (e.g. input/12) whose walls
+    # render proportionally thick, pushing the stroke out of the model's trained
+    # scale and shredding the mask.
+    # ON: resize every image to the fixed rect_unet_img_size square instead —
+    # i.e. the exact Colab val_transform (A.Resize(size, size)) protocol.
+    # Mutually exclusive with enable_wall_thickness_norm (fixed size wins).
+    enable_unet_fixed_size: bool = False
 
     # Wall-thickness scale normalization for the binary wall U-Net.
     # When enabled, the U-Net input dimension is chosen so the dominant wall

@@ -87,6 +87,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
                         help='Stop decomposition once this fraction of wall '
                              'pixels is covered (0..1). Omit to use config '
                              'default.')
+    parser.add_argument('--unet-fixed-size', type=int, default=None,
+                        metavar='N',
+                        help='Resize the image to a fixed N×N square before the '
+                             'binary wall U-Net (the training-resolution / Colab '
+                             'val_transform protocol) instead of the dynamic '
+                             '(H+W)//2. Set N to the model training size (e.g. '
+                             '1024). Helps compact, thick-walled plans. Omit to '
+                             'keep the dynamic default.')
     return parser
 
 
@@ -157,6 +165,9 @@ def main() -> None:
         _rect_overrides['rect_max_overlap'] = args.rect_max_overlap
     if args.rect_coverage_stop is not None:
         _rect_overrides['rect_coverage_stop'] = args.rect_coverage_stop
+    if args.unet_fixed_size is not None:
+        _rect_overrides['enable_unet_fixed_size'] = True
+        _rect_overrides['rect_unet_img_size'] = args.unet_fixed_size
     if _rect_overrides:
         config = config.copy_with(**_rect_overrides)
 
