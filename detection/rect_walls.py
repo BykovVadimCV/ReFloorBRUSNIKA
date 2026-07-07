@@ -1484,7 +1484,8 @@ class RectWallDetector:
         if wall_mask is None:
             _L("  Source : running binary U-Net (%s)",
                getattr(cfg, "rect_unet_ckpt_path", "weights/epoch_20.pth"))
-            wall_mask = self._run_binary_unet(img_bgr, ocr_bboxes=ocr_bboxes)
+            wall_mask = self._run_binary_unet(
+                img_bgr, ocr_bboxes=ocr_bboxes, debug_img_path=debug_img_path)
             if wall_mask is not None:
                 _n = int(np.count_nonzero(wall_mask))
                 _L("  Output : %d wall px / %d  (%.1f%%)",
@@ -2184,10 +2185,66 @@ class RectWallDetector:
         )
 
     # ------------------------------------------------------------------
+    # Debug: softmax confidence heatmap (RdYlGn), matching the Colab viewer
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _save_conf_heatmap(
+        conf_np: np.ndarray,
+        orig_hw: Tuple[int, int],
+        debug_img_path: str,
+    ) -> None:
+        """Render the U-Net softmax confidence map as a RdYlGn heatmap PNG.
+
+        Equivalent to the Colab ``imshow(conf, cmap='RdYlGn', vmin=0, vmax=1)``
+        panel.  Green = high confidence, red = low.  Saved next to the other
+        wall debug images as ``<stem>_wall_conf_heatmap.png``.
+        """
+        h_orig, w_orig = orig_hw
+
+        # Upsample the model-resolution confidence map to original resolution.
+        conf_full = cv2.resize(
+            conf_np.astype(np.float32), (w_orig, h_orig),
+            interpolation=cv2.INTER_LINEAR,
+        )
+        conf_u8 = np.clip(conf_full * 255.0, 0, 255).astype(np.uint8)
+
+        # RdYlGn look-up table (5 matplotlib anchors, RGB) → 256-entry BGR LUT.
+        anchors = np.array([
+            [165,   0,  38],   # 0.00 dark red
+            [244, 109,  67],   # 0.25 orange
+            [255, 255, 191],   # 0.50 pale yellow
+            [166, 217, 106],   # 0.75 light green
+            [  0, 104,  55],   # 1.00 dark green
+        ], dtype=np.float32)
+        xs  = np.linspace(0.0, 1.0, len(anchors))
+        pos = np.linspace(0.0, 1.0, 256)
+        lut_rgb = np.stack(
+            [np.interp(pos, xs, anchors[:, c]) for c in range(3)], axis=1)
+        lut_bgr = lut_rgb[:, ::-1].astype(np.uint8).reshape(256, 1, 3)
+
+        heat = cv2.applyColorMap(conf_u8, lut_bgr)
+
+        # Colourbar strip on the right so the scale reads without a viewer.
+        bar_w = max(18, w_orig // 40)
+        ramp  = np.linspace(255, 0, h_orig).astype(np.uint8).reshape(h_orig, 1)
+        ramp  = np.repeat(ramp, bar_w, axis=1)
+        bar   = cv2.applyColorMap(ramp, lut_bgr)
+        cv2.putText(bar, "1.0", (2, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                    (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.putText(bar, "0.0", (2, h_orig - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.4,
+                    (0, 0, 0), 1, cv2.LINE_AA)
+        out = np.hstack([heat, bar])
+
+        heat_path = os.path.splitext(debug_img_path)[0] + "_wall_conf_heatmap.png"
+        cv2.imwrite(heat_path, out)
+        logger.info("U-Net confidence heatmap → %s", heat_path)
+
+    # ------------------------------------------------------------------
     # U-Net (binary, epoch_20.pth)
     # ------------------------------------------------------------------
     def _run_binary_unet(
-        self, img_bgr: np.ndarray, ocr_bboxes: Optional[List] = None
+        self, img_bgr: np.ndarray, ocr_bboxes: Optional[List] = None,
+        debug_img_path: Optional[str] = None,
     ) -> Optional[np.ndarray]:
         """
         Run the binary wall U-Net following the standard inference protocol:
@@ -2297,6 +2354,16 @@ class RectWallDetector:
             # Uncertain pixels → background (class 0)
             pred_np = pred_np.copy()
             pred_np[conf_np < confidence] = 0
+
+            # Debug: save the softmax confidence map as a RdYlGn heatmap,
+            # matching the Colab inference viewer (imshow(conf, cmap='RdYlGn',
+            # vmin=0, vmax=1)).  Only in debug runs (debug_img_path set).
+            if debug_img_path:
+                try:
+                    self._save_conf_heatmap(
+                        conf_np, (h_orig, w_orig), debug_img_path)
+                except Exception as _he:
+                    logger.warning("Could not save U-Net conf heatmap: %s", _he)
 
         except Exception as exc:
             logger.warning("Binary U-Net inference failed: %s", exc)
