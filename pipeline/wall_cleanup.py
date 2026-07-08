@@ -25,9 +25,8 @@ def cleanup_walls(walls: List[WallSegment],
     1. Remove zero-length walls.
     2. Remove walls thinner than *min_thickness* px.
     3. Remove very short walls that aren't connected to anything.
-    4. Merge overlapping co-axial walls into one.
-    5. Snap parallel wall thicknesses to the nearest *thickness_snap*.
-    6. Snap endpoints of collinear/perpendicular walls within *endpoint_snap*.
+    4. Snap parallel wall thicknesses to the nearest *thickness_snap*.
+    5. Snap endpoints of collinear/perpendicular walls within *endpoint_snap*.
     """
     if not walls:
         return walls
@@ -77,64 +76,7 @@ def cleanup_walls(walls: List[WallSegment],
             kept.append(w)
     clean = kept
 
-    # --- 3. Merge overlapping co-axial walls --------------------------------
-    merged = True
-    while merged:
-        merged = False
-        i = 0
-        while i < len(clean):
-            j = i + 1
-            while j < len(clean):
-                wi = clean[i]
-                wj = clean[j]
-                # Both same orientation?
-                if wi.is_horizontal != wj.is_horizontal:
-                    j += 1
-                    continue
-                if wi.is_horizontal:
-                    # Centerlines close on Y?
-                    cy_i = wi.bbox.center_y
-                    cy_j = wj.bbox.center_y
-                    if abs(cy_i - cy_j) > max(wi.thickness, wj.thickness) * 0.6:
-                        j += 1
-                        continue
-                    # X ranges overlap?
-                    if wi.bbox.x2 < wj.bbox.x1 - endpoint_snap or wj.bbox.x2 < wi.bbox.x1 - endpoint_snap:
-                        j += 1
-                        continue
-                    # Merge
-                    nx1 = min(wi.bbox.x1, wj.bbox.x1)
-                    nx2 = max(wi.bbox.x2, wj.bbox.x2)
-                    ny1 = min(wi.bbox.y1, wj.bbox.y1)
-                    ny2 = max(wi.bbox.y2, wj.bbox.y2)
-                else:
-                    cx_i = wi.bbox.center_x
-                    cx_j = wj.bbox.center_x
-                    if abs(cx_i - cx_j) > max(wi.thickness, wj.thickness) * 0.6:
-                        j += 1
-                        continue
-                    if wi.bbox.y2 < wj.bbox.y1 - endpoint_snap or wj.bbox.y2 < wi.bbox.y1 - endpoint_snap:
-                        j += 1
-                        continue
-                    nx1 = min(wi.bbox.x1, wj.bbox.x1)
-                    nx2 = max(wi.bbox.x2, wj.bbox.x2)
-                    ny1 = min(wi.bbox.y1, wj.bbox.y1)
-                    ny2 = max(wi.bbox.y2, wj.bbox.y2)
-
-                new_wall = WallSegment(
-                    id=wi.id,
-                    bbox=BBox(x1=nx1, y1=ny1, x2=nx2, y2=ny2),
-                    thickness=float(min(nx2 - nx1, ny2 - ny1)),
-                    is_structural=wi.is_structural or wj.is_structural,
-                    is_outer=wi.is_outer or wj.is_outer,
-                )
-                clean[i] = new_wall
-                clean.pop(j)
-                merged = True
-                continue  # re-check i against remaining
-            i += 1
-
-    # --- 4. Quantize thickness to nearest snap value ------------------------
+    # --- 3. Quantize thickness to nearest snap value ------------------------
     if thickness_snap > 0:
         for i, w in enumerate(clean):
             th = w.thickness
@@ -161,7 +103,7 @@ def cleanup_walls(walls: List[WallSegment],
                         is_structural=w.is_structural, is_outer=w.is_outer,
                     )
 
-    # --- 5. Snap endpoints to nearby walls ----------------------------------
+    # --- 4. Snap endpoints to nearby walls ----------------------------------
     for i in range(len(clean)):
         wi = clean[i]
         for j in range(len(clean)):
@@ -217,7 +159,7 @@ def cleanup_walls(walls: List[WallSegment],
                         )
                         wi = clean[i]
 
-    # --- 6. Re-assign IDs ---------------------------------------------------
+    # --- 5. Re-assign IDs ---------------------------------------------------
     # Diagonals were partitioned out at the top; re-attach them here so the
     # whole returned list shares one ID sequence.
     combined = clean + list(diagonal_walls)

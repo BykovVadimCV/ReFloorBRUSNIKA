@@ -403,18 +403,6 @@ class PipelineConfig:
     unet_size_min: int = 512
     wall_to_glyph_ratio: float = 1.8
 
-    # Parallel-sliver merge: the greedy rect decomposition carves a thick wall
-    # into a stack of overlapping parallel rectangles (compact plans like
-    # input/12 shred the exterior wall into ~10 slivers).  This unions same-wall-
-    # line duplicates back into one rect before endpoint snapping.  Only merges
-    # axis-aligned rects whose thin spans overlap (true duplicates), so diagonal
-    # walls and distinct parallel walls are left intact.  See
-    # detection/rect_walls.py:merge_parallel_slivers.
-    enable_rect_sliver_merge: bool = True
-    rect_sliver_merge_gap: float = 2.0
-    rect_sliver_thin_overlap_frac: float = 0.5
-    rect_sliver_long_overlap_frac: float = 0.15
-
     # Diagonal-presence test (LSD on the wall mask).  Tuned to lean toward
     # axis-only mode: a higher ratio threshold needs more diagonal evidence
     # before allowing diagonal rectangles, and the test counts a line as
