@@ -327,9 +327,9 @@ class PipelineConfig:
     enable_door_rect_decompose: bool = True
 
     # Coverage stop: greedy decomposer runs until this fraction of door-mask
-    # pixels are covered.  70% is intentionally low — doors are small and a
-    # single well-placed rectangle usually suffices.
-    door_rect_coverage_stop: float = 0.70
+    # pixels are covered.  Doors are small and a single well-placed rectangle
+    # usually suffices.
+    door_rect_coverage_stop: float = 0.90
 
     # Maximum fraction of a door rect's pixels that may bleed outside the
     # door mask (tight: 2% noise-only tolerance).
@@ -444,7 +444,7 @@ class PipelineConfig:
     rect_angle_steps:          int   = 12
     rect_penalty:              float = 0.0
     rect_max_grid_dim:         int   = 200
-    rect_coverage_stop:        float = 0.93
+    rect_coverage_stop:        float = 0.95
     rect_bleed_weight:         float = 15.0
     rect_initial_bleed_weight: float = 15.0
     rect_bleed_decay:          float = 0.0
