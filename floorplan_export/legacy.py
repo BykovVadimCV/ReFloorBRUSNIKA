@@ -33,6 +33,18 @@ def _point_in_polygon(x: float, y: float, pts: List["Point"]) -> bool:
     return inside
 
 
+def _polygon_area(pts: List["Point"]) -> float:
+    """Shoelace area of a polygon given as Point objects (cm²)."""
+    n = len(pts)
+    if n < 3:
+        return 0.0
+    a = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        a += pts[i].x * pts[j].y - pts[j].x * pts[i].y
+    return abs(a) / 2.0
+
+
 def _assign_room_names_from_ocr(
     rooms: List["Room"],
     ocr_labels: Optional[List],
@@ -1016,9 +1028,13 @@ class RoomDetector:
     connected components of remaining interior (non-wall, non-exterior)
     space.  Each connected component = one room polygon.
 
-    After polygon extraction vertices are snapped to the nearest wall
-    face so room boundaries exactly follow wall edges rather than
-    approximating them.
+    After polygon extraction the contour is snapped onto the walls
+    edge-wise rather than vertex-wise: every polygon edge is matched to the
+    wall face it runs along, the edge is replaced by that face's supporting
+    line, and each corner is rebuilt as the intersection of its two
+    neighbouring lines.  Room boundaries therefore sit exactly on the inner
+    wall faces (airtight) at any wall angle, and corners shaved off by
+    contour simplification are restored.
     """
 
     def __init__(
@@ -1026,7 +1042,7 @@ class RoomDetector:
         resolution: float = 0.5,        # finer raster → sharper corners
         min_room_area_cm2: float = 2000.0,
         wall_dilation_px: int = 4,
-        contour_simplify_ratio: float = 0.003,   # less aggressive simplification
+        simplify_epsilon_cm: float = 2.0,         # absolute, NOT % of perimeter
         snap_tolerance_cm: float = 18.0,          # max snap distance
         split_doorways: bool = True,
         max_doorway_cm: float = 110.0,
@@ -1034,7 +1050,7 @@ class RoomDetector:
         self.resolution = resolution
         self.min_room_area_cm2 = min_room_area_cm2
         self.wall_dilation_px = wall_dilation_px
-        self.contour_simplify_ratio = contour_simplify_ratio
+        self.simplify_epsilon_cm = simplify_epsilon_cm
         self.snap_tolerance_cm = snap_tolerance_cm
         self.split_doorways = split_doorways
         self.max_doorway_cm = max_doorway_cm
@@ -1049,8 +1065,12 @@ class RoomDetector:
         if len(walls) < 3:
             return []
 
-        # Pre-compute wall corner geometry once for snapping
+        # Pre-compute wall corner geometry once for snapping.  Edge snapping
+        # matches against individual faces, so keep a flat list of them.
         self._wall_geom = self._compute_wall_geom(walls)
+        self._wall_faces = [face for edges in self._wall_geom for face in edges]
+        # Corner notches scale with wall thickness (see _snap_polygon_to_walls).
+        self._max_wall_thickness = max((w.thickness for w in walls), default=0.0)
 
         mask, origin = self._rasterize_walls(walls)
         # Seal every DETECTED opening (door/window/gap) into the wall raster.
@@ -1184,25 +1204,308 @@ class RoomDetector:
             geom.append(edges)
         return geom
 
-    def _snap_to_walls(self, x_cm: float, y_cm: float) -> Tuple[float, float]:
-        """Project a point onto the nearest wall edge face within snap_tolerance_cm."""
-        best_dist = self.snap_tolerance_cm
-        best_x, best_y = x_cm, y_cm
-        for edges in self._wall_geom:
-            for (ax, ay), (bx, by) in edges:
-                edx, edy = bx - ax, by - ay
-                len_sq = edx * edx + edy * edy
-                if len_sq < 1e-6:
+    # An edge whose direction is within this of a wall face counts as running
+    # along it.  The raster staircase plus approxPolyDP tilt edges by a few
+    # degrees even when the underlying wall is perfectly straight.
+    _PARALLEL_TOL_DEG = 20.0
+    # Edges this short are raster noise — a single staircase step.  Their
+    # direction says nothing, so they inherit a face from their neighbours
+    # rather than voting for one of their own.
+    _NOISE_EDGE_CM = 4.0
+
+    def _match_face(self, p: Point, q: Point) -> Optional[int]:
+        """Index of the wall face that edge ``p→q`` runs along, or None.
+
+        A face qualifies when it is near-parallel to the edge, both edge
+        endpoints lie within ``snap_tolerance_cm`` of the face's supporting
+        line, and the edge overlaps the face's extent.  Among the qualifiers
+        the closest (and most parallel) wins, which is what keeps an interior
+        edge on the wall's INNER face: the outer face of the same wall is a
+        further whole wall-thickness away.
+        """
+        ex, ey = q.x - p.x, q.y - p.y
+        elen = math.hypot(ex, ey)
+        if elen < self._NOISE_EDGE_CM:
+            return None
+        ux, uy = ex / elen, ey / elen
+        mx, my = (p.x + q.x) / 2.0, (p.y + q.y) / 2.0
+
+        tol = self.snap_tolerance_cm
+        sin_tol = math.sin(math.radians(self._PARALLEL_TOL_DEG))
+        best_score, best_idx = float('inf'), None
+        for idx, ((ax, ay), (bx, by)) in enumerate(self._wall_faces):
+            fx, fy = bx - ax, by - ay
+            flen = math.hypot(fx, fy)
+            if flen < 1e-6:
+                continue
+            vx, vy = fx / flen, fy / flen
+            # Undirected parallelism: a face may run either way along the edge.
+            sin_a = abs(ux * vy - uy * vx)
+            if sin_a > sin_tol:
+                continue
+            # Perpendicular distance of both endpoints to the face's line.
+            d_p = abs((p.x - ax) * vy - (p.y - ay) * vx)
+            d_q = abs((q.x - ax) * vy - (q.y - ay) * vx)
+            if max(d_p, d_q) > tol:
+                continue
+            # The edge must actually sit alongside the face, not past its end.
+            t = (mx - ax) * vx + (my - ay) * vy
+            if t < -tol or t > flen + tol:
+                continue
+            score = 0.5 * (d_p + d_q) + sin_a * tol
+            if score < best_score:
+                best_score, best_idx = score, idx
+        return best_idx
+
+    def _face_line(self, face_id: int) -> Optional[Tuple[float, float, float, float]]:
+        (ax, ay), (bx, by) = self._wall_faces[face_id]
+        return self._line_through(Point(ax, ay), Point(bx, by))
+
+    def _cap_line(self, face_id: int, near: Point):
+        """Supporting line of the end cap of ``face_id``'s wall nearest ``near``.
+
+        ``_compute_wall_geom`` emits exactly four faces per wall in a fixed
+        order — 0 and 2 are the long sides, 1 and 3 the end caps — so the wall
+        and its caps are recoverable from a face index alone.
+        """
+        if face_id % 4 not in (0, 2):
+            return None                        # neighbour is itself a cap
+        edges = self._wall_geom[face_id // 4]
+        best, best_d = None, float('inf')
+        for cap in (edges[1], edges[3]):
+            (ax, ay), (bx, by) = cap
+            d = math.hypot((ax + bx) / 2.0 - near.x, (ay + by) / 2.0 - near.y)
+            if d < best_d:
+                best, best_d = cap, d
+        (ax, ay), (bx, by) = best
+        return self._line_through(Point(ax, ay), Point(bx, by))
+
+    # Two parallel face lines closer than this are the same line — a wall seen
+    # from both sides of a doorway, rather than a step between two faces.
+    _COLLINEAR_TOL_CM = 2.0
+
+    def _chain_ok(self, seq, mid: Point, sin_corner: float, max_shift: float) -> bool:
+        """Every consecutive pair in ``seq`` must meet at a corner near ``mid``."""
+        for u, v in zip(seq, seq[1:]):
+            if u is None or v is None:
+                return False
+            if abs(u[2] * v[3] - u[3] * v[2]) < sin_corner:
+                return False
+            pt = self._intersect(u, v)
+            if pt is None or mid.distance_to(pt) > max_shift:
+                return False
+        return True
+
+    def _classify_free_run(
+        self,
+        runs: List[Tuple[Optional[int], List[int]]],
+        k: int,
+        points: List[Point],
+        n: int,
+        notch_max: float,
+        sin_corner: float,
+        max_shift: float,
+    ):
+        """Classify free run ``k`` as 'convex', 'bridge' or 'cut'.
+
+        Returns ``(kind, lines)``; ``lines`` are the end-cap lines to emit in
+        place of a 'bridge' run, and is empty otherwise.
+        """
+        prev_face = runs[k - 1][0]
+        next_face = runs[(k + 1) % len(runs)][0]
+        if prev_face is None or next_face is None:
+            return 'cut', []
+
+        idxs = runs[k][1]
+        a = points[idxs[0]]
+        b = points[(idxs[-1] + 1) % n]
+        if a.distance_to(b) > notch_max:
+            return 'cut', []          # too long to be a notch (e.g. a doorway)
+
+        l0, l1 = self._face_line(prev_face), self._face_line(next_face)
+        if l0 is None or l1 is None:
+            return 'cut', []
+        mid = Point((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)
+
+        if abs(l0[2] * l1[3] - l0[3] * l1[2]) < sin_corner:
+            # Parallel faces.  Collinear ones are the same wall either side of a
+            # doorway — the watershed cut between them must stay put.  Offset
+            # ones are a step between two faces and need a cap to bridge them.
+            offset = abs((l1[0] - l0[0]) * l0[3] - (l1[1] - l0[1]) * l0[2])
+            if offset < self._COLLINEAR_TOL_CM:
+                return 'cut', []
+        else:
+            corner = self._intersect(l0, l1)
+            # A mitre point OUTSIDE the room means the faces cross beyond the
+            # notch, so mitring adds it to the floor.  INSIDE means they cross
+            # within the room and mitring would slice the notch off — that is a
+            # reflex corner, and the boundary must instead detour along the
+            # walls' end caps, which the bridge search below reconstructs.
+            if (corner is not None
+                    and mid.distance_to(corner) <= max_shift
+                    and not _point_in_polygon(corner.x, corner.y, points)):
+                return 'convex', []
+
+        # Bridge the two faces with the end cap(s) of their walls: both caps for
+        # a reflex corner, a single cap for a step onto an already-matched cap.
+        cap_p = self._cap_line(prev_face, mid)
+        cap_n = self._cap_line(next_face, mid)
+        for bridge in ([cap_p, cap_n], [cap_p], [cap_n]):
+            if any(c is None for c in bridge):
+                continue
+            if self._chain_ok([l0] + bridge + [l1], mid, sin_corner, max_shift):
+                return 'bridge', bridge
+        return 'cut', []
+
+    @staticmethod
+    def _line_through(p: Point, q: Point) -> Optional[Tuple[float, float, float, float]]:
+        """Line as (point_x, point_y, dir_x, dir_y) with a unit direction."""
+        dx, dy = q.x - p.x, q.y - p.y
+        d = math.hypot(dx, dy)
+        if d < 1e-9:
+            return None
+        return (p.x, p.y, dx / d, dy / d)
+
+    @staticmethod
+    def _intersect(l0, l1) -> Optional[Point]:
+        """Intersection of two lines, or None when they are near-parallel."""
+        if l0 is None or l1 is None:
+            return None
+        x0, y0, dx0, dy0 = l0
+        x1, y1, dx1, dy1 = l1
+        denom = dx0 * dy1 - dy0 * dx1
+        if abs(denom) < 1e-6:          # parallel: no stable corner
+            return None
+        t = ((x1 - x0) * dy1 - (y1 - y0) * dx1) / denom
+        return Point(x0 + t * dx0, y0 + t * dy0)
+
+    def _snap_polygon_to_walls(self, points: List[Point]) -> List[Point]:
+        """Snap a room contour onto the wall faces edge-wise.
+
+        Vertex-wise snapping cannot make a corner airtight: a corner vertex has
+        two wall faces meeting at it, and projecting the vertex onto whichever
+        face happens to be nearest leaves it inset from the other one.  Instead
+        each EDGE is matched to the face it runs along and replaced by that
+        face's supporting line; each corner is then rebuilt as the intersection
+        of its two neighbouring lines.  The corner lands exactly where the two
+        wall faces meet, at any wall angle, even if contour simplification had
+        shaved the corner off entirely.
+
+        Edges matching no face (e.g. the watershed cut across a doorway) keep
+        their own chord as their line, so they are left where they were.
+        """
+        n = len(points)
+        if n < 3 or not self._wall_faces:
+            return points
+
+        # 1. Assign each edge i (points[i] → points[i+1]) the face it lies on.
+        face_of: List[Optional[int]] = [
+            self._match_face(points[i], points[(i + 1) % n]) for i in range(n)
+        ]
+
+        # 2. A noise-length edge wedged between two edges of the same face is
+        #    a staircase step on that face — absorb it so it can't break the run.
+        for _ in range(2):
+            for i in range(n):
+                if face_of[i] is not None:
                     continue
-                t = ((x_cm - ax) * edx + (y_cm - ay) * edy) / len_sq
-                t = max(0.0, min(1.0, t))
-                px = ax + t * edx
-                py = ay + t * edy
-                d = math.hypot(x_cm - px, y_cm - py)
-                if d < best_dist:
-                    best_dist = d
-                    best_x, best_y = px, py
-        return best_x, best_y
+                p, q = points[i], points[(i + 1) % n]
+                if math.hypot(q.x - p.x, q.y - p.y) >= self._NOISE_EDGE_CM:
+                    continue
+                prv, nxt = face_of[i - 1], face_of[(i + 1) % n]
+                if prv is not None and prv == nxt:
+                    face_of[i] = prv
+
+        # 3. Group consecutive edges sharing a face into runs (all consecutive
+        #    unmatched edges collapse into one free run).
+        start = None
+        for i in range(n):
+            if face_of[i] != face_of[i - 1]:
+                start = i
+                break
+        if start is None:
+            return points          # every edge on one face — degenerate
+
+        runs: List[Tuple[Optional[int], List[int]]] = []
+        cur_face, cur = face_of[start], [start]
+        for k in range(1, n):
+            i = (start + k) % n
+            if face_of[i] == cur_face:
+                cur.append(i)
+            else:
+                runs.append((cur_face, cur))
+                cur_face, cur = face_of[i], [i]
+        runs.append((cur_face, cur))
+        if len(runs) < 3:
+            return points          # can't rebuild a polygon from <3 lines
+
+        # 4. Turn every run into one or more supporting lines.  A face run gives
+        #    its face's line.  A free run is resolved by what it actually is:
+        #      convex notch — walls are not mitred, so at a corner their inner
+        #        faces stop short of one another.  Drop the run and let the two
+        #        face lines intersect: the floor runs into the notch.
+        #      reflex notch / step — there mitring would slice the notch off (the
+        #        face lines cross inside the room), or the faces are parallel but
+        #        offset.  Either way the boundary detours around the missing wall
+        #        corner along the walls' end caps, so emit those cap lines.
+        #      doorway cut — the watershed cut across an opening.  It is flanked
+        #        by COLLINEAR faces (one wall, either side of the door) forming
+        #        no corner, so it keeps its own chord and stays put.
+        max_shift = 2.0 * self.snap_tolerance_cm
+        notch_max = min(1.6 * self._max_wall_thickness, 0.5 * self.max_doorway_cm)
+        sin_corner = math.sin(math.radians(10.0))
+
+        lines = []
+        anchors: List[Point] = []      # a nearby raster vertex per line, for fallback
+        for k, (face_id, idxs) in enumerate(runs):
+            if face_id is not None:
+                lines.append(self._face_line(face_id))
+                anchors.append(points[idxs[0]])
+                continue
+            a = points[idxs[0]]
+            b = points[(idxs[-1] + 1) % n]
+            mid = Point((a.x + b.x) / 2.0, (a.y + b.y) / 2.0)
+            kind, bridge = self._classify_free_run(
+                runs, k, points, n, notch_max, sin_corner, max_shift
+            )
+            if kind == 'convex':
+                continue                       # drop → neighbours mitre
+            if kind == 'bridge':
+                lines.extend(bridge)           # end cap(s) around the wall corner
+                anchors.extend([mid] * len(bridge))
+                continue
+            lines.append(self._line_through(a, b))
+            anchors.append(a)
+        if len(lines) < 3:
+            return points
+
+        # 5. Each corner = intersection of the two lines meeting there.
+        snapped: List[Point] = []
+        for k in range(len(lines)):
+            original = anchors[k]
+            corner = self._intersect(lines[k - 1], lines[k])
+            # Near-parallel lines give a corner far away (or none): keep the
+            # original vertex rather than flinging it across the plan.
+            if corner is None or original.distance_to(corner) > max_shift:
+                corner = original
+            snapped.append(corner)
+
+        # Drop corners that collapsed onto each other.
+        deduped: List[Point] = []
+        for p in snapped:
+            if not deduped or p.distance_to(deduped[-1]) > 0.5:
+                deduped.append(p)
+        if len(deduped) > 1 and deduped[0].distance_to(deduped[-1]) <= 0.5:
+            deduped.pop()
+        if len(deduped) < 3:
+            return points
+
+        # Safety net: snapping corrects centimetres, never reshapes a room.
+        # If the area moved wildly, some face match was wrong — keep the raster.
+        a_old, a_new = _polygon_area(points), _polygon_area(deduped)
+        if a_old > 0 and abs(a_new - a_old) / a_old > 0.25:
+            return points
+        return deduped
 
     # ---- rasterise walls as filled rectangles ----
     def _rasterize_walls(
@@ -1340,20 +1643,23 @@ class RoomDetector:
                 continue
             contour = max(contours, key=cv2.contourArea)
 
-            # Simplify to a reasonable polygon
-            perimeter = cv2.arcLength(contour, True)
-            epsilon = self.contour_simplify_ratio * perimeter
+            # Simplify with an ABSOLUTE tolerance.  A tolerance proportional to
+            # the perimeter would scale with room size (a 20x12 m room gets a
+            # ~19 cm budget) and flatten away the short wall end-cap edges that
+            # bound a reflex corner's notch, which the snap step needs to see.
+            epsilon = self.simplify_epsilon_cm / self.resolution
             approx = cv2.approxPolyDP(contour, epsilon, True)
             if len(approx) < 3:
                 continue
 
-            points: List[Point] = []
-            for pt in approx:
-                x_cm = pt[0][0] * res + min_x
-                y_cm = pt[0][1] * res + min_y
-                # Snap vertex to nearest wall face for precise room boundaries
-                x_cm, y_cm = self._snap_to_walls(x_cm, y_cm)
-                points.append(Point(x_cm, y_cm))
+            points = [
+                Point(pt[0][0] * res + min_x, pt[0][1] * res + min_y)
+                for pt in approx
+            ]
+            # Snap the contour onto the wall faces so the floor is airtight.
+            points = self._snap_polygon_to_walls(points)
+            if len(points) < 3:
+                continue
 
             rooms.append(Room(
                 points=points,
@@ -1595,7 +1901,7 @@ class SweetHome3DExporter:
             resolution=0.5,
             min_room_area_cm2=2000.0,
             wall_dilation_px=3,
-            contour_simplify_ratio=0.003,
+            simplify_epsilon_cm=2.0,
             snap_tolerance_cm=18.0,
             split_doorways=self.split_doorways,
             max_doorway_cm=self.max_doorway_cm,
