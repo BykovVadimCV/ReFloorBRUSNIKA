@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import math
 import os
 import re
@@ -62,6 +63,43 @@ from pipeline.unet_subprocess import _unet_worker, _run_unet_subprocess
 from pipeline.result import PipelineResult
 
 logger = logging.getLogger(__name__)
+
+
+def _attach_pipeline_file_log(log_path: str) -> Callable[[], None]:
+    """Attach a per-image DEBUG file handler to the root logger.
+
+    Captures every module's records (calibration, stage drops, RoomDetector)
+    into one file. If the root logger's effective level is above INFO, it is
+    temporarily lowered so records actually propagate — pre-existing root
+    handlers get their levels raised to the old root level, so console
+    behaviour is unchanged. Returns a zero-arg callable that restores
+    everything; call it in a ``finally``.
+    """
+    handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    handler.setLevel(logging.DEBUG)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(name)s: %(message)s"))
+
+    root = logging.getLogger()
+    prev_root_level = root.level
+    raised: List[Tuple[logging.Handler, int]] = []
+    if root.getEffectiveLevel() > logging.INFO:
+        floor = root.getEffectiveLevel()
+        for h in root.handlers:
+            if h.level < floor:
+                raised.append((h, h.level))
+                h.setLevel(floor)
+        root.setLevel(logging.INFO)
+    root.addHandler(handler)
+
+    def _detach() -> None:
+        root.removeHandler(handler)
+        handler.close()
+        root.setLevel(prev_root_level)
+        for h, lvl in raised:
+            h.setLevel(lvl)
+
+    return _detach
 
 
 class FloorplanPipeline:
@@ -160,6 +198,11 @@ class FloorplanPipeline:
         """
         Process a single floorplan image through all pipeline stages.
 
+        Writes ``<base>_pipeline.log`` next to the outputs: a full capture of
+        every module's log records (scale calibration, stage drop decisions,
+        RoomDetector internals) for this image only — batch runs on the server
+        otherwise lose all of it to the console.
+
         Args:
             image_path: Path to input image file
             output_dir: Directory for output files
@@ -170,6 +213,22 @@ class FloorplanPipeline:
         Returns:
             PipelineResult with all detection results and output paths
         """
+        base_name = Path(image_path).stem
+        os.makedirs(output_dir, exist_ok=True)
+        detach = _attach_pipeline_file_log(
+            os.path.join(output_dir, f"{base_name}_pipeline.log"))
+        try:
+            return self._process_impl(image_path, output_dir, progress_callback)
+        finally:
+            detach()
+
+    def _process_impl(
+        self,
+        image_path: str,
+        output_dir: str,
+        progress_callback: Optional[Callable] = None,
+    ) -> PipelineResult:
+        """Actual pipeline body — see :meth:`process`."""
         def _notify(stage: str) -> None:
             if progress_callback is not None:
                 progress_callback(stage)
@@ -183,6 +242,11 @@ class FloorplanPipeline:
         os.makedirs(output_dir, exist_ok=True)
 
         result = PipelineResult()
+        # Structured per-image diagnostics, dumped to <base>_diag.json at the
+        # end: the opening funnel (how many survive each filter stage) and
+        # every scale decision. The companion <base>_pipeline.log holds the
+        # full prose; this file is for grepping across a batch.
+        diag: Dict[str, Any] = {"image": base_name, "scale": {}, "openings": {}}
 
         # ── Pre-stage 0a: crop to floorplan extent ────────────────────
         # This is the ONLY step that runs before the diagonal pre-processor.
@@ -511,6 +575,8 @@ class FloorplanPipeline:
                     logger.warning("Room-area scale out of bounds (%.4f), ignoring",
                                    pixels_to_cm)
 
+        diag["scale"]["room_measurement_ptcm"] = result.pixels_to_cm
+
         # Reuse OCR labels collected in pre-stage (no re-run needed).
         logger.info("[%s] Stage 1b2: OCR text label collection (reusing pre-stage)",
                     base_name)
@@ -538,6 +604,8 @@ class FloorplanPipeline:
             self.config = self.config.copy_with(pixels_to_cm=wl_ptcm)
             self.exporter.update_scale(wl_ptcm)
             self.visualizer.pixels_to_cm = wl_ptcm
+        diag["scale"]["wall_length_ptcm"] = wl_ptcm
+        diag["scale"]["stage1_final_ptcm"] = result.pixels_to_cm
 
         # ── Stage 2: Opening Detection (UNIFIED: gap + U-Net with deduplication) ─────
         _notify("detecting openings")
@@ -592,6 +660,20 @@ class FloorplanPipeline:
                 wall_rect_polygons=result.wall_rect_polygons,
             )
 
+            diag["openings"]["detector"] = {
+                "total": len(openings),
+                "doors": sum(1 for o in openings
+                             if o.opening_type == OpeningType.DOOR),
+                "windows": sum(1 for o in openings
+                               if o.opening_type == OpeningType.WINDOW),
+                "gaps": sum(1 for o in openings
+                            if o.opening_type == OpeningType.GAP),
+            }
+            diag["openings"]["unet_raw"] = {
+                "doors": len(unet_door_bboxes or []),
+                "windows": len(unet_window_bboxes or []),
+            }
+
             # Supplement with U-Net doors that don't overlap gap detections
             if unet_door_bboxes or unet_window_bboxes:
                 unet_openings = self._unet_bboxes_to_openings(
@@ -616,6 +698,10 @@ class FloorplanPipeline:
                         "(%d overlapped gap/door detections)",
                         base_name, len(filtered_unet), len(unet_openings), overlapping_count,
                     )
+                diag["openings"]["unet_supplement"] = {
+                    "added": len(filtered_unet),
+                    "overlapped": overlapping_count,
+                }
 
         # ── Stage 2a: Spatial filter — no back-to-back doors ───────────
         # Runs after every door source (gap, YOLO, U-Net, supplement) has been
@@ -630,6 +716,7 @@ class FloorplanPipeline:
 
         result.openings = openings
         result.door_arcs = door_arcs
+        diag["openings"]["after_back_to_back"] = len(openings)
 
         # ── Stage 2a2: Wall-attachment filter ───────────────────────────
         # A real door/window straddles a wall (or the gap between two wall
@@ -644,6 +731,7 @@ class FloorplanPipeline:
                 walls=result.walls,
                 max_dist_factor=self.config.opening_attach_max_dist_factor,
             )
+            diag["openings"]["attachment_dropped"] = _n_un
             if _n_un:
                 result.dropped_unattached_openings = _unattached
                 logger.info(
@@ -662,6 +750,7 @@ class FloorplanPipeline:
                 walls=result.walls,
                 tol_deg=self.config.opening_axis_tol_deg,
             )
+            diag["openings"]["diagonal_dropped"] = _drop_n
             if _drop_n:
                 result.dropped_diagonal_openings = _dropped
                 logger.info(
@@ -780,6 +869,7 @@ class FloorplanPipeline:
                 pixels_to_cm=result.pixels_to_cm,
                 current_scale_factor=self.config.sh3d_scale_factor,
             )
+            _sf_source = "stacked_labels" if new_sf is not None else None
             if new_sf is None:
                 new_sf = self._calibrate_scale_from_rooms(
                     rooms=result.rooms,
@@ -787,6 +877,10 @@ class FloorplanPipeline:
                     pixels_to_cm=result.pixels_to_cm,
                     current_scale_factor=self.config.sh3d_scale_factor,
                 )
+                if new_sf is not None:
+                    _sf_source = "room_polygons"
+            diag["scale"]["stage4b_sf"] = new_sf
+            diag["scale"]["stage4b_source"] = _sf_source
             if new_sf is not None and abs(new_sf - self.config.sh3d_scale_factor) > 1e-4:
                 # Update the XML generator's scale_factor
                 inner_exp = getattr(self.exporter, '_inner', None)
@@ -827,9 +921,12 @@ class FloorplanPipeline:
             ext_m = ext_px * result.pixels_to_cm / sf_cur / 100.0
             lo = self.config.scale_sanity_min_extent_m
             hi = self.config.scale_sanity_max_extent_m
+            diag["scale"]["gate"] = {"extent_m": round(ext_m, 2),
+                                     "in_band": bool(lo <= ext_m <= hi)}
             if ext_px > 0 and not (lo <= ext_m <= hi):
                 target_m = self.config.scale_sanity_fallback_extent_m
                 new_sf = ext_px * result.pixels_to_cm / (target_m * 100.0)
+                diag["scale"]["gate"]["forced_sf"] = round(new_sf, 4)
                 logger.warning(
                     "[%s] Scale sanity gate: plan long side %.1f m outside "
                     "[%.1f, %.1f] m (pixels_to_cm=%.4f, sf=%.4f) — forcing "
@@ -932,6 +1029,26 @@ class FloorplanPipeline:
 
         result.summary_path = summary_path if os.path.exists(summary_path) else None
         result.rooms_ocr_path = rooms_ocr_path if os.path.exists(rooms_ocr_path) else None
+
+        # ── Diagnostics dump ───────────────────────────────────────────
+        diag["scale"]["final_pixels_to_cm"] = result.pixels_to_cm
+        diag["scale"]["final_sh3d_scale_factor"] = self.config.sh3d_scale_factor
+        diag["openings"].setdefault("attachment_dropped", 0)
+        diag["openings"].setdefault("diagonal_dropped", 0)
+        diag["openings"]["final"] = len(result.openings)
+        diag["seal_only_openings"] = len(
+            getattr(result, "dropped_diagonal_openings", None) or [])
+        diag["rooms"] = {
+            "count": len(result.rooms),
+            "names": [getattr(r, "name", "") for r in result.rooms],
+        }
+        diag["walls"] = result.n_walls
+        try:
+            with open(os.path.join(output_dir, f"{base_name}_diag.json"),
+                      "w", encoding="utf-8") as fh:
+                json.dump(diag, fh, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning("[%s] diag.json write failed: %s", base_name, e)
 
         # ── Cleanup: free heavy intermediate data ─────────────────────
         result.wall_mask = None

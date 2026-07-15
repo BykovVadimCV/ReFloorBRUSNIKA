@@ -1107,6 +1107,12 @@ class RoomDetector:
                 self.max_doorway_cm = derived
             interior = self._split_at_necks(interior)
         rooms = self._components_to_rooms(interior, origin, enclosed_labels, mask)
+        logger.info(
+            "RoomDetector: %d room(s) from flood-fill (split_doorways=%s, "
+            "max_doorway_cm=%.0f, %d sealed opening(s))",
+            len(rooms), self.split_doorways, self.max_doorway_cm,
+            len(openings or []),
+        )
         return rooms
 
     # ---- seal detected openings into the wall raster ----
@@ -1945,9 +1951,13 @@ class SweetHome3DExporter:
             all_walls, enclosed_labels=enclosed_labels, openings=room_openings,
         )
 
+        _n_before_overlap = len(rooms)
         rooms = RoomOverlapRemover(
             min_area_threshold=50.0, overlap_threshold=0.50
         ).remove_overlaps(rooms)
+        if len(rooms) != _n_before_overlap:
+            logger.info("RoomOverlapRemover: %d -> %d room(s)",
+                        _n_before_overlap, len(rooms))
 
         # Name rooms from OCR labels (room names / areas) that fall inside each
         # room polygon, so the SH3D carries the real room identity instead of a
