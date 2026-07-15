@@ -86,8 +86,14 @@ def _assign_room_names_from_ocr(
             if not _point_in_polygon(cx, cy, room.points):
                 continue
             if not is_numeric_ocr_label(text):
-                name_text = text          # real room name — highest priority
-                break
+                # A real room name ("Кухня", "Спальня"), not OCR shrapnel:
+                # watermark fragments and stray glyphs ('+', '€', 'Ba', 'L')
+                # otherwise win the priority race and ship as room names.
+                letters = sum(1 for ch in text if ch.isalpha())
+                if letters >= 3 or text.lower() in ("wc", "су", "с/у", "c/y"):
+                    name_text = text      # real room name — highest priority
+                    break
+                continue
             area_val = parse_area_m2(text)
             if area_val is not None and (best_area is None or area_val > best_area):
                 best_area = area_val
@@ -1082,6 +1088,23 @@ class RoomDetector:
         interior = self._extract_interior(mask)
         # Separate rooms still joined through UNDETECTED doorways.
         if self.split_doorways:
+            # Derive the doorway width from the detected doors themselves:
+            # both door widths and room geometry come from px × pixels_to_cm,
+            # so the ratio survives a broken scale calibration where the
+            # fixed max_doorway_cm (real-world cm) does not.
+            door_widths = [
+                float(o.width) for o in (openings or [])
+                if o.opening_type in (OpeningType.DOOR, OpeningType.GAP)
+                and o.width > 0
+            ]
+            if len(door_widths) >= 2:
+                derived = 1.5 * float(np.median(door_widths))
+                logger.info(
+                    "RoomDetector: max_doorway derived from %d door(s): "
+                    "%.0f cm (config %.0f cm)",
+                    len(door_widths), derived, self.max_doorway_cm,
+                )
+                self.max_doorway_cm = derived
             interior = self._split_at_necks(interior)
         rooms = self._components_to_rooms(interior, origin, enclosed_labels, mask)
         return rooms
@@ -1727,7 +1750,9 @@ class SH3DXMLGenerator:
         root.set('version', '7400')
         root.set('name', name)
         root.set('camera', 'topCamera')
-        root.set('wallHeight', f'{self.wall_height / sf:.4f}')
+        # Vertical dimensions are absolute cm; only plan-space XY values are
+        # divided by scale_factor (see sh3d-scale-rule).
+        root.set('wallHeight', f'{self.wall_height:.4f}')
         prop = ET.SubElement(root, 'property')
         prop.set('name', 'com.eteks.sweethome3d.SweetHome3D.PlanScale')
         prop.set('value', '0.02')
@@ -1760,7 +1785,7 @@ class SH3DXMLGenerator:
         e.set('yStart', f'{w.start.y / sf:.4f}')
         e.set('xEnd', f'{w.end.x / sf:.4f}')
         e.set('yEnd', f'{w.end.y / sf:.4f}')
-        e.set('height', f'{w.height / sf:.4f}')
+        e.set('height', f'{w.height:.4f}')  # absolute cm, never scaled
         e.set('thickness', f'{w.thickness / sf:.4f}')
         e.set('pattern', w.pattern)
         if w.wall_at_start:
@@ -1784,11 +1809,11 @@ class SH3DXMLGenerator:
         e.set('x', f'{o.center.x / sf:.4f}')
         e.set('y', f'{o.center.y / sf:.4f}')
         if o.elevation > 0:
-            e.set('elevation', f'{o.elevation / sf:.4f}')
+            e.set('elevation', f'{o.elevation:.4f}')  # absolute cm
         e.set('angle', str(o.angle))
         e.set('width', f'{o.width / sf:.4f}')
         e.set('depth', f'{o.depth / sf:.4f}')
-        e.set('height', f'{o.height / sf:.4f}')
+        e.set('height', f'{o.height:.4f}')  # absolute cm, never scaled
         e.set('movable', 'false')
         e.set('wallThickness', str(o.wall_thickness))
         e.set('wallDistance', str(o.wall_distance))
@@ -1863,6 +1888,7 @@ class SweetHome3DExporter:
         fused_doors: Optional[List] = None,
         enclosed_labels: Optional[np.ndarray] = None,
         extra_structural_walls: Optional[List] = None,
+        seal_only_openings: Optional[List[Opening]] = None,
     ) -> List[Room]:
         structural_walls = self.wall_converter.convert(wall_rectangles)
 
@@ -1897,6 +1923,16 @@ class SweetHome3DExporter:
         # ──────────────────────────────────────────────────────
         # FIX: use the new flood-fill RoomDetector
         # ──────────────────────────────────────────────────────
+        # Seal-only openings (e.g. door proposals dropped from export because
+        # they sit on diagonal walls) still mark real doorways: they close the
+        # passage for room flood-fill but are never written to the XML.
+        room_openings = list(openings)
+        if seal_only_openings:
+            room_openings.extend(seal_only_openings)
+            logger.info(
+                "RoomDetector: sealing %d extra seal-only opening(s) "
+                "(not exported)", len(seal_only_openings),
+            )
         rooms = RoomDetector(
             resolution=0.5,
             min_room_area_cm2=2000.0,
@@ -1906,7 +1942,7 @@ class SweetHome3DExporter:
             split_doorways=self.split_doorways,
             max_doorway_cm=self.max_doorway_cm,
         ).detect(
-            all_walls, enclosed_labels=enclosed_labels, openings=openings,
+            all_walls, enclosed_labels=enclosed_labels, openings=room_openings,
         )
 
         rooms = RoomOverlapRemover(

@@ -44,6 +44,13 @@ _LENGTH_PATTERN = re.compile(
     r"^\s*(\d{1,3}[.,]\d{1,2})\s*$",
 )
 
+# Wall-length in millimetres: bare 4-digit integer (BTI dimension style,
+# e.g. "2420", "5950"). 1–3 digit integers are excluded — they collide with
+# room numbers and apartment numbers.
+_LENGTH_MM_PATTERN = re.compile(
+    r"^\s*([1-9]\d{3})\s*$",
+)
+
 
 # ---------------------------------------------------------------------------
 # Public helpers
@@ -96,6 +103,13 @@ def parse_length_m(text: str) -> Optional[float]:
             # Sanity: wall lengths on floor plans are 0.1 m – 50 m
             if 0.1 <= val <= 50.0:
                 return val
+        except ValueError:
+            pass
+    # BTI-style millimetre dimension: "2420" -> 2.42 m
+    m = _LENGTH_MM_PATTERN.match(text.strip())
+    if m:
+        try:
+            return float(m.group(1)) / 1000.0
         except ValueError:
             pass
     return None

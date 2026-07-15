@@ -631,6 +631,26 @@ class FloorplanPipeline:
         result.openings = openings
         result.door_arcs = door_arcs
 
+        # ── Stage 2a2: Wall-attachment filter ───────────────────────────
+        # A real door/window straddles a wall (or the gap between two wall
+        # segments), so its center is never far from a wall centerline.
+        # Detections floating in the middle of a room are furniture false
+        # positives; they must go BEFORE Stage 2b so the diagonal-drop list
+        # (reused later to seal doorways for room detection) stays clean.
+        if (self.config.enable_opening_wall_attachment
+                and result.openings and result.walls):
+            _n_un, _unattached = self._drop_unattached_openings(
+                openings=result.openings,
+                walls=result.walls,
+                max_dist_factor=self.config.opening_attach_max_dist_factor,
+            )
+            if _n_un:
+                result.dropped_unattached_openings = _unattached
+                logger.info(
+                    "[%s] Stage 2a2: dropped %d floating opening(s) with no "
+                    "wall within reach", base_name, _n_un,
+                )
+
         # ── Stage 2b: Drop openings on diagonal walls ───────────────────
         # Doors and windows must sit on axis-aligned walls. Any opening
         # whose nearest wall (within opening_wall_proximity_cm) is diagonal
@@ -741,6 +761,7 @@ class FloorplanPipeline:
             debug_image_path=debug_img_path,
             wall_mask=result.wall_mask,
             enclosed_labels=None,
+            seal_only_openings=getattr(result, 'dropped_diagonal_openings', None),
         )
 
         result.rooms = rooms
@@ -787,9 +808,62 @@ class FloorplanPipeline:
                     debug_image_path=debug_img_path,
                     wall_mask=result.wall_mask,
                     enclosed_labels=None,
+                    seal_only_openings=getattr(result, 'dropped_diagonal_openings', None),
                 )
                 result.rooms = rooms
                 result.sh3d_path = sh3d_path if os.path.exists(sh3d_path) else None
+
+        # ── Stage 4b2: Scale sanity gate ───────────────────────────────────
+        # Exported plan-space cm = px * pixels_to_cm / sh3d_scale_factor.
+        # When every calibration source fails (common on BTI scans where room
+        # extraction fails), stale defaults ship physically impossible plans
+        # (observed: 36 m-wide apartments with 3.8 m doors, and 5 m-wide ones).
+        # Clamp by re-deriving sf against an assumed long side as last resort.
+        if self.config.enable_scale_sanity_gate and result.walls:
+            xs = [c for w in result.walls for c in (w.bbox.x1, w.bbox.x2)]
+            ys = [c for w in result.walls for c in (w.bbox.y1, w.bbox.y2)]
+            ext_px = float(max(max(xs) - min(xs), max(ys) - min(ys)))
+            sf_cur = self.config.sh3d_scale_factor
+            ext_m = ext_px * result.pixels_to_cm / sf_cur / 100.0
+            lo = self.config.scale_sanity_min_extent_m
+            hi = self.config.scale_sanity_max_extent_m
+            if ext_px > 0 and not (lo <= ext_m <= hi):
+                target_m = self.config.scale_sanity_fallback_extent_m
+                new_sf = ext_px * result.pixels_to_cm / (target_m * 100.0)
+                logger.warning(
+                    "[%s] Scale sanity gate: plan long side %.1f m outside "
+                    "[%.1f, %.1f] m (pixels_to_cm=%.4f, sf=%.4f) — forcing "
+                    "sf -> %.4f (assumed %.1f m long side)",
+                    base_name, ext_m, lo, hi, result.pixels_to_cm, sf_cur,
+                    new_sf, target_m,
+                )
+                inner_exp = getattr(self.exporter, '_inner', None)
+                if inner_exp is not None:
+                    inner_exp.xml_generator.scale_factor = new_sf
+                self.config = self.config.copy_with(sh3d_scale_factor=new_sf)
+                try:
+                    os.remove(sh3d_path)
+                except OSError:
+                    pass
+                rooms = self._run_export(
+                    walls=result.walls,
+                    openings=result.openings,
+                    output_path=sh3d_path,
+                    original_image=img,
+                    ocr_labels=ocr_labels,
+                    debug_image_path=debug_img_path,
+                    wall_mask=result.wall_mask,
+                    enclosed_labels=None,
+                    seal_only_openings=getattr(result, 'dropped_diagonal_openings', None),
+                )
+                result.rooms = rooms
+                result.sh3d_path = sh3d_path if os.path.exists(sh3d_path) else None
+            else:
+                logger.info(
+                    "[%s] Scale sanity gate: plan long side %.1f m OK "
+                    "(pixels_to_cm=%.4f, sf=%.4f)",
+                    base_name, ext_m, result.pixels_to_cm, sf_cur,
+                )
 
         # ── Stage 4c: Room area validation (diagnostic only) ──────────────
         if result.rooms and ocr_text_labels:
@@ -1011,6 +1085,69 @@ class FloorplanPipeline:
         area_b = (bbox_b.x2 - bbox_b.x1) * (bbox_b.y2 - bbox_b.y1)
         union = area_a + area_b - inter
         return inter / union if union > 0 else 0.0
+
+    @staticmethod
+    def _drop_unattached_openings(
+        openings: list, walls: List[WallSegment], max_dist_factor: float = 1.0,
+    ) -> Tuple[int, List[Opening]]:
+        """
+        Mutate ``openings`` in place: remove every opening whose center is
+        farther from ALL wall centerlines than ``max_dist_factor`` times the
+        opening's own long side.
+
+        A genuine door straddles its wall, and a door in an undetected wall
+        gap still sits within ~half a door-width of the flanking segments'
+        endpoints, so legitimate openings measure well under 1.0x. Furniture
+        false positives float in room interiors, several widths away.
+        Angle-agnostic: diagonal walls attach via their outline centerline.
+
+        Returns ``(n_dropped, dropped_openings)``.
+        """
+        if not openings or not walls:
+            return 0, []
+
+        def _seg_dist(px: float, py: float,
+                      a: Tuple[float, float], b: Tuple[float, float]) -> float:
+            ax, ay = a; bx, by = b
+            dx, dy = bx - ax, by - ay
+            l2 = dx * dx + dy * dy
+            if l2 < 1e-9:
+                return math.hypot(px - ax, py - ay)
+            t = max(0.0, min(1.0, ((px - ax) * dx + (py - ay) * dy) / l2))
+            return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+        wall_lines = []
+        for w in walls:
+            if w.outline and len(w.outline) >= 2:
+                p1 = (float(w.outline[0][0]), float(w.outline[0][1]))
+                p2 = (float(w.outline[1][0]), float(w.outline[1][1]))
+            else:
+                p1, p2 = w.centerline
+                p1 = (float(p1[0]), float(p1[1]))
+                p2 = (float(p2[0]), float(p2[1]))
+            wall_lines.append((p1, p2))
+
+        kept: List[Opening] = []
+        dropped_list: List[Opening] = []
+        for op in openings:
+            cx, cy = op.bbox.center
+            long_side = max(op.bbox.width, op.bbox.height)
+            reach = max_dist_factor * long_side
+            best_d = min(_seg_dist(cx, cy, p1, p2) for p1, p2 in wall_lines)
+            if best_d > reach:
+                logger.debug(
+                    "unattached opening dropped: type=%s center=(%.0f,%.0f) "
+                    "nearest wall %.0fpx away (reach %.0fpx)",
+                    op.opening_type, cx, cy, best_d, reach,
+                )
+                dropped_list.append(op)
+            else:
+                kept.append(op)
+
+        if dropped_list:
+            openings.clear()
+            openings.extend(kept)
+        return len(dropped_list), dropped_list
 
     @staticmethod
     def _drop_diagonal_openings(
@@ -1437,6 +1574,7 @@ class FloorplanPipeline:
         debug_image_path: str,
         wall_mask: Optional[np.ndarray],
         enclosed_labels: Optional[np.ndarray] = None,
+        seal_only_openings: Optional[List[Opening]] = None,
     ) -> List[Room]:
         """Run SH3D export and return detected rooms."""
         try:
@@ -1449,6 +1587,7 @@ class FloorplanPipeline:
                 debug_image_path=debug_image_path,
                 wall_mask=wall_mask,
                 enclosed_labels=enclosed_labels,
+                seal_only_openings=seal_only_openings,
             )
         except Exception as e:
             logger.error("SH3D export failed: %s", e, exc_info=True)

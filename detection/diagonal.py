@@ -67,6 +67,13 @@ CLUSTER_TOL_DEG: float      = 5.0       # angular merge threshold
 PERP_TOL_DEG: float         = 20.0      # deviation from 90° apart
 MIN_DESKEW_DEG: float       = 3.0       # below this ⇒ no deskew
 
+# Large-rotation dominance gate: only segments at least this long vote (hatch
+# strokes inside walls are short; wall outlines are long), and the diagonal
+# family must carry this many times more length than the axis family before
+# the large-angle correction is even attempted.
+DOMINANCE_MIN_SEG_LEN_PX: float = 80.0
+DOMINANCE_FACTOR: float         = 1.5
+
 WALL_QUAD_HALF_W: float     = 14.0      # half-width of segment quad for mask test
 WALL_MASK_MIN_OVERLAP: float = 0.25     # fraction of quad on wall_mask to keep
 
@@ -431,13 +438,45 @@ def _find_deskew_angle(clusters: List[Dict],
     primary = ranked[0]
     if not primary['is_diagonal']:
         return None
-    secondary = ranked[1]
-    if abs(_angle_dist(primary['cluster_angle'],
-                        secondary['cluster_angle']) - 90.0) > perp_tol:
+    # A rotated plan has walls in two perpendicular directions, but the
+    # second-longest cluster is not always the perpendicular one (parallel
+    # wall runs, stair strokes) — search a few runners-up for a partner.
+    partner = next(
+        (c for c in ranked[1:6]
+         if abs(_angle_dist(primary['cluster_angle'],
+                            c['cluster_angle']) - 90.0) <= perp_tol),
+        None,
+    )
+    if partner is None:
         return None
     dev = primary['cluster_angle'] % 90.0
     correction = dev if dev <= 45.0 else (dev - 90.0)
     return correction if abs(correction) >= min_angle else None
+
+
+def _diagonal_dominates(clusters: List[Dict],
+                        min_seg_len: float = DOMINANCE_MIN_SEG_LEN_PX,
+                        factor: float = DOMINANCE_FACTOR,
+                        ) -> Tuple[bool, float, float]:
+    """Decide whether the plan as a whole is rotated, not merely decorated
+    with diagonal strokes.
+
+    Sums segment length per family (axis vs diagonal cluster membership),
+    counting only segments >= min_seg_len px: wall-hatch strokes are short
+    and must not out-vote long wall outlines. Returns
+    (diagonal_dominates, axis_len, diag_len).
+    """
+    axis_len = 0.0
+    diag_len = 0.0
+    for c in clusters:
+        for s in c.get('members', []):
+            if s.get('length', 0.0) < min_seg_len:
+                continue
+            if c['is_diagonal']:
+                diag_len += s['length']
+            else:
+                axis_len += s['length']
+    return diag_len > factor * axis_len, axis_len, diag_len
 
 
 # ---------------------------------------------------------------------------
@@ -618,11 +657,26 @@ def preprocess_floorplan(
     logger.info("[diagonal:%s] LSD: %d wall-aligned segs in %d clusters",
                 base, len(segs), len(clusters))
 
-    # 8. Deskew angle — prefer axis-cluster deviation (precise and stable);
-    #    fall back to diagonal-cluster geometry only when no axis-aligned
-    #    clusters exist at all.
-    deskew = _correction_angle_from_axis_clusters(clusters)
-    angle_source = "axis clusters"
+    # 8. Deskew angle. Axis-cluster deviation is precise for small skew, but
+    #    it must not win on a plan that is rotated as a whole: a ~40° BTI
+    #    scan still yields a few axis-aligned clusters (dimension lines,
+    #    stamps), and letting that minority pick a ~0° correction leaves the
+    #    plan diagonal for the whole axis-aligned downstream (observed on
+    #    post_training plan 6). When long diagonal segments clearly dominate,
+    #    try the large-angle correction first.
+    diag_dominant, _axis_len, _diag_len = _diagonal_dominates(clusters)
+    logger.info("[diagonal:%s] long-segment families: axis=%.0fpx "
+                "diag=%.0fpx -> %s-dominant",
+                base, _axis_len, _diag_len,
+                "diagonal" if diag_dominant else "axis")
+    deskew = None
+    angle_source = ""
+    if diag_dominant:
+        deskew = _find_deskew_angle(clusters)
+        angle_source = "diagonal clusters (dominant)"
+    if deskew is None:
+        deskew = _correction_angle_from_axis_clusters(clusters)
+        angle_source = "axis clusters"
     if deskew is None:
         deskew = _find_deskew_angle(clusters)
         angle_source = "diagonal clusters (fallback)"

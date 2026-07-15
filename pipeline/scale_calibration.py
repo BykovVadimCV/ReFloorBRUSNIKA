@@ -32,11 +32,13 @@ def _calibrate_scale_from_wall_lengths(
     debug_dir: Optional[str] = None,
     rotated_labels_in_image_coords: bool = False,
 ) -> Optional[float]:
-    """Match rotated wall-length labels to walls and compute pixels_to_cm.
+    """Match wall-length labels to walls and compute pixels_to_cm (cm/px).
 
     Receives pre-collected OCR labels from both orientations (collected
-    in the pre-stage before wall detection).  Filters to NEW numerical
-    labels only, un-rotates coordinates, and matches to walls.
+    in the pre-stage before wall detection).  Normal-orientation dimension
+    labels (≤ 10 m) and new rotated labels are both used as sources;
+    rotated coordinates are un-rotated, then each label is matched to the
+    nearest wall line and bracketed by perpendicular cuts.
 
     Parameters
     ----------
@@ -48,7 +50,7 @@ def _calibrate_scale_from_wall_lengths(
     """
     h, w = img.shape[:2]
 
-    if not rotated_labels:
+    if not rotated_labels and not normal_labels:
         return None
 
     # --- 1. Existing numerical labels (normal orientation) ----------------
@@ -59,8 +61,22 @@ def _calibrate_scale_from_wall_lengths(
         if val is not None:
             existing_nums.add(round(val, 2))
 
-    # --- 2. Filter to NEW numerical labels only ---------------------------
+    # --- 2. Collect calibration source labels ------------------------------
     new_labels: List[Tuple[float, float, float]] = []  # (length_m, cx_orig, cy_orig)
+
+    # Normal-orientation dimension labels are calibration sources too (they
+    # sit along horizontal walls). Capped at 10 m: bare-decimal room-AREA
+    # labels (11.7, 18.9, 38.6 …) parse identically to lengths, and the cap
+    # plus the max_dist wall-attachment gate and 30% outlier rejection below
+    # keep them from poisoning the median.
+    for item in (normal_labels or []):
+        if len(item) < 5:
+            continue
+        val = _parse_ocr_length_m(str(item[0]))
+        if val is None or val > 10.0:
+            continue
+        new_labels.append((val, (item[1] + item[3]) / 2.0, (item[2] + item[4]) / 2.0))
+
     for item in rotated_labels:
         if len(item) < 5:
             continue
@@ -284,14 +300,17 @@ def _calibrate_scale_from_wall_lengths(
         if seg_len_px < 5:
             continue
 
-        px_per_cm = seg_len_px / (length_m * 100.0)
+        # pixels_to_cm is cm-per-px everywhere in the pipeline (exporter does
+        # cm = px * pixels_to_cm), so the ratio must be real length over
+        # pixel length — NOT px/cm.
+        cm_per_px = (length_m * 100.0) / seg_len_px
         logger.info("  label %.2fm -> wall line seg=[%.0f..%.0f] len=%.0fpx  "
-                    "(%d members)  => px/cm=%.4f",
+                    "(%d members)  => cm/px=%.4f",
                     length_m, lo_bound, hi_bound, seg_len_px,
-                    len(members), px_per_cm)
-        ratios.append(px_per_cm)
+                    len(members), cm_per_px)
+        ratios.append(cm_per_px)
         matches.append((lcx, lcy, lo_bound, hi_bound, is_h,
-                         best_wall, length_m, px_per_cm, cuts,
+                         best_wall, length_m, cm_per_px, cuts,
                          line_lo, line_hi,
                          dbg_primary, dbg_grey, dbg_grey_used))
 
@@ -366,7 +385,7 @@ def _calibrate_scale_from_wall_lengths(
                 mid = (int(wb.center_x), int((seg_lo + seg_hi) / 2))
             cv2.line(dbg_orig, (int(lcx), int(lcy)), mid, (0, 0, 255), 1)
             # Text annotation
-            txt = f"{length_m:.2f}m -> {seg_hi - seg_lo:.0f}px  px/cm={ppcm:.3f}"
+            txt = f"{length_m:.2f}m -> {seg_hi - seg_lo:.0f}px  cm/px={ppcm:.3f}"
             cv2.putText(dbg_orig, txt, (int(lcx) + 8, int(lcy) - 8),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
         # Draw unmatched labels in orange
@@ -381,7 +400,7 @@ def _calibrate_scale_from_wall_lengths(
         if ratios:
             median_val = float(np.median(ratios))
             cv2.putText(dbg_orig,
-                        f"Wall-length calib: median px/cm = {median_val:.4f}  "
+                        f"Wall-length calib: median cm/px = {median_val:.4f}  "
                         f"({len(ratios)} matches)",
                         (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                         (0, 0, 255), 2)

@@ -51,6 +51,22 @@ class PipelineConfig:
     # Scale factor for SweetHome3D export
     sh3d_scale_factor: float = 2.2
 
+    # Scale sanity gate: the exported plan's long side (in meters, computed as
+    # px * pixels_to_cm / sh3d_scale_factor) must land inside this band or the
+    # scale factor is re-derived so the long side equals the fallback extent.
+    # Guards against a failed calibration cascade shipping 36 m-wide (or 5 m)
+    # apartments. Band is generous: single rooms up to whole-floor plans.
+    enable_scale_sanity_gate: bool = True
+    scale_sanity_min_extent_m: float = 4.0
+    scale_sanity_max_extent_m: float = 30.0
+    scale_sanity_fallback_extent_m: float = 12.0
+
+    # Openings must sit on (or bridge a gap in) a wall: an opening whose
+    # center is farther from every wall centerline than this factor times its
+    # own long side is a floating false positive (furniture) and is dropped.
+    enable_opening_wall_attachment: bool = True
+    opening_attach_max_dist_factor: float = 1.0
+
     # ============================================================
     # WALL DETECTION
     # ============================================================

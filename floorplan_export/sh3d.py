@@ -224,6 +224,7 @@ class SH3DExporter:
         debug_image_path: Optional[str] = None,
         wall_mask: Optional[np.ndarray] = None,
         enclosed_labels: Optional[np.ndarray] = None,
+        seal_only_openings: Optional[List[Opening]] = None,
     ) -> List[Room]:
         """
         Export a floorplan to SH3D format.
@@ -236,6 +237,9 @@ class SH3DExporter:
             ocr_labels: OCR text labels for debug overlay
             debug_image_path: Path to save debug image
             wall_mask: Wall binary mask for debug overlay
+            seal_only_openings: Openings excluded from export (e.g. dropped
+                diagonal-wall doors) that still mark real doorways — used only
+                to seal passages during room detection.
 
         Returns:
             List of detected Room objects for visualization
@@ -336,6 +340,26 @@ class SH3DExporter:
 
         gap_rects = [opening_to_rect_dict(g) for g in gaps]
 
+        # Seal-only openings: convert px bboxes to legacy cm-space GAP
+        # openings. Painting the axis-aligned bbox slightly over-seals around
+        # diagonal doorways, which is exactly what room flood-fill needs.
+        seal_only_legacy: List = []
+        if seal_only_openings:
+            from floorplan_export.legacy import (
+                Opening as _LegacyOpening,
+                OpeningType as _LegacyOpeningType,
+            )
+            for so in seal_only_openings:
+                b = so.bbox
+                seal_only_legacy.append(_LegacyOpening(
+                    opening_type=_LegacyOpeningType.GAP,
+                    center=_LegacyPoint(b.center_x * ptcm, b.center_y * ptcm),
+                    width=max(b.width, b.height) * ptcm,
+                    height=0.0,
+                    depth=min(b.width, b.height) * ptcm,
+                    angle=0.0 if b.width >= b.height else math.pi / 2.0,
+                ))
+
         try:
             legacy_rooms = self._inner.export_to_sh3d(
                 wall_rectangles=wall_rects,
@@ -350,6 +374,7 @@ class SH3DExporter:
                 fused_doors=fused_doors if fused_doors else None,
                 enclosed_labels=enclosed_labels,
                 extra_structural_walls=extra_structural if extra_structural else None,
+                seal_only_openings=seal_only_legacy if seal_only_legacy else None,
             )
         except Exception as e:
             logger.error("SH3D export failed: %s", e, exc_info=True)
