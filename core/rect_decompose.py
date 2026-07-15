@@ -436,6 +436,187 @@ def _spill_fraction(rect: Rect, outside_mask: np.ndarray,
 
 
 # ---------------------------------------------------------------------------
+# Thin-residual rescue
+# ---------------------------------------------------------------------------
+
+def _dilate_bool(m: np.ndarray, radius: int) -> np.ndarray:
+    """8-connected boolean dilation by `radius` px (pure numpy, no cv2)."""
+    out = m.copy()
+    for _ in range(max(0, radius)):
+        d = out.copy()
+        d[1:, :]  |= out[:-1, :]
+        d[:-1, :] |= out[1:, :]
+        d[:, 1:]  |= out[:, :-1]
+        d[:, :-1] |= out[:, 1:]
+        d[1:, 1:]   |= out[:-1, :-1]
+        d[1:, :-1]  |= out[:-1, 1:]
+        d[:-1, 1:]  |= out[1:, :-1]
+        d[:-1, :-1] |= out[1:, 1:]
+        out = d
+    return out
+
+
+def _label_components(m: np.ndarray):
+    """8-connectivity component labelling.
+
+    Returns (labels, comps) where comps is a list of
+    (component_id, area_px, (y0, y1, x0, x1)) bounding boxes, or (None, [])
+    when neither cv2 nor scipy is importable (this module deliberately has no
+    hard dependency on either).
+    """
+    try:
+        import cv2
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(
+            m.astype(np.uint8), connectivity=8)
+        comps = [(i, int(stats[i, cv2.CC_STAT_AREA]),
+                  (int(stats[i, cv2.CC_STAT_TOP]),
+                   int(stats[i, cv2.CC_STAT_TOP] + stats[i, cv2.CC_STAT_HEIGHT]),
+                   int(stats[i, cv2.CC_STAT_LEFT]),
+                   int(stats[i, cv2.CC_STAT_LEFT] + stats[i, cv2.CC_STAT_WIDTH])))
+                 for i in range(1, n)]
+        return lab, comps
+    except ImportError:
+        pass
+    try:
+        from scipy import ndimage
+        lab, _n = ndimage.label(m, structure=np.ones((3, 3), np.int32))
+        comps = []
+        for i, sl in enumerate(ndimage.find_objects(lab), start=1):
+            if sl is None:
+                continue
+            comps.append((i, int(np.count_nonzero(lab[sl] == i)),
+                          (sl[0].start, sl[0].stop, sl[1].start, sl[1].stop)))
+        return lab, comps
+    except ImportError:
+        return None, []
+
+
+def rescue_thin_residual(
+    mask: np.ndarray,
+    remaining: np.ndarray,
+    placed_union: np.ndarray,
+    axis_only:            bool  = False,
+    max_thickness:        float = 20.0,
+    min_len:              float = 25.0,
+    min_area:             int   = 40,
+    fringe_px:            int   = 2,
+    max_components:       int   = 32,
+    max_rects_per_component: int = 6,
+    component_coverage:   float = 0.90,
+    grid_dim_cap:         int   = 256,
+    bleed_weight:         float = 3.0,
+    max_spill_fraction:   float = 0.15,
+    refine:               bool  = True,
+    verbose:              bool  = True,
+) -> List[Rect]:
+    """
+    Recover wall-shaped regions the greedy loop abandoned.
+
+    The main loop quantizes the mask onto a grid of at most `max_grid_dim`
+    cells: on a large canvas a wall thinner than one grid cell mixes its +1
+    weights with `-bleed_weight` background inside the same cell and becomes
+    net-negative — invisible to the rectangle search no matter how high
+    `coverage_stop` is.  The global `coverage_stop` then abandons whatever is
+    left (thin walls are a small fraction of total wall area, so they are
+    exactly what the last few percent consist of).
+
+    This pass re-runs the same greedy search per residual connected component
+    on the component's own crop at scale 1 (no quantization), keeping the
+    bleed/spill discipline, and accepts only wall-shaped rectangles:
+
+      • short side ≤ `max_thickness`  — a fat rect means the component is a
+        blob (e.g. furniture false-positive), which aborts the component;
+      • long side ≥ `min_len`         — no dot/speck rectangles;
+      • spill ≤ `max_spill_fraction`  — same outside-the-mask discipline as
+        the main loop.
+
+    Residual pixels within `fringe_px` of an already-placed rectangle are
+    discarded first: ragged 1–2 px edges left along covered thick walls must
+    not be re-fit as parallel slivers.
+    """
+    H, W = mask.shape
+    outside = ~mask
+
+    work = remaining.copy()
+    if fringe_px > 0 and placed_union.any():
+        work &= ~_dilate_bool(placed_union, fringe_px)
+    if not work.any():
+        return []
+
+    labels, comps = _label_components(work)
+    if labels is None:
+        if verbose:
+            print("  [rescue] skipped — neither cv2 nor scipy available "
+                  "for component labelling")
+        return []
+
+    comps = sorted((c for c in comps if c[1] >= min_area),
+                   key=lambda c: -c[1])[:max_components]
+
+    rescued: List[Rect] = []
+    n_comp_used = 0
+    margin = 3
+    for cid, area, (by0, by1, bx0, bx1) in comps:
+        # Blob pre-gate: a component that is wide in BOTH directions and
+        # well-filled is not a wall — skip before paying for the search.
+        bh, bw = by1 - by0, bx1 - bx0
+        if min(bh, bw) > 3.0 * max_thickness and area > 0.35 * bh * bw:
+            continue
+
+        y0, y1 = max(0, by0 - margin), min(H, by1 + margin)
+        x0, x1 = max(0, bx0 - margin), min(W, bx1 + margin)
+        comp_mask = labels[y0:y1, x0:x1] == cid
+        sub_out   = outside[y0:y1, x0:x1]
+        ch, cw    = comp_mask.shape
+
+        sub_rem = comp_mask.copy()
+        total_c = area
+        min_gain = max(20, int(0.08 * total_c))
+        placed: List[Rect] = []
+
+        for _ in range(max_rects_per_component):
+            n_left = int(np.count_nonzero(sub_rem))
+            if n_left == 0 or (total_c - n_left) / total_c >= component_coverage:
+                break
+            angles = build_angle_list(sub_rem, angle_steps=8, axis_only=axis_only)
+            best_rect: Optional[Rect] = None
+            best_s = 0
+            for ang in angles:
+                rect, s = best_rect_at_angle(sub_rem, sub_out, ang,
+                                             grid_dim_cap, bleed_weight)
+                if rect is not None and s > best_s:
+                    best_rect, best_s = rect, s
+            if best_rect is None or best_s < min_gain:
+                break
+            if refine:
+                best_rect, best_s = refine_rect(
+                    best_rect, sub_rem, sub_out, ch, cw,
+                    bleed_weight=bleed_weight, axis_only=axis_only)
+            short, long_ = min(best_rect.w, best_rect.h), max(best_rect.w, best_rect.h)
+            if short > max_thickness:
+                break               # component is a blob, not a wall
+            if long_ < min_len:
+                break
+            if _spill_fraction(best_rect, sub_out, ch, cw) > max_spill_fraction:
+                break
+            pix = rasterise(best_rect, ch, cw)
+            if int(np.count_nonzero(pix & sub_rem)) < min_gain:
+                break
+            sub_rem &= ~pix
+            placed.append(Rect(best_rect.cx + x0, best_rect.cy + y0,
+                               best_rect.w, best_rect.h, best_rect.angle))
+
+        if placed:
+            n_comp_used += 1
+            rescued.extend(placed)
+
+    if verbose:
+        print(f"  [rescue] {len(comps)} residual component(s) examined → "
+              f"{len(rescued)} thin rect(s) from {n_comp_used} component(s)")
+    return rescued
+
+
+# ---------------------------------------------------------------------------
 # Main decomposition
 # ---------------------------------------------------------------------------
 
@@ -457,6 +638,11 @@ def decompose(
     diag_overlap_penalty: float = 0.0,
     refine:               bool  = True,
     verbose:              bool  = True,
+    thin_rescue:          bool  = False,
+    thin_rescue_max_thickness: float = 20.0,
+    thin_rescue_min_len:  float = 25.0,
+    thin_rescue_min_area: int   = 40,
+    thin_rescue_fringe_px: int  = 2,
 ) -> List[Rect]:
     """
     Greedy rectangle decomposition.  Runs until no rectangle clears the
@@ -530,6 +716,12 @@ def decompose(
                            grab a few residual pixels.  Default 0.0 (disabled).
     refine               : if True, hill-climb each placed rectangle.
     verbose              : print live progress.
+    thin_rescue          : if True, run `rescue_thin_residual` on whatever the
+                           greedy loop left uncovered — recovers thin walls
+                           that the quantized weight grid cannot see and that
+                           `coverage_stop` would otherwise abandon.  The
+                           `thin_rescue_*` parameters are documented on
+                           `rescue_thin_residual`.
 
     Returns
     -------
@@ -668,6 +860,20 @@ def decompose(
             _progress(step, len(chosen), covered, total, min_gain,
                       f"score={best_score}")
             print(f"\n    └─ {best_rect}")
+
+    if thin_rescue and remaining.any():
+        chosen.extend(rescue_thin_residual(
+            mask, remaining, placed_union,
+            axis_only          = axis_only,
+            max_thickness      = thin_rescue_max_thickness,
+            min_len            = thin_rescue_min_len,
+            min_area           = thin_rescue_min_area,
+            fringe_px          = thin_rescue_fringe_px,
+            bleed_weight       = bleed_weight,
+            max_spill_fraction = max_spill_fraction,
+            refine             = refine,
+            verbose            = verbose,
+        ))
 
     return chosen
 
@@ -827,6 +1033,11 @@ def main():
                         "Default 0.15 (15%%). Use 1.0 to disable.")
     p.add_argument("--coverage-stop",  type=float, default=0.98,
                    help="Stop once this fraction of mask is covered (default 0.95 = 95%)")
+    p.add_argument("--thin-rescue",   action="store_true",
+                   help="After the greedy loop, re-search the abandoned residual "
+                        "per connected component at full resolution and keep "
+                        "wall-shaped rectangles (recovers thin walls the "
+                        "quantized weight grid cannot see).")
     p.add_argument("--no-refine",     action="store_true",
                    help="Disable coordinate-descent refinement")
     p.add_argument("--output",        default="result.png",
@@ -871,6 +1082,7 @@ def main():
         max_spill_fraction   = args.max_spill_fraction,
         refine               = not args.no_refine,
         verbose              = True,
+        thin_rescue          = args.thin_rescue,
     )
 
     print(f"\n--- {len(rects)} rectangle(s) found ---")

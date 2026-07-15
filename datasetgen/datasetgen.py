@@ -595,10 +595,25 @@ class FloorPlanConfig(BaseModel):
     vary_wall_thickness: bool = True
     vary_room_counts: bool = True
     vary_balcony: bool = True
-    wall_thickness_range: Tuple[int, int] = (7, 100)
+    wall_thickness_range: Tuple[int, int] = (3, 100)
     balcony_probability: float = Field(0.7, ge=0.0, le=1.0)
-    augmentation_probability: float = Field(0.3, ge=0.0, le=1.0)
-    rotation_probability: float = Field(0.15, ge=0.0, le=1.0)
+    augmentation_probability: float = Field(0.5, ge=0.0, le=1.0)
+    rotation_probability: float = Field(0.2, ge=0.0, le=1.0)
+
+    # ── Thin-partition regime ────────────────────────────────────────────────
+    # Real studio/compact plans pair fat exterior walls with interior
+    # partitions at 10-40% of exterior thickness. The legacy sampler drew the
+    # interior ratio from (0.5, 0.7) only, so that pairing never occurred in
+    # synthetic data — the exact band where the U-Net's thin-wall recall
+    # plateaus (~0.76, see analysis_out/unet_target_wall_px_best_studio.json).
+    # With probability thin_partition_prob the interior ratio is drawn from
+    # thin_partition_ratio_range instead of int_wall_ratio_range.
+    thin_partition_prob: float = Field(0.45, ge=0.0, le=1.0)
+    thin_partition_ratio_range: Tuple[float, float] = (0.10, 0.40)
+    int_wall_ratio_range: Tuple[float, float] = (0.5, 0.7)
+    # Hard floor for interior wall thickness, in OUTPUT pixels (scaled by
+    # super_sampling internally) so extreme ratios stay drawable.
+    int_wall_min_px: int = Field(2, ge=1)
     cultural_preset: Optional[str] = None
     multi_story: bool = False
     num_floors: int = Field(1, ge=1, le=5)
@@ -617,12 +632,37 @@ class FloorPlanConfig(BaseModel):
     enable_augmentations: bool = Field(True, description="Enable visual corruptions/augmentations")
     color_jitter_intensity: int = Field(12, ge=0, le=40,
                                         description="Per-image color jitter within same style")
-    aug_rotation_range: float = 5.0
+    aug_rotation_range: float = 15.0
     aug_scale_range: float = 0.1
     aug_brightness_range: float = 0.15
     aug_blur_prob: float = 0.4
     aug_noise_prob: float = 0.5
     aug_jpeg_prob: float = 0.5
+
+    # ── Scan-domain augmentations ────────────────────────────────────────────
+    # Large rotations: real BTI scans arrive rotated up to ~45° (see
+    # input/6.jpg), far beyond the small-angle jitter. When a rotation event
+    # fires (rotation_probability), with probability large_rotation_prob the
+    # angle is drawn from large_rotation_range (random sign) instead of
+    # ±aug_rotation_range.
+    large_rotation_prob: float = Field(0.25, ge=0.0, le=1.0)
+    large_rotation_range: Tuple[float, float] = (15.0, 45.0)
+    # Resolution round-trip: downscale the IMAGE ONLY by a random factor and
+    # resize back up. Simulates low-resolution uploads where interpolation
+    # washes thin wall strokes out to faint grey — while the mask stays crisp,
+    # teaching the model to amplify washed-out strokes instead of dropping
+    # them. This is the single most targeted aug for the thin-wall gap.
+    aug_downscale_prob: float = Field(0.5, ge=0.0, le=1.0)
+    aug_downscale_range: Tuple[float, float] = (0.35, 0.9)
+    # Semi-transparent diagonal text watermarks (BTI scans, listing sites).
+    aug_watermark_prob: float = Field(0.35, ge=0.0, le=1.0)
+    # Minimum wall stroke width in the GT MASK, in OUTPUT pixels (0 = off).
+    # Walls thinner than this are drawn into the mask at this width even
+    # though the image keeps the true thin stroke: the label policy is
+    # "amplify thin walls, never drop them" — downstream rect_decompose needs
+    # presence and connectivity, not exact thinness. Keep 0 to reproduce
+    # legacy (image-faithful) masks.
+    mask_min_wall_px: int = Field(2, ge=0)
 
     # ── NEW v6.0 options ──────────────────────────────────────────────────
     wall_draw_style: str = Field("random", description="Wall drawing style: solid, outlined, or random")
@@ -2742,13 +2782,18 @@ class ThemeRenderer:
                 cv2.rectangle(img, (wx1, wy1), (wx2, wy2), color, -1, cv2.LINE_AA)
 
 
-    def draw_walls_on_mask(self, mask, walls, class_id):
-        """Draw walls onto segmentation mask."""
+    def draw_walls_on_mask(self, mask, walls, class_id, min_thickness=0):
+        """Draw walls onto segmentation mask.
+
+        min_thickness (hi-res px) floors the drawn stroke width: the image
+        keeps the true thin stroke while the label is guaranteed detectable —
+        the "amplify thin walls, never drop them" policy."""
         for w in walls:
+            eff_th = max(w.thickness, min_thickness)
             if w.is_guardrail:
-                cv2.line(mask, (w.x1, w.y1), (w.x2, w.y2), class_id, max(2, w.thickness // 2))
+                cv2.line(mask, (w.x1, w.y1), (w.x2, w.y2), class_id, max(2, eff_th // 2))
             else:
-                half = w.thickness // 2
+                half = eff_th // 2
                 x1, x2 = min(w.x1, w.x2), max(w.x1, w.x2)
                 y1, y2 = min(w.y1, w.y2), max(w.y1, w.y2)
                 if w.x1 == w.x2:
@@ -2826,7 +2871,11 @@ class StyleRotator:
         return self.rng.choice(ranges)
 
     def next_wall_thickness(self):
-        presets = [(5, 15), (7, 30), (15, 40), (20, 50), (30, 60),
+        # Thin presets (first three) cover BTI-style single-stroke plans whose
+        # walls land at 1-4 px after any downscale — the band both real
+        # datasets under-represent and the deployed checkpoint misses.
+        presets = [(2, 5), (3, 8), (3, 12),
+                   (5, 15), (7, 30), (15, 40), (20, 50), (30, 60),
                    (40, 80), (50, 100)]
         return self.rng.choice(presets)
 
@@ -3076,7 +3125,12 @@ class SmartFloorPlanGenerator:
 
             base_ext = self.rng.randint(*wall_thickness_range)
             ext_th   = base_ext * self.super_sampling
-            int_th   = int(ext_th * self.rng.uniform(0.5, 0.7))
+            if self.rng.random() < self.config.thin_partition_prob:
+                ratio = self.rng.uniform(*self.config.thin_partition_ratio_range)
+            else:
+                ratio = self.rng.uniform(*self.config.int_wall_ratio_range)
+            int_th = max(int(ext_th * ratio),
+                         self.config.int_wall_min_px * self.super_sampling)
 
             tasks.append({
                 "idx":       i,
@@ -3184,9 +3238,11 @@ class SmartFloorPlanGenerator:
 
         # Draw walls
         self.renderer.draw_walls(img, walls)
-        # Draw walls on mask
-        self.renderer.draw_walls_on_mask(semantic_mask, walls,
-                                          UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.WALL))
+        # Draw walls on mask (with the min-width label floor, in hi-res px)
+        self.renderer.draw_walls_on_mask(
+            semantic_mask, walls,
+            UNetSemanticClasses.to_pixel_value(UNetSemanticClasses.WALL),
+            min_thickness=self.config.mask_min_wall_px * self.super_sampling)
 
         # Furniture (visual only — not written to mask)
         self.furniture_placer.place_furniture(img, rooms, walls)
@@ -3241,6 +3297,17 @@ class SmartFloorPlanGenerator:
         if not self.config.enable_augmentations:
             return img
         h, w = img.shape[:2]
+        # Resolution round-trip FIRST: it emulates the source raster being
+        # low-res, so photo-style effects (brightness/blur/noise/jpeg) stack
+        # on top of it the way they do on real uploads. Image only — the mask
+        # keeps the crisp stroke, which is the point.
+        if self.rng.random() < self.config.aug_downscale_prob:
+            s = self.rng.uniform(*self.config.aug_downscale_range)
+            small = cv2.resize(img, (max(8, int(w * s)), max(8, int(h * s))),
+                               interpolation=cv2.INTER_AREA)
+            up_interp = self.rng.choice(
+                [cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_NEAREST])
+            img = cv2.resize(small, (w, h), interpolation=up_interp)
         if self.rng.random() < 0.8:
             brightness_factor = 1.0 + self.rng.uniform(
                 -self.config.aug_brightness_range, self.config.aug_brightness_range)
@@ -3253,6 +3320,8 @@ class SmartFloorPlanGenerator:
             sigma = self.rng.uniform(5, 25)
             gauss = np.random.normal(0, sigma, img.shape).astype(np.int16)
             img = np.clip(img.astype(np.int16) + gauss, 0, 255).astype(np.uint8)
+        if self.rng.random() < self.config.aug_watermark_prob:
+            img = self._draw_watermark(img)
         if self.rng.random() < self.config.aug_jpeg_prob:
             quality = self.rng.randint(10, 80)
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), quality]
@@ -3260,6 +3329,37 @@ class SmartFloorPlanGenerator:
             if result:
                 img = cv2.imdecode(encimg, 1)
         return img
+
+    def _draw_watermark(self, img):
+        """Semi-transparent diagonal text overlay, as on BTI scans and
+        listing-site exports. Visual only — never touches the mask, so the
+        model learns to segment walls straight through watermark ink."""
+        h, w = img.shape[:2]
+        overlay = np.zeros((h, w), dtype=np.uint8)
+        texts = ["SAMPLE", "COPY", "DEMO", "PLAN 185", "WWW.PLANS.RU",
+                 "BTI COPY", "PEREPLAN", "NE KOPIROVAT"]
+        for _ in range(self.rng.randint(1, 3)):
+            txt = self.rng.choice(texts)
+            scale = self.rng.uniform(1.5, 4.0) * (w / 1024.0)
+            th = max(1, int(scale * 1.5))
+            (tw, tht), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX,
+                                           scale, th)
+            x = self.rng.randint(-tw // 4, max(1, w - tw // 2))
+            y = self.rng.randint(tht, h)
+            cv2.putText(overlay, txt, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
+                        scale, 255, th, cv2.LINE_AA)
+        angle = self.rng.uniform(-60, 60)
+        M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
+        overlay = cv2.warpAffine(overlay, M, (w, h))
+        alpha = self.rng.uniform(0.12, 0.35)
+        color = np.array(self.rng.choice(
+            [(180, 180, 180), (160, 160, 170), (130, 150, 180),
+             (150, 130, 130)]), dtype=np.float32)
+        ink = (overlay > 0)
+        out = img.astype(np.float32)
+        a = (overlay[ink].astype(np.float32) / 255.0 * alpha)[:, None]
+        out[ink] = out[ink] * (1.0 - a) + color[None, :] * a
+        return np.clip(out, 0, 255).astype(np.uint8)
 
     # ── Multi-story ───────────────────────────────────────────────────────────
     def generate_multi_story(self, ext_th, int_th):
@@ -4104,7 +4204,12 @@ class SmartFloorPlanGenerator:
 
     def _apply_rotation(self, img, labels, mask=None):
         size = img.shape[0]
-        angle = self.rng.uniform(-15, 15)
+        if self.rng.random() < self.config.large_rotation_prob:
+            lo, hi = self.config.large_rotation_range
+            angle = self.rng.uniform(lo, hi) * self.rng.choice([-1.0, 1.0])
+        else:
+            r = self.config.aug_rotation_range
+            angle = self.rng.uniform(-r, r)
         center = (size // 2, size // 2)
         M = cv2.getRotationMatrix2D(center, angle, 1.0)
         bg = self.theme.background
@@ -4354,7 +4459,18 @@ def main():
     parser.add_argument("--aug-noise-prob", type=float, default=0.5)
     parser.add_argument("--aug-jpeg-prob", type=float, default=0.5)
     parser.add_argument("--aug-brightness", type=float, default=0.15)
-    parser.add_argument("--aug-rotation", type=float, default=5.0)
+    parser.add_argument("--aug-rotation", type=float, default=15.0)
+    parser.add_argument("--aug-downscale-prob", type=float, default=0.5,
+                        help="Probability of image-only resolution round-trip "
+                             "(downscale + resize back; mask stays crisp)")
+    parser.add_argument("--aug-watermark-prob", type=float, default=0.35,
+                        help="Probability of a diagonal text watermark overlay")
+    parser.add_argument("--thin-partition-prob", type=float, default=0.45,
+                        help="Probability of the thin-partition regime "
+                             "(interior walls at 10-40%% of exterior thickness)")
+    parser.add_argument("--mask-min-wall-px", type=int, default=2,
+                        help="Minimum GT wall stroke width in output px "
+                             "(0 = image-faithful legacy masks)")
     parser.add_argument("--workers", type=int, default=None,
                         metavar="N",
                         help="Number of parallel worker processes "
@@ -4403,6 +4519,10 @@ def main():
             aug_jpeg_prob=args.aug_jpeg_prob,
             aug_brightness_range=args.aug_brightness,
             aug_rotation_range=args.aug_rotation,
+            aug_downscale_prob=args.aug_downscale_prob,
+            aug_watermark_prob=args.aug_watermark_prob,
+            thin_partition_prob=args.thin_partition_prob,
+            mask_min_wall_px=args.mask_min_wall_px,
         )
         # Set palette from style
         cfg.palette_name = args.style

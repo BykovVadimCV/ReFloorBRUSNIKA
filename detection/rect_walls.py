@@ -1799,6 +1799,11 @@ class RectWallDetector:
         _p_diag_tol    = getattr(cfg, "rect_diag_axis_tol",        8.0)
         _p_diag_spen   = getattr(cfg, "rect_diag_score_penalty",   0.4)
         _p_diag_open   = getattr(cfg, "rect_diag_overlap_penalty", 6.0)
+        _p_rescue      = getattr(cfg, "rect_thin_rescue",          True)
+        _p_rescue_thk  = getattr(cfg, "rect_thin_rescue_max_thickness", 20.0)
+        _p_rescue_len  = getattr(cfg, "rect_thin_rescue_min_len",  25.0)
+        _p_rescue_area = getattr(cfg, "rect_thin_rescue_min_area", 40)
+        _p_rescue_frg  = getattr(cfg, "rect_thin_rescue_fringe_px", 2)
 
         _L("  Wall pixels entering decompose: %d / %d  (%.2f%%)",
            total_wall_px, total_px, 100.0 * total_wall_px / max(1, total_px))
@@ -1817,6 +1822,13 @@ class RectWallDetector:
             _L("  diagonal penalties : axis_tol=%.1f°  score_penalty=%.2f"
                "  overlap_penalty=%.1f/px (demote thin diagonals over walls)",
                _p_diag_tol, _p_diag_spen, _p_diag_open)
+        if _p_rescue:
+            _L("  thin rescue        = ON  (max_thickness=%.0fpx  min_len=%.0fpx"
+               "  min_area=%dpx²  fringe=%dpx) — full-res re-search of the"
+               " abandoned residual", _p_rescue_thk, _p_rescue_len,
+               _p_rescue_area, _p_rescue_frg)
+        else:
+            _L("  thin rescue        = OFF (rect_thin_rescue=False)")
         _LL.append("\n--- rd.decompose verbose output (start) ---\n")
 
         _verbose_buf = io.StringIO()
@@ -1839,6 +1851,11 @@ class RectWallDetector:
                 diag_overlap_penalty = _p_diag_open,
                 refine               = True,
                 verbose              = True,
+                thin_rescue          = _p_rescue,
+                thin_rescue_max_thickness = _p_rescue_thk,
+                thin_rescue_min_len  = _p_rescue_len,
+                thin_rescue_min_area = _p_rescue_area,
+                thin_rescue_fringe_px = _p_rescue_frg,
             )
         _verbose_text = _verbose_buf.getvalue()
         _LL.append(_verbose_text if _verbose_text

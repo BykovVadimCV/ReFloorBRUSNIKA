@@ -480,6 +480,20 @@ class PipelineConfig:
     # this is rejected regardless of its score.  0.15 = max 15% bleed.
     rect_max_spill: float = 0.15
 
+    # Thin-residual rescue (rd.rescue_thin_residual, runs after the greedy
+    # loop).  The main loop's weight grid (rect_max_grid_dim cells over the
+    # whole canvas) cannot see walls thinner than one grid cell — their +1
+    # weights mix with -bleed background in the same cell and go net-negative —
+    # and rect_coverage_stop then abandons the residual, which is mostly thin
+    # walls.  The rescue re-runs the same search per residual component at
+    # scale 1 and keeps only wall-shaped rects (short side ≤ max_thickness,
+    # long side ≥ min_len, same spill cap).
+    rect_thin_rescue:               bool  = True
+    rect_thin_rescue_max_thickness: float = 20.0  # px, rescued rect short-side cap
+    rect_thin_rescue_min_len:       float = 25.0  # px, rescued rect long-side floor
+    rect_thin_rescue_min_area:      int   = 40    # px², ignore smaller residual specks
+    rect_thin_rescue_fringe_px:     int   = 2     # drop residual this close to placed rects
+
     # Cap (morph-close) kernel size applied to the raw U-Net wall mask
     # before enclosed-space analysis and rect decomposition.  Bridges small
     # gaps in wall coverage so the decomposer sees a connected mask.
