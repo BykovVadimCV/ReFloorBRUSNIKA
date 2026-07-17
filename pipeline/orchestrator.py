@@ -598,14 +598,29 @@ class FloorplanPipeline:
             debug_dir=output_dir,
             rotated_labels_in_image_coords=True,
         )
+        # Legit wall-length corrections of the prior estimate reach ~3×
+        # (case 11520: 0.28 → 0.87), but a >5× jump is never a correction —
+        # it means calibration latched onto junk, and an inflated scale
+        # blows up the cm-space room raster into an OOM kill downstream.
+        _max_scale_jump = 5.0
         if wl_ptcm is not None and 0.1 < wl_ptcm < 20.0:
-            logger.info("[%s] Wall-length calibration: pixels_to_cm %.4f -> %.4f",
-                        base_name, result.pixels_to_cm, wl_ptcm)
-            result.pixels_to_cm = wl_ptcm
-            result.pixel_scale = wl_ptcm / 100.0
-            self.config = self.config.copy_with(pixels_to_cm=wl_ptcm)
-            self.exporter.update_scale(wl_ptcm)
-            self.visualizer.pixels_to_cm = wl_ptcm
+            prior_ptcm = result.pixels_to_cm
+            jump = (max(wl_ptcm / prior_ptcm, prior_ptcm / wl_ptcm)
+                    if prior_ptcm > 0 else 1.0)
+            if jump > _max_scale_jump:
+                logger.warning(
+                    "[%s] Wall-length calibration REJECTED: pixels_to_cm "
+                    "%.4f -> %.4f is a %.1fx jump (max %.1fx) — keeping prior",
+                    base_name, prior_ptcm, wl_ptcm, jump, _max_scale_jump)
+                diag_out["scale"]["wall_length_jump_rejected"] = True
+            else:
+                logger.info("[%s] Wall-length calibration: pixels_to_cm %.4f -> %.4f",
+                            base_name, prior_ptcm, wl_ptcm)
+                result.pixels_to_cm = wl_ptcm
+                result.pixel_scale = wl_ptcm / 100.0
+                self.config = self.config.copy_with(pixels_to_cm=wl_ptcm)
+                self.exporter.update_scale(wl_ptcm)
+                self.visualizer.pixels_to_cm = wl_ptcm
         diag_out["scale"]["wall_length_ptcm"] = wl_ptcm
         diag_out["scale"]["stage1_final_ptcm"] = result.pixels_to_cm
 
@@ -1941,7 +1956,15 @@ class FloorplanPipeline:
             area_m2 = stacked_pairs[idx]['val']
             ratios.append(math.sqrt(area_px2 * (m_per_px ** 2) / area_m2))
 
-        if not ratios:
+        # A single matched room is too fragile a basis to rescale the whole
+        # plan: a leaked/merged polygon or an apartment-total label matched to
+        # one room skews sf by 1.5–2x (observed on plans 1 and 9).
+        if len(ratios) < 2:
+            if ratios:
+                logger.info(
+                    "Stacked-label scale calibration: only 1 matched room — "
+                    "skipping (need >= 2)",
+                )
             return None
 
         new_sf = float(np.median(ratios))
@@ -2013,7 +2036,15 @@ class FloorplanPipeline:
                 if _point_in_polygon(cx, cy, pts_px):
                     ratios.append(math.sqrt(area_px2 * (m_per_px ** 2) / area_val))
 
-        if not ratios:
+        # Same >= 2 samples rule as the stacked-label pass: one leaked room
+        # polygon must not rescale the plan (plan 1: sf 1.92 from the merged
+        # room-3+corridor polygon halved the apartment).
+        if len(ratios) < 2:
+            if ratios:
+                logger.info(
+                    "Room-polygon scale calibration: only 1 matched room — "
+                    "skipping (need >= 2)",
+                )
             return None
 
         new_sf = float(np.median(ratios))

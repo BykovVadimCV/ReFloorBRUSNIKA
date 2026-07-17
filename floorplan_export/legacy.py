@@ -1043,6 +1043,11 @@ class RoomDetector:
     contour simplification are restored.
     """
 
+    # Hard ceiling on raster area (px). 64M ≈ 8000×8000 keeps peak memory
+    # ~1 GB through the distance-transform/watershed passes; normal plans
+    # use <10M. Exceeding it coarsens self.resolution (see _rasterize_walls).
+    MAX_RASTER_PX = 64_000_000
+
     def __init__(
         self,
         resolution: float = 0.5,        # finer raster → sharper corners
@@ -1085,8 +1090,10 @@ class RoomDetector:
         # full opening footprint here guarantees a crisp cut.
         if openings:
             self._seal_openings(mask, openings, origin)
-        interior = self._extract_interior(mask)
-        # Separate rooms still joined through UNDETECTED doorways.
+        # Separate rooms joined through UNDETECTED doorways — including
+        # doorways to the OUTSIDE (entrance, stairs), which is why the neck
+        # cut must run on the full non-wall space before interior extraction
+        # rather than as an interior-only post-pass.
         if self.split_doorways:
             # Derive the doorway width from the detected doors themselves:
             # both door widths and room geometry come from px × pixels_to_cm,
@@ -1098,14 +1105,22 @@ class RoomDetector:
                 and o.width > 0
             ]
             if len(door_widths) >= 2:
-                derived = 1.5 * float(np.median(door_widths))
+                # Never go BELOW the config value: junk gap detections can be
+                # narrow slits (plan 1: 26 cm median → 39 cm neck would make
+                # real ~90 cm doorways unsplittable). The derived value only
+                # WIDENS the neck when detected doors are larger than the
+                # config assumes (the broken-large-scale case).
+                derived = max(self.max_doorway_cm,
+                              1.5 * float(np.median(door_widths)))
                 logger.info(
                     "RoomDetector: max_doorway derived from %d door(s): "
                     "%.0f cm (config %.0f cm)",
                     len(door_widths), derived, self.max_doorway_cm,
                 )
                 self.max_doorway_cm = derived
-            interior = self._split_at_necks(interior)
+            interior = self._extract_interior_with_neck_cut(mask)
+        else:
+            interior = self._extract_interior(mask)
         rooms = self._components_to_rooms(interior, origin, enclosed_labels, mask)
         logger.info(
             "RoomDetector: %d room(s) from flood-fill (split_doorways=%s, "
@@ -1565,6 +1580,23 @@ class RoomDetector:
         res = self.resolution
         w_px = int(math.ceil((max_x - min_x) / res)) + 1
         h_px = int(math.ceil((max_y - min_y) / res)) + 1
+        # A broken scale calibration can inflate the plan to tens of
+        # thousands of cm; at 0.5 cm/px the float32 distance transform and
+        # int32 watershed labels over that grid OOM-kill the whole batch
+        # (case 11520: ~42,000×17,000 px, >10 GB). Coarsen the resolution so
+        # the raster stays bounded — a degraded plan beats a dead batch.
+        # self.resolution must follow: every later cm↔px conversion
+        # (neck_px, simplify epsilon, room polygons) divides by it.
+        if w_px * h_px > self.MAX_RASTER_PX:
+            factor = math.sqrt((w_px * h_px) / self.MAX_RASTER_PX)
+            self.resolution = res = res * factor
+            w_px = int(math.ceil((max_x - min_x) / res)) + 1
+            h_px = int(math.ceil((max_y - min_y) / res)) + 1
+            logger.warning(
+                "RoomDetector: raster would exceed %d px — coarsened "
+                "resolution ×%.1f to %.2f cm/px (%dx%d px). Scale "
+                "calibration is likely broken for this plan.",
+                self.MAX_RASTER_PX, factor, res, w_px, h_px)
         mask = np.zeros((h_px, w_px), dtype=np.uint8)
 
         for wall in walls:
@@ -1601,27 +1633,72 @@ class RoomDetector:
         return mask, (min_x, min_y)
 
     # ---- flood-fill exterior, then interior = rooms ----
-    def _extract_interior(self, mask: np.ndarray) -> np.ndarray:
-        h, w = mask.shape
-        # Close wall-raster gaps before flood-fill so exterior doesn't leak in.
-        # Two passes: first closes single-pixel cracks, second closes gaps up to
-        # ~20 raster px wide (≈10 cm at resolution=0.5 cm/px).
-        # Union with original preserves existing wall pixels.
-        # min_room_area_cm2 in _components_to_rooms filters false rooms from
-        # over-aggressive closing.
+    @staticmethod
+    def _close_wall_gaps(mask: np.ndarray) -> np.ndarray:
+        """Close wall-raster gaps so exterior doesn't leak through cracks.
+
+        Two passes: first closes single-pixel cracks, second closes gaps up
+        to ~20 raster px wide (≈10 cm at resolution=0.5 cm/px). Union with
+        the original preserves existing wall pixels. min_room_area_cm2 in
+        _components_to_rooms filters false rooms from over-aggressive
+        closing.
+        """
         k5  = np.ones((5,  5),  dtype=np.uint8)
         k21 = np.ones((21, 21), dtype=np.uint8)
         sealed = cv2.morphologyEx(mask,   cv2.MORPH_CLOSE, k5,  iterations=1)
         sealed = cv2.morphologyEx(sealed, cv2.MORPH_CLOSE, k21, iterations=2)
-        # Union with original so no wall pixels are lost
-        sealed = cv2.bitwise_or(sealed, mask)
+        return cv2.bitwise_or(sealed, mask)
 
+    @staticmethod
+    def _flood_interior(sealed: np.ndarray) -> np.ndarray:
+        h, w = sealed.shape
         flood = sealed.copy()
         ff_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
         cv2.floodFill(flood, ff_mask, (0, 0), 128)
         # flood: 255 = wall, 128 = exterior, 0 = interior
-        interior = (flood == 0).astype(np.uint8) * 255
-        return interior
+        return (flood == 0).astype(np.uint8) * 255
+
+    def _extract_interior(self, mask: np.ndarray) -> np.ndarray:
+        return self._flood_interior(self._close_wall_gaps(mask))
+
+    def _extract_interior_with_neck_cut(self, mask: np.ndarray) -> np.ndarray:
+        """Extract interior after cutting door-width necks in the ENTIRE
+        non-wall space, exterior included.
+
+        A room joined to the OUTSIDE through an undetected doorway (entrance
+        door, stair passage) floods as exterior during interior extraction
+        and is lost before _split_at_necks can see it — on post_training
+        plan 3 that killed every room in the left half of the plan. Running
+        the same erode-core/watershed cut with the exterior as one more
+        basin severs those passages first, so the flood-fill stays out.
+        """
+        sealed = self._close_wall_gaps(mask)
+        res = self.resolution
+        neck_px = (self.max_doorway_cm / res) / 2.0
+        if neck_px >= 1:
+            non_wall = (sealed == 0).astype(np.uint8) * 255
+            dist = cv2.distanceTransform(non_wall, cv2.DIST_L2, 3)
+            cores = (dist > neck_px).astype(np.uint8) * 255
+            # The raster border is padding (60 cm beyond every wall), so it
+            # is exterior by construction. Force it to be a core: with a
+            # large derived neck the erosion could otherwise consume the
+            # whole exterior margin and leave the outside without a basin.
+            ring = np.zeros_like(cores)
+            ring[0, :] = ring[-1, :] = 255
+            ring[:, 0] = ring[:, -1] = 255
+            cores = cv2.bitwise_or(cores, cv2.bitwise_and(ring, non_wall))
+            n_cores, core_lbls = cv2.connectedComponents(cores)
+            if n_cores > 2:
+                markers = core_lbls.astype(np.int32)
+                markers[non_wall == 0] = n_cores
+                img3 = cv2.cvtColor(non_wall, cv2.COLOR_GRAY2BGR)
+                cv2.watershed(img3, markers)
+                ridge = (markers == -1).astype(np.uint8)
+                ridge = cv2.dilate(ridge, np.ones((3, 3), np.uint8),
+                                   iterations=2)
+                sealed = sealed.copy()
+                sealed[ridge > 0] = 255
+        return self._flood_interior(sealed)
 
     # ---- connected components → Room objects ----
     def _components_to_rooms(

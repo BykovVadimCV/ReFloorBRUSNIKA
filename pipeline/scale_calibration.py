@@ -22,6 +22,14 @@ from core.models import WallSegment
 
 logger = logging.getLogger(__name__)
 
+# Plausible cm-per-px band for a single label↔segment match. Plans are
+# upscaled to ≥1200 px long side before this runs, so real scales land well
+# under 5 cm/px; ratios outside the band mean the label was bracketed by the
+# wrong segment (case 11520: "3.50m" against a 10 px sliver → 36 cm/px,
+# which averaged with one good match OOM-killed the batch downstream).
+_CM_PER_PX_MIN = 0.1
+_CM_PER_PX_MAX = 5.0
+
 
 def _calibrate_scale_from_wall_lengths(
     img: np.ndarray,
@@ -304,6 +312,12 @@ def _calibrate_scale_from_wall_lengths(
         # cm = px * pixels_to_cm), so the ratio must be real length over
         # pixel length — NOT px/cm.
         cm_per_px = (length_m * 100.0) / seg_len_px
+        if not (_CM_PER_PX_MIN < cm_per_px < _CM_PER_PX_MAX):
+            logger.info("  label %.2fm -> wall line seg=[%.0f..%.0f] len=%.0fpx  "
+                        "=> cm/px=%.4f REJECTED (outside %.1f..%.1f band)",
+                        length_m, lo_bound, hi_bound, seg_len_px,
+                        cm_per_px, _CM_PER_PX_MIN, _CM_PER_PX_MAX)
+            continue
         logger.info("  label %.2fm -> wall line seg=[%.0f..%.0f] len=%.0fpx  "
                     "(%d members)  => cm/px=%.4f",
                     length_m, lo_bound, hi_bound, seg_len_px,
@@ -410,10 +424,19 @@ def _calibrate_scale_from_wall_lengths(
         return None
 
     # --- Outlier rejection: discard ratios >30% from median ----------------
+    # With an even count np.median averages the two middle values, so two
+    # mutually-disagreeing matches can BOTH land >30% from "their" median.
+    # That is not a consensus to salvage — averaging good and garbage is how
+    # case 11520 got 18.44 cm/px (0.87 good + 36.0 junk) and OOM-killed the
+    # batch. No agreement → no calibration; caller keeps the prior scale.
     med = float(np.median(ratios))
     filtered = [r for r in ratios if abs(r - med) / med < 0.30]
     if not filtered:
-        filtered = ratios  # keep all if everything would be rejected
+        logger.warning("Wall-length calibration: %d match(es) mutually "
+                       "disagree (ratios: %s) — no consensus, keeping prior "
+                       "scale", len(ratios),
+                       ", ".join(f"{r:.3f}" for r in ratios))
+        return None
     result = float(np.median(filtered))
     if len(filtered) < len(ratios):
         logger.info("Wall-length calibration: rejected %d/%d outlier(s)",
