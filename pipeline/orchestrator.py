@@ -1847,6 +1847,76 @@ class FloorplanPipeline:
             logger.warning("OCR text label extraction failed (non-fatal): %s", e)
         return []
 
+    @staticmethod
+    def _room_poly_info(rooms: List[Room], pixels_to_cm: float) -> List[dict]:
+        """Pixel-space polygon info + containment tree for scale calibration.
+
+        Returns one dict per usable room polygon: ``pts`` (px tuples),
+        ``area`` (px²), ``cx``/``cy`` (vertex centroid), ``parent`` (index of
+        the smallest strictly-larger polygon containing the centroid, or
+        None), ``children`` (indices), ``top`` (root of the containment
+        chain).  A polygon with children is an apartment outline or a merged
+        blob — never a single labeled room — and the tree is what lets the
+        calibrators tell the two apart.
+        """
+        polys: List[dict] = []
+        for room in rooms:
+            pts = [(p.x / pixels_to_cm, p.y / pixels_to_cm) for p in room.points]
+            if len(pts) < 3:
+                continue
+            area = _polygon_area_from_tuples(pts)
+            if area < 1.0:
+                continue
+            polys.append({
+                "pts": pts, "area": area,
+                "cx": sum(x for x, _ in pts) / len(pts),
+                "cy": sum(y for _, y in pts) / len(pts),
+                "parent": None, "children": [],
+            })
+        for i, p in enumerate(polys):
+            containers = [
+                j for j, q in enumerate(polys)
+                if j != i and q["area"] > p["area"]
+                and _point_in_polygon(p["cx"], p["cy"], q["pts"])
+            ]
+            if containers:
+                p["parent"] = min(containers, key=lambda j: polys[j]["area"])
+        for i, p in enumerate(polys):
+            if p["parent"] is not None:
+                polys[p["parent"]]["children"].append(i)
+        for i, p in enumerate(polys):
+            top, seen = i, set()
+            while polys[top]["parent"] is not None and top not in seen:
+                seen.add(top)
+                top = polys[top]["parent"]
+            p["top"] = top
+        return polys
+
+    @staticmethod
+    def _ratio_consensus(ratios: List[float], rel_tol: float = 0.15) -> List[float]:
+        """Largest subset of ratios that mutually agree within ±rel_tol.
+
+        Sorted-window scan: a window agrees when max <= min * (1 + 2*rel_tol).
+        Ties go to the tightest window.  Returns [] when fewer than 2 agree —
+        one ratio is never a consensus.
+        """
+        if len(ratios) < 2:
+            return []
+        s = sorted(ratios)
+        span = 1.0 + 2.0 * rel_tol
+        best: List[float] = []
+        best_spread = float("inf")
+        i = 0
+        for j in range(len(s)):
+            while s[j] > s[i] * span:
+                i += 1
+            win = s[i:j + 1]
+            spread = s[j] / s[i]
+            if len(win) > len(best) or (len(win) == len(best)
+                                        and spread < best_spread):
+                best, best_spread = win, spread
+        return best if len(best) >= 2 else []
+
     def _calibrate_scale_from_stacked_labels(
         self,
         ocr_text_labels: List[Tuple],
@@ -1930,21 +2000,20 @@ class FloorplanPipeline:
         m_per_px = pixels_to_cm / 100.0
         ratios: List[float] = []
 
-        for room in rooms:
-            pts_px = [
-                (p.x / pixels_to_cm, p.y / pixels_to_cm)
-                for p in room.points
-            ]
-            if len(pts_px) < 3:
-                continue
-            area_px2 = _polygon_area_from_tuples(pts_px)
-            if area_px2 < 1.0:
+        polys = self._room_poly_info(rooms, pixels_to_cm)
+        for p in polys:
+            # An outline/merged polygon (it contains other rooms) is never
+            # the room a stacked pair was printed for.  Single-apartment
+            # outlines slip past the exactly-one-integer rule below when
+            # only one room number is legible, and pair the whole apartment
+            # with one room's area.
+            if p["children"]:
                 continue
 
             # Collect all integer labels inside this room
             ints_in_room = [
                 (i, lb) for i, lb in enumerate(integer_labels)
-                if _point_in_polygon(lb['cx'], lb['cy'], pts_px)
+                if _point_in_polygon(lb['cx'], lb['cy'], p["pts"])
             ]
             # Rule: exactly one integer in the room, and it must be a stacked one
             if len(ints_in_room) != 1:
@@ -1954,23 +2023,27 @@ class FloorplanPipeline:
                 continue
 
             area_m2 = stacked_pairs[idx]['val']
-            ratios.append(math.sqrt(area_px2 * (m_per_px ** 2) / area_m2))
+            ratios.append(math.sqrt(p["area"] * (m_per_px ** 2) / area_m2))
 
         # A single matched room is too fragile a basis to rescale the whole
         # plan: a leaked/merged polygon or an apartment-total label matched to
-        # one room skews sf by 1.5–2x (observed on plans 1 and 9).
-        if len(ratios) < 2:
+        # one room skews sf by 1.5–2x (observed on plans 1 and 9).  Doorway-
+        # split fragments pair a partial polygon with a full room label, so
+        # the median runs over the largest agreeing cluster only.
+        cluster = self._ratio_consensus(ratios)
+        if len(cluster) < 2:
             if ratios:
                 logger.info(
-                    "Stacked-label scale calibration: only 1 matched room — "
-                    "skipping (need >= 2)",
+                    "Stacked-label scale calibration: no consensus among %d "
+                    "matched room(s) — skipping (need >= 2 agreeing)",
+                    len(ratios),
                 )
             return None
 
-        new_sf = float(np.median(ratios))
+        new_sf = float(np.median(cluster))
         logger.info(
-            "Stacked-label scale calibration from %d room(s): sf %.4f -> %.4f",
-            len(ratios), current_scale_factor, new_sf,
+            "Stacked-label scale calibration from %d/%d room(s): sf %.4f -> %.4f",
+            len(cluster), len(ratios), current_scale_factor, new_sf,
         )
         return new_sf
 
@@ -1990,12 +2063,26 @@ class FloorplanPipeline:
         total apartment area; this pass adjusts the XML scale_factor so that
         individual room polygons match the area labels printed on the plan.
 
-        The returned value is the median of sqrt(computed_area / ocr_area) over
-        all rooms where exactly one area label falls inside the polygon.  When
-        pixels_to_cm is already correct this evaluates to ≈ 1.0; when the
-        primary calibration was skipped it absorbs the full correction.
+        Three defenses, each against a failure mode that broke the 52-plan
+        brusnika batch (displayed areas at 0.22× their labels):
 
-        Returns the new scale_factor, or None if calibration cannot proceed.
+        1. A label pairs only with the SMALLEST polygon containing it.  Every
+           plan has an apartment-outline/merged polygon containing most room
+           labels; pairing them all with the outline flooded the median with
+           sqrt(outline_area / small_label) and sf overshot up to 35×.
+        2. The apartment-total label (OCR cannot tell it from a room area) is
+           detected per apartment by sum-consistency — a label equal to the
+           sum of the other labels in its containment group — and excluded.
+        3. Doorway-splitting invents rooms the plan's labels were never
+           written for.  Splitting moves area between child polygons but
+           never out of the apartment, so an apartment-level ratio over the
+           SUMMED leaf areas is immune to it; per-room pairs only count when
+           they agree with the largest consensus cluster of ratios.
+
+        The consensus median evaluates to ≈ 1.0 when pixels_to_cm is already
+        correct; when the primary calibration was skipped it absorbs the full
+        correction.  Returns the new scale_factor, or None when no two ratios
+        agree.
         """
         if not rooms or not ocr_text_labels:
             return None
@@ -2013,44 +2100,111 @@ class FloorplanPipeline:
         if not parsed:
             return None
 
+        polys = self._room_poly_info(rooms, pixels_to_cm)
+        if not polys:
+            return None
         m_per_px = pixels_to_cm / 100.0
-        ratios: List[float] = []
 
-        for room in rooms:
-            # Convert room points from cm back to pixel space
-            pts_px = [
-                (p.x / pixels_to_cm, p.y / pixels_to_cm)
-                for p in room.points
-            ]
-            if len(pts_px) < 3:
+        # Defense 1: label → smallest containing polygon.
+        host_labels: dict = {}  # poly index -> [area_m2, ...]
+        for area_val, cx, cy in parsed:
+            containers = [i for i, p in enumerate(polys)
+                          if _point_in_polygon(cx, cy, p["pts"])]
+            if not containers:
                 continue
-
-            area_px2 = _polygon_area_from_tuples(pts_px)
-            if area_px2 < 1.0:
-                continue
-
-            # Collect a ratio for every label whose centre lands in this room.
-            # Using all matched pairs (not just rooms with exactly one label)
-            # gives a more robust median across the whole floor plan.
-            for area_val, cx, cy in parsed:
-                if _point_in_polygon(cx, cy, pts_px):
-                    ratios.append(math.sqrt(area_px2 * (m_per_px ** 2) / area_val))
-
-        # Same >= 2 samples rule as the stacked-label pass: one leaked room
-        # polygon must not rescale the plan (plan 1: sf 1.92 from the merged
-        # room-3+corridor polygon halved the apartment).
-        if len(ratios) < 2:
-            if ratios:
-                logger.info(
-                    "Room-polygon scale calibration: only 1 matched room — "
-                    "skipping (need >= 2)",
-                )
+            host = min(containers, key=lambda i: polys[i]["area"])
+            host_labels.setdefault(host, []).append(area_val)
+        if not host_labels:
             return None
 
-        new_sf = float(np.median(ratios))
+        # Group label pairs per apartment (containment-tree root).
+        groups: dict = {}  # top index -> [(host, area_m2), ...]
+        for host, vals in host_labels.items():
+            for v in vals:
+                groups.setdefault(polys[host]["top"], []).append((host, v))
+
+        ratios: List[float] = []
+        n_totals = 0
+        for top, members in groups.items():
+            vals = [v for _, v in members]
+            # Candidate per-room ratios.  A polygon with children is an
+            # outline/merged blob, not the room a label was printed for —
+            # those members carry no ratio.
+            cand: List[Optional[float]] = []
+            for host, v in members:
+                if polys[host]["children"]:
+                    cand.append(None)
+                else:
+                    cand.append(
+                        math.sqrt(polys[host]["area"] * (m_per_px ** 2) / v))
+            prelim = self._ratio_consensus([c for c in cand if c is not None])
+
+            # Defense 2: apartment-total label.  A sum-match alone misfires
+            # on coincidences (rooms of 20 = 15 + 6 exist), so a label is the
+            # total only when all three hold: largest value in its group,
+            # ≈ sum of the rest (±12%), and its own pairing NOT already
+            # consistent with the other rooms' ratios.
+            total_idx = None
+            if len(members) >= 3:
+                s_all = sum(vals)
+                vmax = max(vals)
+                for k, v in enumerate(vals):
+                    rest = s_all - v
+                    if (v < vmax or rest <= 0
+                            or abs(v - rest) > 0.12 * max(v, rest)):
+                        continue
+                    if cand[k] is not None and cand[k] in prelim:
+                        continue
+                    total_idx = k
+                    n_totals += 1
+                    logger.info(
+                        "Room-polygon scale calibration: label %.1f m² ≈ "
+                        "sum of %d sibling label(s) %.1f m² and pairing is "
+                        "inconsistent — treated as apartment total, excluded",
+                        v, len(vals) - 1, rest,
+                    )
+                    break
+            room_label_sum = 0.0
+            n_room_labels = 0
+            for k, (host, v) in enumerate(members):
+                if k == total_idx:
+                    continue
+                room_label_sum += v
+                n_room_labels += 1
+                if cand[k] is not None:
+                    ratios.append(cand[k])
+            # Defense 3a: splitting-immune apartment-sum ratio.  Leaf areas
+            # include label-less artificial rooms, so the sum matches the
+            # label sum even when the neck cut carved real rooms up.
+            if polys[top]["children"] and n_room_labels >= 2:
+                leaf_area = sum(
+                    p["area"] for i, p in enumerate(polys)
+                    if p["top"] == top and i != top and not p["children"])
+                if leaf_area > 0:
+                    ratios.append(math.sqrt(
+                        leaf_area * (m_per_px ** 2) / room_label_sum))
+
+        if not ratios:
+            return None
+
+        # Defense 3b: fragment pairs and residual mislabels scatter; genuine
+        # pairs agree.  Median only over the largest agreeing cluster — and
+        # one lone ratio is never a basis to rescale the plan (plan 1:
+        # sf 1.92 from a merged room-3+corridor polygon halved the apartment).
+        cluster = self._ratio_consensus(ratios)
+        if len(cluster) < 2:
+            logger.info(
+                "Room-polygon scale calibration: no consensus among %d "
+                "ratio(s) — skipping",
+                len(ratios),
+            )
+            return None
+
+        new_sf = float(np.median(cluster))
         logger.info(
-            "Scale calibration from %d room(s): sf %.4f → %.4f",
-            len(ratios), current_scale_factor, new_sf,
+            "Scale calibration from rooms: %d/%d ratio(s) in consensus, "
+            "%d apartment total(s) excluded: sf %.4f → %.4f",
+            len(cluster), len(ratios), n_totals, current_scale_factor, new_sf,
         )
         return new_sf
 
