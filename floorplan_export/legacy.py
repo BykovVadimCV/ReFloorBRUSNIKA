@@ -61,6 +61,16 @@ def _assign_room_names_from_ocr(
     otherwise the largest numeric value inside the room is taken as its area
     and formatted as "<area> м²".  Rooms with no enclosed label keep their
     default "Room N" name.  Returns the number of rooms (re)named.
+
+    An apartment-total label (the printed sum of all room areas, e.g. a
+    header "137,8 м²") is excluded up front rather than let it attach to
+    whichever room happens to contain its centre: without this a room whose
+    polygon overlaps the total's position picks it up as "the largest
+    numeric value inside the room" and ships labeled with the whole
+    apartment's size instead of its own. Detected the same way as the
+    scale-calibration apartment-total defense (orchestrator.py
+    ``_calibrate_scale_from_rooms``): the largest numeric value across the
+    whole plan, when it is within ~12% of the sum of all the others.
     """
     if not rooms or not ocr_labels or not pixels_to_cm or pixels_to_cm <= 0:
         return 0
@@ -68,6 +78,24 @@ def _assign_room_names_from_ocr(
         from core.ocr_utils import parse_area_m2, is_numeric_ocr_label
     except Exception:
         return 0
+
+    # Pre-pass: find the apartment-total label (if any) so it's never used
+    # to size an individual room below.
+    all_areas: List[float] = []
+    for item in ocr_labels:
+        if len(item) < 5:
+            continue
+        text = str(item[0]).strip()
+        if text and is_numeric_ocr_label(text):
+            v = parse_area_m2(text)
+            if v is not None:
+                all_areas.append(v)
+    total_area: Optional[float] = None
+    if len(all_areas) >= 3:
+        vmax = max(all_areas)
+        rest = sum(all_areas) - vmax
+        if rest > 0 and abs(vmax - rest) <= 0.12 * max(vmax, rest):
+            total_area = vmax
 
     assigned = 0
     for room in rooms:
@@ -95,7 +123,11 @@ def _assign_room_names_from_ocr(
                     break
                 continue
             area_val = parse_area_m2(text)
-            if area_val is not None and (best_area is None or area_val > best_area):
+            if area_val is None:
+                continue
+            if total_area is not None and abs(area_val - total_area) < 1e-6:
+                continue  # apartment total — filtered, never a room's size
+            if best_area is None or area_val > best_area:
                 best_area = area_val
         if name_text is None and best_area is not None:
             name_text = f"{best_area:g} м²"
