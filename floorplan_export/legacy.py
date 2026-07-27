@@ -62,15 +62,28 @@ def _assign_room_names_from_ocr(
     and formatted as "<area> м²".  Rooms with no enclosed label keep their
     default "Room N" name.  Returns the number of rooms (re)named.
 
-    An apartment-total label (the printed sum of all room areas, e.g. a
-    header "137,8 м²") is excluded up front rather than let it attach to
-    whichever room happens to contain its centre: without this a room whose
-    polygon overlaps the total's position picks it up as "the largest
-    numeric value inside the room" and ships labeled with the whole
-    apartment's size instead of its own. Detected the same way as the
-    scale-calibration apartment-total defense (orchestrator.py
-    ``_calibrate_scale_from_rooms``): the largest numeric value across the
-    whole plan, when it is within ~12% of the sum of all the others.
+    Apartment-total filtering (why the whole-plan rectangle stops being sized
+    from the apartment's overall area):
+
+    An apartment-outline / merged-blob polygon geometrically contains every
+    room nested inside it — and therefore contains *every* label, including
+    the printed apartment total (a header like "137,8 м²").  Left alone it
+    grabs the largest numeric value in the plan (the total) and ships as one
+    big rectangular room labeled with the whole apartment's size.  Two
+    defenses, both ported from the scale calibrator
+    (orchestrator.py ``_room_poly_info`` / ``_calibrate_scale_from_rooms``):
+
+    1. Containment routing: every label is assigned to the *smallest* room
+       that contains it, so the labels printed for nested rooms land on those
+       rooms, never on the outline swallowing them.
+    2. A room that contains a smaller room is an outline/merged blob and is
+       never sized from a numeric label at all.  This is what drops the
+       apartment total, and — unlike a sum-of-siblings check — it does not
+       depend on every room label being OCR'd, so it holds on real plans
+       where some room labels are missing.
+
+    The sum-consistency check (largest value within ~12% of the sum of the
+    rest) is kept as a cheap secondary guard for the flat, no-outline case.
     """
     if not rooms or not ocr_labels or not pixels_to_cm or pixels_to_cm <= 0:
         return 0
@@ -79,17 +92,63 @@ def _assign_room_names_from_ocr(
     except Exception:
         return 0
 
-    # Pre-pass: find the apartment-total label (if any) so it's never used
-    # to size an individual room below.
+    # Per-room geometry + containment.  ``is_outline`` marks a polygon that
+    # contains the centroid of a strictly smaller room — an apartment outline
+    # or a merged blob, never a single labeled space.
+    infos: List[Optional[dict]] = []
+    for room in rooms:
+        pts = room.points
+        if len(pts) < 3:
+            infos.append(None)
+            continue
+        infos.append({
+            "area": _polygon_area(pts),
+            "cx": sum(p.x for p in pts) / len(pts),
+            "cy": sum(p.y for p in pts) / len(pts),
+            "is_outline": False,
+        })
+    for i, a in enumerate(infos):
+        if a is None:
+            continue
+        for j, b in enumerate(infos):
+            if b is None or i == j or a["area"] <= b["area"]:
+                continue
+            if _point_in_polygon(b["cx"], b["cy"], rooms[i].points):
+                a["is_outline"] = True
+                break
+
+    def _smallest_container(cx: float, cy: float) -> Optional[int]:
+        best: Optional[int] = None
+        best_area = 0.0
+        for idx, info in enumerate(infos):
+            if info is None:
+                continue
+            if _point_in_polygon(cx, cy, rooms[idx].points):
+                if best is None or info["area"] < best_area:
+                    best, best_area = idx, info["area"]
+        return best
+
+    # Route each label to the single smallest room that contains it.
+    room_labels: Dict[int, List[Tuple[str, bool, Optional[float]]]] = defaultdict(list)
     all_areas: List[float] = []
     for item in ocr_labels:
         if len(item) < 5:
             continue
         text = str(item[0]).strip()
-        if text and is_numeric_ocr_label(text):
-            v = parse_area_m2(text)
-            if v is not None:
-                all_areas.append(v)
+        if not text:
+            continue
+        num = is_numeric_ocr_label(text)
+        area_val = parse_area_m2(text) if num else None
+        if num and area_val is not None:
+            all_areas.append(area_val)
+        cx = ((float(item[1]) + float(item[3])) / 2.0) * pixels_to_cm
+        cy = ((float(item[2]) + float(item[4])) / 2.0) * pixels_to_cm
+        idx = _smallest_container(cx, cy)
+        if idx is None:
+            continue
+        room_labels[idx].append((text, num, area_val))
+
+    # Secondary guard for the flat (no-outline) case.
     total_area: Optional[float] = None
     if len(all_areas) >= 3:
         vmax = max(all_areas)
@@ -98,22 +157,14 @@ def _assign_room_names_from_ocr(
             total_area = vmax
 
     assigned = 0
-    for room in rooms:
-        if len(room.points) < 3:
+    for idx, room in enumerate(rooms):
+        info = infos[idx]
+        if info is None:
             continue
         name_text: Optional[str] = None
         best_area: Optional[float] = None
-        for item in ocr_labels:
-            if len(item) < 5:
-                continue
-            text = str(item[0]).strip()
-            if not text:
-                continue
-            cx = ((float(item[1]) + float(item[3])) / 2.0) * pixels_to_cm
-            cy = ((float(item[2]) + float(item[4])) / 2.0) * pixels_to_cm
-            if not _point_in_polygon(cx, cy, room.points):
-                continue
-            if not is_numeric_ocr_label(text):
+        for text, num, area_val in room_labels.get(idx, []):
+            if not num:
                 # A real room name ("Кухня", "Спальня"), not OCR shrapnel:
                 # watermark fragments and stray glyphs ('+', '€', 'Ba', 'L')
                 # otherwise win the priority race and ship as room names.
@@ -122,7 +173,8 @@ def _assign_room_names_from_ocr(
                     name_text = text      # real room name — highest priority
                     break
                 continue
-            area_val = parse_area_m2(text)
+            if info["is_outline"]:
+                continue  # outline/merged blob — never sized from a label
             if area_val is None:
                 continue
             if total_area is not None and abs(area_val - total_area) < 1e-6:
