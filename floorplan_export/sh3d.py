@@ -203,6 +203,8 @@ class SH3DExporter:
             max_doorway_cm=getattr(cfg, "room_max_doorway_cm", 110.0),
             split_by_labels=getattr(cfg, "room_split_by_labels", True),
             max_room_label_m2=getattr(cfg, "max_room_label_m2", 25.0),
+            min_room_width_cm=getattr(cfg, "room_min_width_cm", 60.0),
+            min_room_body_ratio=getattr(cfg, "room_min_body_ratio", 0.75),
             sanitize_geometry=getattr(
                 cfg, "enable_export_geometry_sanitation", True),
             min_wall_length_cm=getattr(cfg, "export_min_wall_length_cm", 10.0),
