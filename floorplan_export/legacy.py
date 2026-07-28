@@ -1169,8 +1169,6 @@ class RoomDetector:
         snap_tolerance_cm: float = 18.0,          # max snap distance
         split_doorways: bool = True,
         max_doorway_cm: float = 110.0,
-        min_room_width_cm: float = 60.0,
-        min_room_body_ratio: float = 0.75,
     ) -> None:
         self.resolution = resolution
         self.min_room_area_cm2 = min_room_area_cm2
@@ -1179,8 +1177,6 @@ class RoomDetector:
         self.snap_tolerance_cm = snap_tolerance_cm
         self.split_doorways = split_doorways
         self.max_doorway_cm = max_doorway_cm
-        self.min_room_width_cm = min_room_width_cm
-        self.min_room_body_ratio = min_room_body_ratio
 
     # ---- public API ----
     def detect(
@@ -1188,7 +1184,6 @@ class RoomDetector:
         walls: List[Wall],
         enclosed_labels: Optional[np.ndarray] = None,
         openings: Optional[List[Opening]] = None,
-        area_label_seeds: Optional[List[Tuple[float, float]]] = None,
     ) -> List[Room]:
         if len(walls) < 3:
             return []
@@ -1238,11 +1233,6 @@ class RoomDetector:
             interior = self._extract_interior_with_neck_cut(mask)
         else:
             interior = self._extract_interior(mask)
-        # A blob still holding several printed area labels was merged through a
-        # partition the wall mask missed entirely — no neck to cut, so the pass
-        # above cannot see it.  The labels themselves say where the rooms are.
-        if area_label_seeds:
-            interior = self._split_by_labels(interior, area_label_seeds, origin)
         rooms = self._components_to_rooms(interior, origin, enclosed_labels, mask)
         logger.info(
             "RoomDetector: %d room(s) from flood-fill (split_doorways=%s, "
@@ -1346,111 +1336,6 @@ class RoomDetector:
         cut = interior.copy()
         cut[ridge > 0] = 0
         return cut
-
-    # ---- split rooms merged through a missing partition ----
-    def _split_by_labels(
-        self,
-        interior: np.ndarray,
-        seeds_cm: List[Tuple[float, float]],
-        origin: Tuple[float, float],
-    ) -> np.ndarray:
-        """Re-cut interior blobs that contain more than one room-area label.
-
-        ``_split_at_necks`` separates rooms joined by a channel about one door
-        wide.  It cannot help when the partition between two rooms is simply
-        absent from the wall mask — thin drywall the segmenter under-detects,
-        or a wall broken by a hatch pattern — because then the two rooms share
-        a wide front and there is no neck to erode away.  That is the merge the
-        audit found in 12% of rooms: kitchen, living room and corridor in one
-        polygon.
-
-        The plan itself carries the missing evidence: one printed area label
-        per room.  A blob holding *k* labels is *k* rooms, so it is re-cut with
-        a watershed seeded at those labels, run over the inverted distance
-        transform so the ridge settles in the blob's narrowest waists — where
-        the missing partition stood — instead of halfway between the labels.
-
-        The cut is kept only if every resulting piece is a plausible room; a
-        label sitting in a corner (or a duplicated OCR read) would otherwise
-        shave a sliver off a correct polygon.
-        """
-        min_x, min_y = origin
-        res = self.resolution
-        h_px, w_px = interior.shape[:2]
-
-        pts: List[Tuple[int, int]] = []
-        for cx, cy in seeds_cm:
-            px = int((cx - min_x) / res)
-            py = int((cy - min_y) / res)
-            if 0 <= px < w_px and 0 <= py < h_px and interior[py, px] > 0:
-                pts.append((px, py))
-        if len(pts) < 2:
-            return interior
-
-        n_comp, comp_lbls = cv2.connectedComponents(interior)
-        by_comp: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
-        for px, py in pts:
-            by_comp[int(comp_lbls[py, px])].append((px, py))
-
-        min_area_px = self.min_room_area_cm2 / (res * res)
-        seed_r = max(1, int(round(20.0 / res)))     # 20 cm marker discs
-        result = interior
-        n_split = 0
-
-        for comp_id, comp_pts in by_comp.items():
-            if comp_id == 0 or len(comp_pts) < 2:
-                continue
-            comp = (comp_lbls == comp_id).astype(np.uint8) * 255
-            if int(np.count_nonzero(comp)) < 2 * min_area_px:
-                continue                    # too small to be several rooms
-
-            # Markers are the label discs and nothing else.  Giving the space
-            # outside the blob a marker of its own — the natural thing to do,
-            # and what the neck cut does — makes it a competing basin: against
-            # markers this small it floods in from the whole perimeter and the
-            # first ridge to form is a rim around the room, not a line between
-            # the rooms.  With no rival, the two seeds meet each other.
-            markers = np.zeros(comp.shape, np.int32)
-            for i, (px, py) in enumerate(comp_pts, start=1):
-                cv2.circle(markers, (px, py), seed_r, i, -1)
-
-            # Topography: high ground at the waists and along the walls, basins
-            # at the room bodies, so the two floods meet — and the ridge lands —
-            # at the narrowest passage between the labels, which is where the
-            # missing partition stood.
-            dist = cv2.distanceTransform(comp, cv2.DIST_L2, 3)
-            surface = cv2.normalize(dist, None, 0, 255,
-                                    cv2.NORM_MINMAX).astype(np.uint8)
-            surface = 255 - surface
-            cv2.watershed(cv2.cvtColor(surface, cv2.COLOR_GRAY2BGR), markers)
-
-            ridge = self._watershed_ridge(markers)
-            ridge = cv2.dilate(ridge, np.ones((3, 3), np.uint8), iterations=2)
-            candidate = comp.copy()
-            # Ridges outside the blob are between basins that spread over the
-            # walls; only the part crossing the blob is a cut.
-            candidate[(ridge > 0) & (comp > 0)] = 0
-
-            n_parts, part_lbls = cv2.connectedComponents(candidate)
-            parts = [int(np.count_nonzero(part_lbls == k))
-                     for k in range(1, n_parts)]
-            big = [a for a in parts if a >= min_area_px]
-            if len(big) < 2:
-                continue                    # cut produced no second real room
-            if sum(big) < 0.80 * int(np.count_nonzero(comp)):
-                continue                    # cut shredded the blob — discard
-
-            if result is interior:
-                result = interior.copy()
-            result[(comp > 0) & (candidate == 0)] = 0
-            n_split += 1
-
-        if n_split:
-            logger.info(
-                "RoomDetector: label-seeded split re-cut %d merged blob(s) "
-                "from %d room-area label(s)", n_split, len(pts),
-            )
-        return result
 
     # ---- wall geometry for snap ----
     @staticmethod
@@ -1878,25 +1763,10 @@ class RoomDetector:
 
     @staticmethod
     def _flood_interior(sealed: np.ndarray) -> np.ndarray:
-        """Interior = non-wall space not reachable from outside the raster.
-
-        Seeded from every free pixel on the raster border, not just (0, 0):
-        the raster is padded 60 cm beyond the outermost wall, so the whole
-        border is outdoors by construction, and a single blocked corner must
-        not be able to decide that there is no outdoors at all.  One blocked
-        corner used to do exactly that (see ``_watershed_ridge``), and the
-        outdoors then shipped as a room.
-        """
         h, w = sealed.shape
         flood = sealed.copy()
         ff_mask = np.zeros((h + 2, w + 2), dtype=np.uint8)
-        border = (
-            [(x, 0) for x in range(w)] + [(x, h - 1) for x in range(w)]
-            + [(0, y) for y in range(h)] + [(w - 1, y) for y in range(h)]
-        )
-        for x, y in border:
-            if flood[y, x] == 0:
-                cv2.floodFill(flood, ff_mask, (x, y), 128)
+        cv2.floodFill(flood, ff_mask, (0, 0), 128)
         # flood: 255 = wall, 128 = exterior, 0 = interior
         return (flood == 0).astype(np.uint8) * 255
 
@@ -1935,30 +1805,22 @@ class RoomDetector:
                 markers[non_wall == 0] = n_cores
                 img3 = cv2.cvtColor(non_wall, cv2.COLOR_GRAY2BGR)
                 cv2.watershed(img3, markers)
-                ridge = self._watershed_ridge(markers)
+                ridge = (markers == -1).astype(np.uint8)
+                # cv2.watershed always writes -1 along all four edges of the
+                # image — a boundary condition, not a detected ridge.  Sealed
+                # as wall it fences the raster in, so the exterior flood-fill
+                # below starts on a wall pixel and fills nothing; every non-wall
+                # pixel, outdoors included, then reaches _components_to_rooms as
+                # interior and the outdoors ships as one room covering the whole
+                # plan.  Dropping the frame affects nothing else: it lies in the
+                # 60 cm padding, far from any wall or room.
+                ridge[0, :] = ridge[-1, :] = 0
+                ridge[:, 0] = ridge[:, -1] = 0
                 ridge = cv2.dilate(ridge, np.ones((3, 3), np.uint8),
                                    iterations=2)
                 sealed = sealed.copy()
                 sealed[ridge > 0] = 255
         return self._flood_interior(sealed)
-
-    @staticmethod
-    def _watershed_ridge(markers: np.ndarray) -> np.ndarray:
-        """Watershed basin boundaries, without the frame around the raster.
-
-        ``cv2.watershed`` unconditionally writes -1 along all four edges of the
-        image, whatever the markers say — it is a boundary condition, not a
-        detected ridge.  Sealing it as wall walls the raster in: the exterior
-        flood-fill then starts on a wall pixel, fills nothing, and every
-        non-wall pixel — the outdoors included — is handed to the component
-        pass as interior.  With ``RETR_EXTERNAL`` discarding the building-shaped
-        hole, the outdoors comes back as one room covering the whole image.
-        That is the recurring "one big room across the entire plan".
-        """
-        ridge = (markers == -1).astype(np.uint8)
-        ridge[0, :] = ridge[-1, :] = 0
-        ridge[:, 0] = ridge[:, -1] = 0
-        return ridge
 
     # ---- connected components → Room objects ----
     def _components_to_rooms(
@@ -1987,17 +1849,18 @@ class RoomDetector:
                 enc_bool, (w_raster, h_raster), interpolation=cv2.INTER_NEAREST
             )
 
-        # Anything reachable from the raster edge is outdoors: the raster is
-        # padded 60 cm past the outermost wall, so no real room can touch it.
-        # This is the backstop for the exterior leak that _watershed_ridge and
-        # _flood_interior fix at source — cheap, and it cannot be defeated by
-        # whatever seals the border next.
+        # The one thing that is never a room: a component reachable from the
+        # raster edge.  The raster is padded 60 cm past the outermost wall, so
+        # nothing indoors can touch the border — anything that does is the
+        # outdoors, and `RETR_EXTERNAL` below would turn it into a single
+        # rectangle covering the whole plan (the recurring "one big room").
+        # It leaks in when the neck-cut watershed seals the raster frame as
+        # wall, which strands the exterior flood-fill on a wall pixel.
         border_labels = set(labels[0, :].tolist()) | set(labels[-1, :].tolist())
         border_labels |= set(labels[:, 0].tolist()) | set(labels[:, -1].tolist())
         border_labels.discard(0)
 
         rooms: List[Room] = []
-        n_exterior = n_sliver = 0
         for label_id in range(1, num_labels):
             component = (labels == label_id).astype(np.uint8) * 255
             area_px = int(np.sum(component > 0))
@@ -2006,30 +1869,10 @@ class RoomDetector:
                 continue
 
             if label_id in border_labels:
-                n_exterior += 1
                 logger.info(
                     "RoomDetector: dropped a %.1f m² component touching the "
                     "raster border — that is the outdoors, not a room",
                     area_cm2 / 10000.0,
-                )
-                continue
-
-            # Shape gate.  Area alone accepts a 9 cm-wide channel that winds
-            # for 50 m — the "onion" polygons: tens of metres of perimeter
-            # around a couple of m² of floor, self-crossing once simplified and
-            # snapped.  They come out of the raster as leftovers between two
-            # watershed cuts, never as a place anyone could stand.  A room has
-            # to be mostly *body*: floor within reach of a spot wide enough to
-            # stand in.  Real rooms score 0.96–1.00 here, corridors ~0.9;
-            # the onions score 0.00–0.19.
-            body = self._component_body_ratio(component)
-            if body < self.min_room_body_ratio:
-                n_sliver += 1
-                logger.info(
-                    "RoomDetector: dropped a %.1f m² sliver (body ratio %.2f "
-                    "< %.2f at %.0f cm width) — a winding channel, not a room",
-                    area_cm2 / 10000.0, body, self.min_room_body_ratio,
-                    self.min_room_width_cm,
                 )
                 continue
 
@@ -2070,54 +1913,7 @@ class RoomDetector:
                 name=f'Room {len(rooms) + 1}',
             ))
 
-        if n_exterior or n_sliver:
-            logger.info(
-                "RoomDetector: %d room(s) kept; rejected %d exterior "
-                "component(s) and %d sliver(s)",
-                len(rooms), n_exterior, n_sliver,
-            )
         return rooms
-
-    # ---- shape validity ----
-    def _component_body_ratio(self, component: np.ndarray) -> float:
-        """Fraction of a component that lies within reach of a standable spot.
-
-        "Body" = every pixel no farther than ``min_room_width_cm / 2`` from a
-        pixel that is itself at least that far from the component's edge.  It
-        is a morphological opening at that radius, computed with two distance
-        transforms so the cost is linear rather than kernel-sized.
-
-        1.0 means the component is a room-shaped blob; near 0 means it is
-        tendrils — a channel too narrow to stand in, however long it runs and
-        however much area that adds up to.  Cropped to the component's bounding
-        box, so it costs a pass over the room, not over the plan.
-        """
-        r_px = (self.min_room_width_cm / 2.0) / self.resolution
-        if r_px < 1.0:
-            return 1.0
-        ys, xs = np.nonzero(component)
-        if ys.size == 0:
-            return 0.0
-        pad = int(math.ceil(r_px)) + 2
-        y0, y1 = int(ys.min()), int(ys.max()) + 1
-        x0, x1 = int(xs.min()), int(xs.max()) + 1
-        sub = np.zeros((y1 - y0 + 2 * pad, x1 - x0 + 2 * pad), np.uint8)
-        sub[pad:pad + (y1 - y0), pad:pad + (x1 - x0)] = component[y0:y1, x0:x1]
-
-        # Distance to the component's own edge — the zero-padded border makes
-        # the crop's surroundings count as outside, which is what we want.
-        dist = cv2.distanceTransform(sub, cv2.DIST_L2, 5)
-        core = (dist > r_px).astype(np.uint8)
-        total = int(np.count_nonzero(sub))
-        if total == 0:
-            return 0.0
-        if not core.any():
-            return 0.0                     # nowhere in it is wide enough
-        # distanceTransform measures to the nearest ZERO pixel, so inverting
-        # the core turns it into "distance to the nearest standable spot".
-        to_core = cv2.distanceTransform(1 - core, cv2.DIST_L2, 5)
-        body = (to_core <= r_px) & (sub > 0)
-        return float(np.count_nonzero(body)) / float(total)
 
 
 # ============================================================
@@ -2281,10 +2077,7 @@ class SweetHome3DExporter:
         preserve_structural_geometry: bool = False,
         split_doorways: bool = True,
         max_doorway_cm: float = 110.0,
-        split_by_labels: bool = True,
         max_room_label_m2: float = 25.0,
-        min_room_width_cm: float = 60.0,
-        min_room_body_ratio: float = 0.75,
         sanitize_geometry: bool = True,
         min_wall_length_cm: float = 10.0,
         min_wall_thickness_cm: float = 3.0,
@@ -2299,10 +2092,7 @@ class SweetHome3DExporter:
         # Room-detector doorway-splitting knobs (threaded to RoomDetector below).
         self.split_doorways = split_doorways
         self.max_doorway_cm = max_doorway_cm
-        self.split_by_labels = split_by_labels
         self.max_room_label_m2 = max_room_label_m2
-        self.min_room_width_cm = min_room_width_cm
-        self.min_room_body_ratio = min_room_body_ratio
         # Plan-space (post-/scale_factor) dimension bounds enforced at XML write.
         self.sanitize_geometry = sanitize_geometry
         self.min_wall_length_cm = min_wall_length_cm
@@ -2382,11 +2172,6 @@ class SweetHome3DExporter:
                 "RoomDetector: sealing %d extra seal-only opening(s) "
                 "(not exported)", len(seal_only_openings),
             )
-        # Printed room-area labels double as "there is a separate room here"
-        # markers for the label-seeded split (see RoomDetector._split_by_labels).
-        room_area_seeds = (
-            self._room_area_seeds(ocr_labels) if self.split_by_labels else None
-        )
         rooms = RoomDetector(
             resolution=0.5,
             min_room_area_cm2=2000.0,
@@ -2395,11 +2180,8 @@ class SweetHome3DExporter:
             snap_tolerance_cm=18.0,
             split_doorways=self.split_doorways,
             max_doorway_cm=self.max_doorway_cm,
-            min_room_width_cm=self.min_room_width_cm,
-            min_room_body_ratio=self.min_room_body_ratio,
         ).detect(
             all_walls, enclosed_labels=enclosed_labels, openings=room_openings,
-            area_label_seeds=room_area_seeds,
         )
 
         _n_before_overlap = len(rooms)
@@ -2440,35 +2222,6 @@ class SweetHome3DExporter:
             )
             cv2.imwrite(debug_image_path, debug_img)
         return rooms
-
-    # ----- printed-area labels as room seeds -----
-    def _room_area_seeds(
-        self, ocr_labels: Optional[List],
-    ) -> List[Tuple[float, float]]:
-        """Centres (cm) of the OCR labels that mark a distinct labelled room.
-
-        Only per-room area labels qualify: a value above ``max_room_label_m2``
-        is the apartment total printed in the header and marks no room at all,
-        and seeding a blob with it would cut the plan at an arbitrary place.
-        """
-        if not ocr_labels:
-            return []
-        try:
-            from core.ocr_utils import parse_room_area_m2
-        except Exception:
-            return []
-        s = self.wall_converter.pixels_to_cm
-        seeds: List[Tuple[float, float]] = []
-        for item in ocr_labels:
-            if len(item) < 5:
-                continue
-            if parse_room_area_m2(str(item[0]).strip(),
-                                  self.max_room_label_m2) is None:
-                continue
-            cx = ((float(item[1]) + float(item[3])) / 2.0) * s
-            cy = ((float(item[2]) + float(item[4])) / 2.0) * s
-            seeds.append((cx, cy))
-        return seeds
 
     # ----- final plan-space geometry bounds -----
     def _sanitize_export_geometry(

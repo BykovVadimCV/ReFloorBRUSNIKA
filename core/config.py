@@ -272,31 +272,6 @@ class PipelineConfig:
     # over-split, so keep it near a real max door width.
     room_max_doorway_cm: float = 110.0
 
-    # Split a room blob that swallowed several labelled spaces.  The neck cut
-    # above only separates rooms joined through a *narrow* passage; when the
-    # partition between them is thin or broken in the wall mask there is no
-    # neck at all and kitchen + living + corridor come out as one polygon
-    # (audit 28.07.2026: 54/453 rooms = 12%).  The printed area labels say how
-    # many rooms are really in there, so a blob holding two or more of them is
-    # re-cut by a label-seeded watershed.
-    room_split_by_labels: bool = True
-
-    # Shape gate for a detected room (see RoomDetector._component_body_ratio).
-    # A room must be mostly floor you could stand on: at least
-    # `room_min_body_ratio` of its area within reach of a spot at least
-    # `room_min_width_cm` wide.  Without it, leftover channels between two
-    # watershed cuts pass the area filter — a 9 cm-wide strip winding for 50 m
-    # is 4.7 m² — and export as self-crossing "onion" polygons with a hundred
-    # metres of perimeter.
-    #
-    # Calibrated on plan 58002 and synthetic narrow spaces: at a 60 cm width
-    # its three onions score 0.00 / 0.14 / 0.64, its eight real rooms 0.98–1.00,
-    # and the tightest spaces that must survive — a 65 cm WC, a 90 cm corridor
-    # — score 0.90 and 0.98.  0.75 sits in the gap.  Widening the 60 cm figure
-    # closes on real bathrooms before it catches anything new.
-    room_min_width_cm: float = 60.0
-    room_min_body_ratio: float = 0.75
-
     # ============================================================
     # EXPORT
     # ============================================================
