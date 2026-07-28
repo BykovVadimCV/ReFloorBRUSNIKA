@@ -201,6 +201,19 @@ class SH3DExporter:
             preserve_structural_geometry=cfg.use_rect_walls,
             split_doorways=getattr(cfg, "room_split_doorways", True),
             max_doorway_cm=getattr(cfg, "room_max_doorway_cm", 110.0),
+            split_by_labels=getattr(cfg, "room_split_by_labels", True),
+            max_room_label_m2=getattr(cfg, "max_room_label_m2", 25.0),
+            sanitize_geometry=getattr(
+                cfg, "enable_export_geometry_sanitation", True),
+            min_wall_length_cm=getattr(cfg, "export_min_wall_length_cm", 10.0),
+            min_wall_thickness_cm=getattr(
+                cfg, "export_min_wall_thickness_cm", 3.0),
+            max_wall_thickness_cm=getattr(
+                cfg, "export_max_wall_thickness_cm", 50.0),
+            min_opening_width_cm=getattr(
+                cfg, "export_min_opening_width_cm", 50.0),
+            max_opening_width_cm=getattr(
+                cfg, "export_max_opening_width_cm", 250.0),
         )
 
     def update_scale(self, pixels_to_cm: float) -> None:

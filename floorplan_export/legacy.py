@@ -49,6 +49,7 @@ def _assign_room_names_from_ocr(
     rooms: List["Room"],
     ocr_labels: Optional[List],
     pixels_to_cm: float,
+    max_room_label_m2: float = 25.0,
 ) -> int:
     """
     Name each detected room from the OCR label(s) falling inside it.
@@ -84,11 +85,25 @@ def _assign_room_names_from_ocr(
 
     The sum-consistency check (largest value within ~12% of the sum of the
     rest) is kept as a cheap secondary guard for the flat, no-outline case.
+
+    3. A magnitude ceiling (``max_room_label_m2``).  Both defenses above are
+       structural — they need either a containment relation or the full set of
+       sibling labels to fire.  Neither holds on a plan whose rooms merged into
+       one blob, or where OCR read only the header, and those are exactly the
+       plans the audit caught shipping a 45–150 m² "room".  A printed value
+       above the ceiling is a total, whatever the geometry says.
+
+    Names, as opposed to areas, are filtered by ``looks_like_room_name``: the
+    old "3+ letters" rule admitted watermark and hatching shrapnel ("AAAA",
+    "UUV") as room names.  A room that ends up with neither a name nor an area
+    keeps its default "Room N".
     """
     if not rooms or not ocr_labels or not pixels_to_cm or pixels_to_cm <= 0:
         return 0
     try:
-        from core.ocr_utils import parse_area_m2, is_numeric_ocr_label
+        from core.ocr_utils import (
+            parse_area_m2, is_numeric_ocr_label, looks_like_room_name,
+        )
     except Exception:
         return 0
 
@@ -141,12 +156,24 @@ def _assign_room_names_from_ocr(
         area_val = parse_area_m2(text) if num else None
         if num and area_val is not None:
             all_areas.append(area_val)
+            if area_val > max_room_label_m2:
+                # Apartment total by magnitude — kept out of every room's
+                # candidate list entirely, so no polygon can be sized from it.
+                area_val = None
         cx = ((float(item[1]) + float(item[3])) / 2.0) * pixels_to_cm
         cy = ((float(item[2]) + float(item[4])) / 2.0) * pixels_to_cm
         idx = _smallest_container(cx, cy)
         if idx is None:
             continue
         room_labels[idx].append((text, num, area_val))
+
+    n_over_ceiling = sum(1 for a in all_areas if a > max_room_label_m2)
+    if n_over_ceiling:
+        logger.info(
+            "Room naming: %d/%d numeric label(s) above the %.0f m² room "
+            "ceiling — treated as apartment totals",
+            n_over_ceiling, len(all_areas), max_room_label_m2,
+        )
 
     # Secondary guard for the flat (no-outline) case.
     total_area: Optional[float] = None
@@ -166,10 +193,11 @@ def _assign_room_names_from_ocr(
         for text, num, area_val in room_labels.get(idx, []):
             if not num:
                 # A real room name ("Кухня", "Спальня"), not OCR shrapnel:
-                # watermark fragments and stray glyphs ('+', '€', 'Ba', 'L')
-                # otherwise win the priority race and ship as room names.
-                letters = sum(1 for ch in text if ch.isalpha())
-                if letters >= 3 or text.lower() in ("wc", "су", "с/у", "c/y"):
+                # watermark fragments, hatch strokes and stray glyphs
+                # ('+', '€', 'Ba', 'L', 'AAAA', 'UUV') otherwise win the
+                # priority race and ship as room names.
+                if (looks_like_room_name(text)
+                        or text.lower() in ("wc", "су", "с/у", "c/y")):
                     name_text = text      # real room name — highest priority
                     break
                 continue
@@ -1156,6 +1184,7 @@ class RoomDetector:
         walls: List[Wall],
         enclosed_labels: Optional[np.ndarray] = None,
         openings: Optional[List[Opening]] = None,
+        area_label_seeds: Optional[List[Tuple[float, float]]] = None,
     ) -> List[Room]:
         if len(walls) < 3:
             return []
@@ -1205,6 +1234,11 @@ class RoomDetector:
             interior = self._extract_interior_with_neck_cut(mask)
         else:
             interior = self._extract_interior(mask)
+        # A blob still holding several printed area labels was merged through a
+        # partition the wall mask missed entirely — no neck to cut, so the pass
+        # above cannot see it.  The labels themselves say where the rooms are.
+        if area_label_seeds:
+            interior = self._split_by_labels(interior, area_label_seeds, origin)
         rooms = self._components_to_rooms(interior, origin, enclosed_labels, mask)
         logger.info(
             "RoomDetector: %d room(s) from flood-fill (split_doorways=%s, "
@@ -1308,6 +1342,104 @@ class RoomDetector:
         cut = interior.copy()
         cut[ridge > 0] = 0
         return cut
+
+    # ---- split rooms merged through a missing partition ----
+    def _split_by_labels(
+        self,
+        interior: np.ndarray,
+        seeds_cm: List[Tuple[float, float]],
+        origin: Tuple[float, float],
+    ) -> np.ndarray:
+        """Re-cut interior blobs that contain more than one room-area label.
+
+        ``_split_at_necks`` separates rooms joined by a channel about one door
+        wide.  It cannot help when the partition between two rooms is simply
+        absent from the wall mask — thin drywall the segmenter under-detects,
+        or a wall broken by a hatch pattern — because then the two rooms share
+        a wide front and there is no neck to erode away.  That is the merge the
+        audit found in 12% of rooms: kitchen, living room and corridor in one
+        polygon.
+
+        The plan itself carries the missing evidence: one printed area label
+        per room.  A blob holding *k* labels is *k* rooms, so it is re-cut with
+        a watershed seeded at those labels, run over the inverted distance
+        transform so the ridge settles in the blob's narrowest waists — where
+        the missing partition stood — instead of halfway between the labels.
+
+        The cut is kept only if every resulting piece is a plausible room; a
+        label sitting in a corner (or a duplicated OCR read) would otherwise
+        shave a sliver off a correct polygon.
+        """
+        min_x, min_y = origin
+        res = self.resolution
+        h_px, w_px = interior.shape[:2]
+
+        pts: List[Tuple[int, int]] = []
+        for cx, cy in seeds_cm:
+            px = int((cx - min_x) / res)
+            py = int((cy - min_y) / res)
+            if 0 <= px < w_px and 0 <= py < h_px and interior[py, px] > 0:
+                pts.append((px, py))
+        if len(pts) < 2:
+            return interior
+
+        n_comp, comp_lbls = cv2.connectedComponents(interior)
+        by_comp: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+        for px, py in pts:
+            by_comp[int(comp_lbls[py, px])].append((px, py))
+
+        min_area_px = self.min_room_area_cm2 / (res * res)
+        seed_r = max(1, int(round(20.0 / res)))     # 20 cm marker discs
+        result = interior
+        n_split = 0
+
+        for comp_id, comp_pts in by_comp.items():
+            if comp_id == 0 or len(comp_pts) < 2:
+                continue
+            comp = (comp_lbls == comp_id).astype(np.uint8) * 255
+            if int(np.count_nonzero(comp)) < 2 * min_area_px:
+                continue                    # too small to be several rooms
+
+            markers = np.zeros(comp.shape, np.int32)
+            for i, (px, py) in enumerate(comp_pts, start=1):
+                cv2.circle(markers, (px, py), seed_r, i, -1)
+            # Applied after the seed discs so one that spilled over the blob
+            # edge cannot fight the background marker: the blob mask wins.
+            markers[comp == 0] = len(comp_pts) + 1
+
+            # Topography: high ground at the waists, basins at the room bodies,
+            # so the watershed line runs through the missing partition.
+            dist = cv2.distanceTransform(comp, cv2.DIST_L2, 3)
+            surface = cv2.normalize(dist, None, 0, 255,
+                                    cv2.NORM_MINMAX).astype(np.uint8)
+            surface = 255 - surface
+            cv2.watershed(cv2.cvtColor(surface, cv2.COLOR_GRAY2BGR), markers)
+
+            ridge = (markers == -1).astype(np.uint8)
+            ridge = cv2.dilate(ridge, np.ones((3, 3), np.uint8), iterations=2)
+            candidate = comp.copy()
+            candidate[ridge > 0] = 0
+
+            n_parts, part_lbls = cv2.connectedComponents(candidate)
+            parts = [int(np.count_nonzero(part_lbls == k))
+                     for k in range(1, n_parts)]
+            big = [a for a in parts if a >= min_area_px]
+            if len(big) < 2:
+                continue                    # cut produced no second real room
+            if sum(big) < 0.80 * int(np.count_nonzero(comp)):
+                continue                    # cut shredded the blob — discard
+
+            if result is interior:
+                result = interior.copy()
+            result[(comp > 0) & (candidate == 0)] = 0
+            n_split += 1
+
+        if n_split:
+            logger.info(
+                "RoomDetector: label-seeded split re-cut %d merged blob(s) "
+                "from %d room-area label(s)", n_split, len(pts),
+            )
+        return result
 
     # ---- wall geometry for snap ----
     @staticmethod
@@ -2020,6 +2152,14 @@ class SweetHome3DExporter:
         preserve_structural_geometry: bool = False,
         split_doorways: bool = True,
         max_doorway_cm: float = 110.0,
+        split_by_labels: bool = True,
+        max_room_label_m2: float = 25.0,
+        sanitize_geometry: bool = True,
+        min_wall_length_cm: float = 10.0,
+        min_wall_thickness_cm: float = 3.0,
+        max_wall_thickness_cm: float = 50.0,
+        min_opening_width_cm: float = 50.0,
+        max_opening_width_cm: float = 250.0,
     ) -> None:
         self.pixels_to_cm = pixels_to_cm
         self.wall_height = wall_height_cm
@@ -2028,6 +2168,15 @@ class SweetHome3DExporter:
         # Room-detector doorway-splitting knobs (threaded to RoomDetector below).
         self.split_doorways = split_doorways
         self.max_doorway_cm = max_doorway_cm
+        self.split_by_labels = split_by_labels
+        self.max_room_label_m2 = max_room_label_m2
+        # Plan-space (post-/scale_factor) dimension bounds enforced at XML write.
+        self.sanitize_geometry = sanitize_geometry
+        self.min_wall_length_cm = min_wall_length_cm
+        self.min_wall_thickness_cm = min_wall_thickness_cm
+        self.max_wall_thickness_cm = max_wall_thickness_cm
+        self.min_opening_width_cm = min_opening_width_cm
+        self.max_opening_width_cm = max_opening_width_cm
         # When True, structural wall endpoints/axes are NEVER modified after
         # conversion from rect dicts. Use this with the rect_decompose pipeline
         # so the exporter keeps every wall exactly where the decomposer put it.
@@ -2100,6 +2249,11 @@ class SweetHome3DExporter:
                 "RoomDetector: sealing %d extra seal-only opening(s) "
                 "(not exported)", len(seal_only_openings),
             )
+        # Printed room-area labels double as "there is a separate room here"
+        # markers for the label-seeded split (see RoomDetector._split_by_labels).
+        room_area_seeds = (
+            self._room_area_seeds(ocr_labels) if self.split_by_labels else None
+        )
         rooms = RoomDetector(
             resolution=0.5,
             min_room_area_cm2=2000.0,
@@ -2110,6 +2264,7 @@ class SweetHome3DExporter:
             max_doorway_cm=self.max_doorway_cm,
         ).detect(
             all_walls, enclosed_labels=enclosed_labels, openings=room_openings,
+            area_label_seeds=room_area_seeds,
         )
 
         _n_before_overlap = len(rooms)
@@ -2125,7 +2280,17 @@ class SweetHome3DExporter:
         # generic "Room N".  Falls back silently when no labels are available.
         _assign_room_names_from_ocr(
             rooms, ocr_labels, self.wall_converter.pixels_to_cm,
+            max_room_label_m2=self.max_room_label_m2,
         )
+
+        # Last gate before the file: drop/clamp geometry that cannot exist in a
+        # real apartment.  Runs here, not in cleanup_walls, because only now are
+        # the numbers in their final plan-space cm — cleanup_walls works in
+        # pixels, and door/window walls are injected after it anyway.
+        if self.sanitize_geometry:
+            all_walls, openings = self._sanitize_export_geometry(
+                all_walls, openings,
+            )
 
         xml = self.xml_generator.generate(
             walls=all_walls, openings=openings, rooms=rooms, name=output_path
@@ -2140,6 +2305,111 @@ class SweetHome3DExporter:
             )
             cv2.imwrite(debug_image_path, debug_img)
         return rooms
+
+    # ----- printed-area labels as room seeds -----
+    def _room_area_seeds(
+        self, ocr_labels: Optional[List],
+    ) -> List[Tuple[float, float]]:
+        """Centres (cm) of the OCR labels that mark a distinct labelled room.
+
+        Only per-room area labels qualify: a value above ``max_room_label_m2``
+        is the apartment total printed in the header and marks no room at all,
+        and seeding a blob with it would cut the plan at an arbitrary place.
+        """
+        if not ocr_labels:
+            return []
+        try:
+            from core.ocr_utils import parse_room_area_m2
+        except Exception:
+            return []
+        s = self.wall_converter.pixels_to_cm
+        seeds: List[Tuple[float, float]] = []
+        for item in ocr_labels:
+            if len(item) < 5:
+                continue
+            if parse_room_area_m2(str(item[0]).strip(),
+                                  self.max_room_label_m2) is None:
+                continue
+            cx = ((float(item[1]) + float(item[3])) / 2.0) * s
+            cy = ((float(item[2]) + float(item[4])) / 2.0) * s
+            seeds.append((cx, cy))
+        return seeds
+
+    # ----- final plan-space geometry bounds -----
+    def _sanitize_export_geometry(
+        self, walls: List[Wall], openings: List[Opening],
+    ) -> Tuple[List[Wall], List[Opening]]:
+        """Drop or clamp walls/openings that cannot exist in a real apartment.
+
+        Applied to plan-space cm — the values after the ``/scale_factor``
+        division that ``SH3DXMLGenerator`` performs — because that is what ends
+        up in the file and what the audit measured.  Bounds and their rationale
+        (28.07.2026 audit, defect catalogue rows 7 and 8):
+
+        * length < ``min_wall_length_cm`` (70/113 plans): decomposition crumbs
+          and zero-length stubs.  Dropped — a wall shorter than a hand span
+          holds nothing up and only makes the model harder to hand-edit.
+        * thickness outside ``[min, max]_wall_thickness_cm`` (39/113 too thin,
+          64/113 too fat): clamped, not dropped.  The wall is in the right
+          place; only its measured thickness is wrong, and removing it would
+          open a hole in the room boundary.
+        * opening width outside ``[min, max]_opening_width_cm`` (30/113 too
+          narrow, 21/113 too wide): clamped about the opening's own centre, so
+          an unopenable 30 cm door becomes a usable one and two windows fused
+          into a single 4 m hole shrink back to a plausible span.
+
+        Openings that lose their parent wall are dropped with it.
+        """
+        sf = getattr(self.xml_generator, 'scale_factor', 1.0) or 1.0
+
+        kept_walls: List[Wall] = []
+        n_short = n_thin = n_thick = 0
+        for w in walls:
+            if (w.length / sf) < self.min_wall_length_cm:
+                n_short += 1
+                continue
+            th_plan = w.thickness / sf
+            if th_plan < self.min_wall_thickness_cm:
+                w.thickness = self.min_wall_thickness_cm * sf
+                n_thin += 1
+            elif th_plan > self.max_wall_thickness_cm:
+                w.thickness = self.max_wall_thickness_cm * sf
+                n_thick += 1
+            kept_walls.append(w)
+
+        # Wall connectivity references (wallAtStart/wallAtEnd) must not point
+        # at a wall that no longer exists, or SweetHome3D drops the whole file.
+        live_ids = {w.wall_id for w in kept_walls}
+        for w in kept_walls:
+            if w.wall_at_start not in live_ids:
+                w.wall_at_start = None
+            if w.wall_at_end not in live_ids:
+                w.wall_at_end = None
+
+        kept_openings: List[Opening] = []
+        n_orphan = n_narrow = n_wide = 0
+        for o in openings:
+            if o.parent_wall_id is not None and o.parent_wall_id not in live_ids:
+                n_orphan += 1
+                continue
+            w_plan = o.width / sf
+            if w_plan < self.min_opening_width_cm:
+                o.width = self.min_opening_width_cm * sf
+                n_narrow += 1
+            elif w_plan > self.max_opening_width_cm:
+                o.width = self.max_opening_width_cm * sf
+                n_wide += 1
+            kept_openings.append(o)
+
+        if any((n_short, n_thin, n_thick, n_orphan, n_narrow, n_wide)):
+            logger.info(
+                "Export sanitation: dropped %d wall(s) under %.0f cm and %d "
+                "orphaned opening(s); clamped thickness on %d thin / %d thick "
+                "wall(s) and width on %d narrow / %d wide opening(s)",
+                n_short, self.min_wall_length_cm, n_orphan,
+                n_thin, n_thick, n_narrow, n_wide,
+            )
+        return kept_walls, kept_openings
 
     # ----- bbox-overlap gap bridging for door placement -----
     def _snap_doors_to_wall_gaps(

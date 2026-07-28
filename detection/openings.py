@@ -421,6 +421,7 @@ class OpeningPipeline:
                 img_size=cfg.unet_img_size,
                 confidence=cfg.unet_confidence,
                 min_door_area=cfg.unet_min_door_area,
+                min_window_area=getattr(cfg, "unet_min_window_area", None),
                 match_margin=getattr(cfg, "unet_door_match_margin", 40),
                 device=cfg.unet_device,
                 # Rect decomposition

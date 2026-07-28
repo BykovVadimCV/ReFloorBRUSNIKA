@@ -55,11 +55,44 @@ class PipelineConfig:
     # px * pixels_to_cm / sh3d_scale_factor) must land inside this band or the
     # scale factor is re-derived so the long side equals the fallback extent.
     # Guards against a failed calibration cascade shipping 36 m-wide (or 5 m)
-    # apartments. Band is generous: single rooms up to whole-floor plans.
+    # apartments.
+    #
+    # Lower bound is 7 m, not 4: the 113-plan audit (28.07.2026) found the whole
+    # 89%-median-area-error group sitting at a 3–5 m estimated long side against
+    # a real 10–15 m, and every one of them cleared a 4 m floor. A residential
+    # plan that reaches the exporter is at minimum a one-room flat with a hall
+    # and a bathroom — under 7 m end to end it is a broken scale, not a small
+    # apartment.
     enable_scale_sanity_gate: bool = True
-    scale_sanity_min_extent_m: float = 4.0
+    scale_sanity_min_extent_m: float = 7.0
     scale_sanity_max_extent_m: float = 30.0
     scale_sanity_fallback_extent_m: float = 12.0
+
+    # Every calibration candidate (stacked-label, room-polygon, area-sum) is
+    # replayed through the sanity band BEFORE it is accepted, so a bad source
+    # never reaches the exporter and the gate never has to guess after the fact.
+    validate_calibration_against_gate: bool = True
+
+    # Largest OCR value that can be a single room's area, in m².  Anything
+    # larger is the apartment-total stamp printed in the plan header — OCR
+    # cannot tell the two apart by appearance, and the audit found 152/695
+    # labels (22%) were totals that got adopted as room areas, shipping 45–150 m²
+    # "rooms".  Totals are excluded from room naming and from every scale
+    # calibrator; they are still usable as an apartment-level area sum.
+    max_room_label_m2: float = 25.0
+
+    # ============================================================
+    # EXPORT GEOMETRY SANITATION (plan-space cm, applied at XML write)
+    # ============================================================
+    # Bounds from the 28.07.2026 audit's defect catalogue.  Everything here is
+    # measured AFTER the /scale_factor division, i.e. on the numbers that
+    # actually land in the SH3D file.
+    enable_export_geometry_sanitation: bool = True
+    export_min_wall_length_cm: float = 10.0
+    export_min_wall_thickness_cm: float = 3.0
+    export_max_wall_thickness_cm: float = 50.0
+    export_min_opening_width_cm: float = 50.0
+    export_max_opening_width_cm: float = 250.0
 
     # Openings must sit on (or bridge a gap in) a wall: an opening whose
     # center is farther from every wall centerline than this factor times its
@@ -239,6 +272,15 @@ class PipelineConfig:
     # over-split, so keep it near a real max door width.
     room_max_doorway_cm: float = 110.0
 
+    # Split a room blob that swallowed several labelled spaces.  The neck cut
+    # above only separates rooms joined through a *narrow* passage; when the
+    # partition between them is thin or broken in the wall mask there is no
+    # neck at all and kitchen + living + corridor come out as one polygon
+    # (audit 28.07.2026: 54/453 rooms = 12%).  The printed area labels say how
+    # many rooms are really in there, so a blob holding two or more of them is
+    # re-cut by a label-seeded watershed.
+    room_split_by_labels: bool = True
+
     # ============================================================
     # EXPORT
     # ============================================================
@@ -367,12 +409,11 @@ class PipelineConfig:
     # ============================================================
     # PLAUSIBILITY VALIDATION
     # ============================================================
+    # NOTE: the wall/opening dimension bounds that used to live here were never
+    # read by any code path and disagreed with the ones actually enforced.  The
+    # live bounds are the ``export_*`` block under SCALE — they run at XML write
+    # time, on plan-space cm, which is the only place the numbers are final.
 
-    min_plausible_wall_thickness_cm: float = 5.0
-    max_plausible_wall_thickness_cm: float = 40.0
-    min_plausible_wall_length_cm: float = 10.0
-    min_plausible_opening_width_cm: float = 40.0
-    max_plausible_opening_width_cm: float = 200.0
     max_door_depth_cm: float = 15.0
     max_window_depth_cm: float = 15.0
     room_area_tolerance_ratio: float = 0.30

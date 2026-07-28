@@ -38,7 +38,8 @@ from core.models import BBox, Opening, OpeningType, WallSegment
 
 logger = logging.getLogger(__name__)
 
-# Door class index in the 4-class checkpoint
+# Class indices in the 4-class checkpoint (0=background, 1=wall)
+_WINDOW_CLASS = 2
 _DOOR_CLASS = 3
 
 # Confidence assigned to U-Net door openings (lower than YOLO/geo to let
@@ -613,6 +614,7 @@ class UNetDoorDetector:
         img_size: int = 1024,
         confidence: float = 0.5,
         min_door_area: int = 600,
+        min_window_area: Optional[int] = None,
         match_margin: int = 40,
         device: Optional[str] = None,
         # Rect decomposition
@@ -637,6 +639,8 @@ class UNetDoorDetector:
         self.img_size = img_size
         self.confidence = confidence
         self.min_door_area = min_door_area
+        self.min_window_area = (min_window_area if min_window_area is not None
+                                else min_door_area)
         self.match_margin = match_margin
         self.device = device
         self.use_rect_decompose = use_rect_decompose
@@ -664,6 +668,13 @@ class UNetDoorDetector:
         # result.walls so the SH3D exporter has a precise parent wall for
         # each door and never needs to guess or create a synthetic wall.
         self._debug_door_wall_segments: List[WallSegment] = []
+        # Window class from the same forward pass as the doors (see
+        # _run_inference / extract_window_bboxes).  Populated by detect().
+        self._window_mask: Optional[np.ndarray] = None
+        self.window_bboxes: List[Tuple[int, int, int, int]] = []
+        # Raw door blobs straight off the net, before enclosed-space refinement
+        # and decomposition — the "how much did the U-Net actually see" number.
+        self.raw_door_bboxes: List[Tuple[int, int, int, int]] = []
 
     # ------------------------------------------------------------------
     def initialize(self) -> bool:
@@ -735,9 +746,24 @@ class UNetDoorDetector:
         if self._model is None:
             return [], None
 
+        self._window_mask = None
+        self.window_bboxes = []
+        self.raw_door_bboxes = []
+
         door_mask = self._run_inference(img_bgr)
+        # Windows come from the same forward pass, so they are harvested even
+        # when the checkpoint has no door class and door detection bails below.
+        self.window_bboxes = self._extract_window_bboxes(img_bgr, wall_mask)
         if door_mask is None:
             return [], None
+        self.raw_door_bboxes = [
+            (int(x), int(y), int(x + w), int(y + h))
+            for x, y, w, h in (
+                cv2.boundingRect(c) for c in cv2.findContours(
+                    door_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]
+            )
+            if w * h >= self.min_door_area
+        ]
 
         # Refine door mask using enclosed-space analysis: fill regions that are
         # mostly door-class and have no OCR label; clear all others so
@@ -840,6 +866,57 @@ class UNetDoorDetector:
         return doors, door_mask
 
     # ------------------------------------------------------------------
+    def _extract_window_bboxes(
+        self,
+        img_bgr: np.ndarray,
+        wall_mask: Optional[np.ndarray] = None,
+    ) -> List[Tuple[int, int, int, int]]:
+        """Window bboxes from the window class of the last forward pass.
+
+        Runs the same post-processing chain the standalone U-Net path uses for
+        windows (merge neighbours across mullions, drop nested boxes, require a
+        wall to sit on, validate the aspect/size, clip to enclosed regions), so
+        the boxes are interchangeable with that path's output.  Returns an
+        empty list for checkpoints without a window class.
+        """
+        if self._window_mask is None or not self._window_mask.any():
+            return []
+        try:
+            from detection.unet_inference import (
+                extract_opening_bboxes, merge_nearby_windows,
+                remove_nested_openings, filter_standalone_openings,
+                validate_windows, clip_openings_to_enclosed_regions,
+            )
+        except Exception as exc:
+            logger.warning("UNetDoorDetector: window post-processing "
+                           "unavailable (%s)", exc)
+            return []
+
+        try:
+            wm = (self._window_mask > 0).astype(np.uint8)
+            if wall_mask is not None and wall_mask.shape[:2] == wm.shape[:2]:
+                wall_binary = (wall_mask > 0).astype(np.uint8) * 255
+            else:
+                wall_binary = None
+
+            boxes = extract_opening_bboxes(wm, min_area=self.min_window_area)
+            if wall_binary is not None:
+                boxes = merge_nearby_windows(
+                    boxes, (wall_binary > 0).astype(np.uint8), max_gap=20)
+            boxes = remove_nested_openings(boxes)
+            if wall_binary is not None:
+                boxes = filter_standalone_openings(boxes, wall_binary)
+                boxes = validate_windows(boxes, wall_binary)
+            boxes = clip_openings_to_enclosed_regions(
+                boxes, cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+            logger.info("UNetDoorDetector: %d window bbox(es) from the window "
+                        "class", len(boxes))
+            return [tuple(int(v) for v in b) for b in boxes]
+        except Exception as exc:
+            logger.warning("UNetDoorDetector: window extraction failed: %s", exc)
+            return []
+
+    # ------------------------------------------------------------------
     def _run_inference(self, img_bgr: np.ndarray) -> Optional[np.ndarray]:
         """
         Run the 4-class U-Net and return a binary door mask (uint8, 255=door)
@@ -867,6 +944,16 @@ class UNetDoorDetector:
             pred_full = cv2.resize(
                 pred_np.astype(np.uint8), (w_orig, h_orig),
                 interpolation=cv2.INTER_NEAREST,
+            )
+
+            # The window class comes free with this forward pass.  It used to be
+            # thrown away, and because the only other place the 4-class net ran
+            # was a branch the default wall path never takes, the pipeline
+            # shipped with no U-Net window evidence at all — every window in the
+            # 28.07.2026 audit came from the heuristic detector alone.
+            self._window_mask = (
+                (pred_full == _WINDOW_CLASS).astype(np.uint8) * 255
+                if self._num_classes >= 3 else None
             )
 
             # Extract door class only (valid when checkpoint has ≥ 4 classes)

@@ -686,8 +686,27 @@ class FloorplanPipeline:
                 "gaps": sum(1 for o in openings
                             if o.opening_type == OpeningType.GAP),
             }
+            # The 4-class U-Net that the OpeningPipeline runs for doors also
+            # predicts windows, and on the default rect-wall path it is the ONLY
+            # place that net runs: `_try_unet_detection` below sits behind
+            # `_legacy_walls_active`, so with rect walls working — i.e. always —
+            # its door/window bboxes were empty for every plan (audit: 113/113
+            # with unet_raw = 0/0, windows resting on the heuristic detector
+            # alone).  Harvesting them here costs no extra inference.
+            _unet_det = getattr(
+                self.opening_detector, '_unet_door_detector', None)
+            _unet_doors_seen = len(unet_door_bboxes or [])
+            if _unet_det is not None:
+                _det_windows = list(getattr(_unet_det, 'window_bboxes', []) or [])
+                _unet_doors_seen += len(
+                    getattr(_unet_det, 'raw_door_bboxes', []) or [])
+                # Doors from this detector are already merged into `openings` by
+                # the OpeningPipeline; only the windows are new here.
+                if _det_windows:
+                    unet_window_bboxes = list(unet_window_bboxes or [])
+                    unet_window_bboxes.extend(_det_windows)
             diag_out["openings"]["unet_raw"] = {
-                "doors": len(unet_door_bboxes or []),
+                "doors": _unet_doors_seen,
                 "windows": len(unet_window_bboxes or []),
             }
 
@@ -880,24 +899,52 @@ class FloorplanPipeline:
         # Falls back to standard room-polygon calibration.
         if result.rooms and ocr_text_labels:
             logger.info("[%s] Stage 4b: Scale calibration from rooms", base_name)
-            new_sf = self._calibrate_scale_from_stacked_labels(
-                ocr_text_labels=ocr_text_labels,
-                rooms=result.rooms,
-                pixels_to_cm=result.pixels_to_cm,
-                current_scale_factor=self.config.sh3d_scale_factor,
-            )
-            _sf_source = "stacked_labels" if new_sf is not None else None
-            if new_sf is None:
-                new_sf = self._calibrate_scale_from_rooms(
+            # Order matters. The stacked-label rule used to run first because it
+            # is the more specific pattern, but it was the least reliable source
+            # in practice: in the 113-plan audit all 5 plans it fired on landed
+            # in the reject pile (87% median area error) while room_polygons
+            # produced 3.6%. It now only runs when the general rule found no
+            # consensus, and — like every source here — its answer must survive
+            # the same plausibility band the sanity gate applies.
+            _candidates = [
+                ("room_polygons", lambda: self._calibrate_scale_from_rooms(
                     rooms=result.rooms,
                     ocr_text_labels=ocr_text_labels,
                     pixels_to_cm=result.pixels_to_cm,
                     current_scale_factor=self.config.sh3d_scale_factor,
-                )
-                if new_sf is not None:
-                    _sf_source = "room_polygons"
+                )),
+                ("stacked_labels", lambda: self._calibrate_scale_from_stacked_labels(
+                    ocr_text_labels=ocr_text_labels,
+                    rooms=result.rooms,
+                    pixels_to_cm=result.pixels_to_cm,
+                    current_scale_factor=self.config.sh3d_scale_factor,
+                )),
+            ]
+            new_sf = None
+            _sf_source = None
+            _rejected: List[str] = []
+            for _name, _fn in _candidates:
+                _cand = _fn()
+                if _cand is None:
+                    continue
+                _ok, _ext = self._sf_within_band(
+                    result.walls, result.pixels_to_cm, _cand)
+                if not _ok:
+                    _rejected.append(f"{_name}({_cand:.4f}→{_ext:.1f}m)")
+                    logger.warning(
+                        "[%s] Stage 4b: %s proposed sf=%.4f — plan long side "
+                        "would be %.1f m, outside [%.1f, %.1f]; rejected",
+                        base_name, _name, _cand, _ext,
+                        self.config.scale_sanity_min_extent_m,
+                        self.config.scale_sanity_max_extent_m,
+                    )
+                    continue
+                new_sf, _sf_source = _cand, _name
+                break
             diag_out["scale"]["stage4b_sf"] = new_sf
             diag_out["scale"]["stage4b_source"] = _sf_source
+            if _rejected:
+                diag_out["scale"]["stage4b_rejected"] = _rejected
             if new_sf is not None and abs(new_sf - self.config.sh3d_scale_factor) > 1e-4:
                 # Update the XML generator's scale_factor
                 inner_exp = getattr(self.exporter, '_inner', None)
@@ -941,16 +988,55 @@ class FloorplanPipeline:
             diag_out["scale"]["gate"] = {"extent_m": round(ext_m, 2),
                                      "in_band": bool(lo <= ext_m <= hi)}
             if ext_px > 0 and not (lo <= ext_m <= hi):
-                target_m = self.config.scale_sanity_fallback_extent_m
-                new_sf = ext_px * result.pixels_to_cm / (target_m * 100.0)
-                diag_out["scale"]["gate"]["forced_sf"] = round(new_sf, 4)
-                logger.warning(
-                    "[%s] Scale sanity gate: plan long side %.1f m outside "
-                    "[%.1f, %.1f] m (pixels_to_cm=%.4f, sf=%.4f) — forcing "
-                    "sf -> %.4f (assumed %.1f m long side)",
-                    base_name, ext_m, lo, hi, result.pixels_to_cm, sf_cur,
-                    new_sf, target_m,
+                # Last resort, in order of how much the plan itself supports it.
+                #
+                # 1. Apartment area.  The total-area stamp — useless for sizing
+                #    a single room, and discarded everywhere else for exactly
+                #    that reason — is a direct measurement of the whole flat, so
+                #    matching the summed room polygons against it recovers the
+                #    true scale.  Falls back to the sum of the room labels when
+                #    no stamp was read.
+                # 2. Assumed long side.  A blind constant: it puts the plan in
+                #    the right order of magnitude and nothing more (median area
+                #    error 110% on the audit's 7 plans).  Reached only when the
+                #    plan carries no usable area label at all.
+                new_sf = self._calibrate_scale_from_area_sum(
+                    rooms=result.rooms,
+                    ocr_text_labels=ocr_text_labels,
+                    pixels_to_cm=result.pixels_to_cm,
                 )
+                _forced_ok = False
+                if new_sf is not None:
+                    _forced_ok, _forced_ext = self._sf_within_band(
+                        result.walls, result.pixels_to_cm, new_sf)
+                    if not _forced_ok:
+                        logger.warning(
+                            "[%s] Scale sanity gate: apartment-area rescale "
+                            "sf=%.4f still gives a %.1f m long side — discarded",
+                            base_name, new_sf, _forced_ext,
+                        )
+                if _forced_ok:
+                    diag_out["scale"]["gate"]["forced_source"] = "apartment_area"
+                    logger.warning(
+                        "[%s] Scale sanity gate: plan long side %.1f m outside "
+                        "[%.1f, %.1f] m (pixels_to_cm=%.4f, sf=%.4f) — rescaled "
+                        "from the apartment area: sf -> %.4f",
+                        base_name, ext_m, lo, hi, result.pixels_to_cm, sf_cur,
+                        new_sf,
+                    )
+                else:
+                    target_m = self.config.scale_sanity_fallback_extent_m
+                    new_sf = ext_px * result.pixels_to_cm / (target_m * 100.0)
+                    diag_out["scale"]["gate"]["forced_source"] = "assumed_extent"
+                    logger.warning(
+                        "[%s] Scale sanity gate: plan long side %.1f m outside "
+                        "[%.1f, %.1f] m (pixels_to_cm=%.4f, sf=%.4f) — no usable "
+                        "area label; forcing sf -> %.4f (assumed %.1f m long "
+                        "side). Areas on this plan are a guess.",
+                        base_name, ext_m, lo, hi, result.pixels_to_cm, sf_cur,
+                        new_sf, target_m,
+                    )
+                diag_out["scale"]["gate"]["forced_sf"] = round(new_sf, 4)
                 inner_exp = getattr(self.exporter, '_inner', None)
                 if inner_exp is not None:
                     inner_exp.xml_generator.scale_factor = new_sf
@@ -978,6 +1064,32 @@ class FloorplanPipeline:
                     "(pixels_to_cm=%.4f, sf=%.4f)",
                     base_name, ext_m, result.pixels_to_cm, sf_cur,
                 )
+
+        # ── Stage 4b3: Publish the accept/reject verdict ───────────────────
+        # The audit's finding worth acting on: the bad plans separate perfectly
+        # from the good ones using fields the pipeline already computes, with no
+        # ground truth and no human. Rather than making every consumer re-derive
+        # that rule from scattered diag fields, the pipeline states its own
+        # verdict — accepted plans are the ~73% whose median area error is 3.6%,
+        # rejected ones the group that needs a human before it is used.
+        _scale_diag = diag_out.get("scale", {})
+        _reasons: List[str] = []
+        if _scale_diag.get("stage4b_source") is None:
+            _reasons.append("no_calibration_source")
+        elif _scale_diag.get("stage4b_source") != "room_polygons":
+            _reasons.append(
+                f"weak_source:{_scale_diag['stage4b_source']}")
+        if not _scale_diag.get("gate", {}).get("in_band", True):
+            _reasons.append("extent_out_of_band")
+        _scale_diag["accepted"] = not _reasons
+        _scale_diag["reject_reasons"] = _reasons
+        if _reasons:
+            logger.warning(
+                "[%s] Scale verdict: NEEDS REVIEW (%s) — areas on this plan "
+                "are not trustworthy", base_name, ", ".join(_reasons),
+            )
+        else:
+            logger.info("[%s] Scale verdict: accepted", base_name)
 
         # ── Stage 4c: Room area validation (diagnostic only) ──────────────
         if result.rooms and ocr_text_labels:
@@ -1917,6 +2029,110 @@ class FloorplanPipeline:
                 best, best_spread = win, spread
         return best if len(best) >= 2 else []
 
+    def _sf_within_band(
+        self,
+        walls: List[WallSegment],
+        pixels_to_cm: float,
+        sf: float,
+    ) -> Tuple[bool, float]:
+        """Would *sf* put the plan's long side inside the sanity band?
+
+        Returns ``(ok, extent_m)``.  This is the same measurement the Stage 4b2
+        gate makes after the fact; running it on each *candidate* is what stops
+        a bad calibration source from being adopted in the first place, so the
+        gate no longer has to undo it with a guess.  Answers ``True`` when
+        there is nothing to measure or the check is disabled — the caller then
+        keeps its existing behaviour.
+        """
+        if not walls or sf is None or sf <= 0:
+            return True, 0.0
+        if not getattr(self.config, "validate_calibration_against_gate", True):
+            return True, 0.0
+        if not self.config.enable_scale_sanity_gate:
+            return True, 0.0
+        xs = [c for w in walls for c in (w.bbox.x1, w.bbox.x2)]
+        ys = [c for w in walls for c in (w.bbox.y1, w.bbox.y2)]
+        ext_px = float(max(max(xs) - min(xs), max(ys) - min(ys)))
+        if ext_px <= 0:
+            return True, 0.0
+        ext_m = ext_px * pixels_to_cm / sf / 100.0
+        lo = self.config.scale_sanity_min_extent_m
+        hi = self.config.scale_sanity_max_extent_m
+        return bool(lo <= ext_m <= hi), ext_m
+
+    def _calibrate_scale_from_area_sum(
+        self,
+        rooms: List[Room],
+        ocr_text_labels: Optional[List[Tuple]],
+        pixels_to_cm: float,
+    ) -> Optional[float]:
+        """Scale factor from the apartment's total floor area.
+
+        Used only as the sanity gate's last resort, where per-room pairing has
+        already failed and the alternative is assuming a long side outright.
+        It needs no correspondence between individual labels and polygons —
+        just two totals:
+
+        * the apartment's real area: the total stamp when one was printed
+          (the largest label above the room ceiling), otherwise the sum of the
+          room labels;
+        * its measured area: the summed leaf polygons, which is immune to the
+          doorway splitting and room merging that wreck per-room pairs because
+          area only moves *between* leaves, never out of the apartment.
+
+        Only the largest containment group is used, so a plan sheet carrying
+        several flats is scaled from the one the polygons mostly describe.
+        """
+        if not rooms or not ocr_text_labels or pixels_to_cm <= 0:
+            return None
+        max_label = getattr(self.config, "max_room_label_m2", 25.0)
+
+        room_vals: List[float] = []
+        total_vals: List[float] = []
+        for item in ocr_text_labels:
+            if len(item) < 5:
+                continue
+            area = _parse_ocr_area_m2(str(item[0]))
+            if area is None or area < 1.0:
+                continue
+            (total_vals if area > max_label else room_vals).append(area)
+
+        if total_vals:
+            apartment_m2 = max(total_vals)
+        elif len(room_vals) >= 3:
+            apartment_m2 = sum(room_vals)
+        else:
+            return None
+        if apartment_m2 <= 0:
+            return None
+
+        polys = self._room_poly_info(rooms, pixels_to_cm)
+        if not polys:
+            return None
+        by_top: dict = {}
+        for i, p in enumerate(polys):
+            by_top.setdefault(p["top"], []).append(i)
+        best_top = max(
+            by_top,
+            key=lambda t: sum(polys[i]["area"] for i in by_top[t]
+                              if not polys[i]["children"]),
+        )
+        leaf_area_px2 = sum(polys[i]["area"] for i in by_top[best_top]
+                            if not polys[i]["children"])
+        if leaf_area_px2 <= 0:
+            return None
+
+        m_per_px = pixels_to_cm / 100.0
+        new_sf = math.sqrt(leaf_area_px2 * (m_per_px ** 2) / apartment_m2)
+        logger.info(
+            "Apartment-area scale calibration: %.1f m² (%s) against %d leaf "
+            "polygon(s) → sf %.4f",
+            apartment_m2, "total stamp" if total_vals else "sum of room labels",
+            sum(1 for i in by_top[best_top] if not polys[i]["children"]),
+            new_sf,
+        )
+        return new_sf
+
     def _calibrate_scale_from_stacked_labels(
         self,
         ocr_text_labels: List[Tuple],
@@ -1988,8 +2204,11 @@ class FloorplanPipeline:
                 # Decimal below must be numerically larger than integer above
                 if b['val'] <= a['val']:
                     continue
-                # Decimal must be in a sane room-area range
-                if not (1.0 <= b['val'] <= 300.0):
+                # Decimal must be a plausible single-room area.  The old 300 m²
+                # ceiling let the apartment total pair with whatever integer
+                # happened to sit above it in the header block.
+                if not (1.0 <= b['val']
+                        <= getattr(self.config, "max_room_label_m2", 25.0)):
                     continue
                 stacked_pairs[i] = b
                 break
@@ -2087,16 +2306,32 @@ class FloorplanPipeline:
         if not rooms or not ocr_text_labels:
             return None
 
-        # Parse area values from every OCR word
+        # Parse area values from every OCR word.  The upper bound is the
+        # room-label ceiling, not a generic sanity cap: a value above it is the
+        # apartment total, and defense 2 below can only catch a total when the
+        # whole sibling set was OCR'd.  On a plan where it was not, an
+        # unfiltered 137,8 m² total paired with one polygon moves sf by ~2.5×.
+        max_label = getattr(self.config, "max_room_label_m2", 25.0)
         parsed: List[Tuple[float, float, float]] = []  # (area_m2, cx, cy)
+        n_totals_by_size = 0
         for item in ocr_text_labels:
             if len(item) < 5:
                 continue
             text, x1, y1, x2, y2 = item[0], item[1], item[2], item[3], item[4]
             area = _parse_ocr_area_m2(str(text))
-            if area is not None and 1.0 <= area <= 200.0:
-                parsed.append((area, (x1 + x2) / 2.0, (y1 + y2) / 2.0))
+            if area is None or area < 1.0:
+                continue
+            if area > max_label:
+                n_totals_by_size += 1
+                continue
+            parsed.append((area, (x1 + x2) / 2.0, (y1 + y2) / 2.0))
 
+        if n_totals_by_size:
+            logger.info(
+                "Room-polygon scale calibration: %d label(s) above the "
+                "%.0f m² room ceiling excluded as apartment totals",
+                n_totals_by_size, max_label,
+            )
         if not parsed:
             return None
 

@@ -9,6 +9,9 @@ Public API
 ----------
 is_numeric_ocr_label(text)  -> bool
 parse_area_m2(text)         -> Optional[float]
+parse_room_area_m2(text)    -> Optional[float]
+is_apartment_total_m2(area) -> bool
+looks_like_room_name(text)  -> bool
 parse_length_m(text)        -> Optional[float]
 """
 
@@ -43,6 +46,14 @@ _AREA_PATTERN = re.compile(
 _LENGTH_PATTERN = re.compile(
     r"^\s*(\d{1,3}[.,]\d{1,2})\s*$",
 )
+
+# Default ceiling for a single room's printed area label, in m².  Mirrors
+# PipelineConfig.max_room_label_m2 — callers holding a config should pass its
+# value through rather than relying on this default.
+MAX_ROOM_LABEL_M2 = 25.0
+
+_CYR_VOWELS = frozenset("аеёиоуыэюя")
+_LAT_VOWELS = frozenset("aeiouy")
 
 # Wall-length in millimetres: bare 4-digit integer (BTI dimension style,
 # e.g. "2420", "5950"). 1–3 digit integers are excluded — they collide with
@@ -86,6 +97,75 @@ def parse_area_m2(text: str) -> Optional[float]:
         except ValueError:
             pass
     return None
+
+
+def is_apartment_total_m2(area_m2: Optional[float],
+                          max_room_m2: float = MAX_ROOM_LABEL_M2) -> bool:
+    """True when *area_m2* is too large to be a single room's printed area.
+
+    Floor plans carry two kinds of numeric area label and OCR cannot tell them
+    apart: the per-room area written inside each space, and the apartment total
+    printed in the header/stamp.  Adopting a total as a room area is what put
+    45–150 m² "rooms" in the export and skewed every scale calibrator that
+    paired it with a polygon (audit 28.07.2026: 152/695 labels = 22%).
+
+    ``max_room_m2`` is a *label* ceiling, not a room-size ceiling: a genuine
+    open-plan living space can exceed it, but its printed label almost never
+    does on the residential plans this pipeline handles, whereas totals almost
+    always do.
+    """
+    return area_m2 is not None and area_m2 > max_room_m2
+
+
+def parse_room_area_m2(text: str,
+                       max_room_m2: float = MAX_ROOM_LABEL_M2) -> Optional[float]:
+    """Parse *text* as a single room's area, rejecting apartment totals.
+
+    Same grammar as :func:`parse_area_m2`; returns ``None`` for values above
+    ``max_room_m2`` so callers cannot accidentally size or name a room from
+    the apartment total.  Use :func:`parse_area_m2` when the total is wanted
+    (e.g. an apartment-level area sum).
+    """
+    area = parse_area_m2(text)
+    if area is None or is_apartment_total_m2(area, max_room_m2):
+        return None
+    return area
+
+
+def looks_like_room_name(text: str) -> bool:
+    """True when *text* plausibly reads as a room name rather than OCR noise.
+
+    "≥3 letters" alone let watermark and hatch-pattern shrapnel through as room
+    names ("AAAA", "UUV", "Jl Ill"): 124 of 819 exported names (15%) were junk
+    in the 28.07.2026 audit.  A real room name — Russian or Latin — has vowels
+    and does not repeat one letter forever, so require:
+
+    * at least 3 letters, all from one alphabet;
+    * at least one vowel in that alphabet;
+    * no letter taking more than half of the string;
+    * no run of 3+ identical letters.
+    """
+    if not text:
+        return False
+    s = text.strip()
+    letters = [ch for ch in s if ch.isalpha()]
+    if len(letters) < 3:
+        return False
+
+    low = [ch.lower() for ch in letters]
+    cyr = sum(1 for ch in low if 'а' <= ch <= 'я' or ch == 'ё')
+    lat = sum(1 for ch in low if 'a' <= ch <= 'z')
+    if cyr and lat:
+        return False                      # mixed alphabets — OCR confusion
+    vowels = _CYR_VOWELS if cyr else _LAT_VOWELS
+    if not any(ch in vowels for ch in low):
+        return False
+    if max(low.count(ch) for ch in set(low)) > len(low) / 2.0:
+        return False
+    for i in range(len(low) - 2):
+        if low[i] == low[i + 1] == low[i + 2]:
+            return False
+    return True
 
 
 def parse_length_m(text: str) -> Optional[float]:
