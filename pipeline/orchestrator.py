@@ -475,6 +475,12 @@ class FloorplanPipeline:
                     base_name, len(result.walls),
                     sum(1 for w in result.walls if w.is_diagonal),
                 )
+                if _rd_res.wall_coverage is not None:
+                    diag_out.setdefault("walls", {})
+                    diag_out["walls"]["coverage"] = round(
+                        _rd_res.wall_coverage, 4)
+                    diag_out["walls"]["coverage_target"] = (
+                        _rd_res.wall_coverage_target)
 
                 # ── Save wall mask debug images ────────────────────────
                 # Raw: straight U-Net argmax output, no post-processing.
@@ -590,6 +596,8 @@ class FloorplanPipeline:
         # ── Stage 1b3: Wall-length scale calibration (rotated labels) ────
         # Uses rotated OCR labels collected in pre-stage (no re-run).
         logger.info("[%s] Stage 1b3: Wall-length scale calibration", base_name)
+        _wall_dim_sf: Optional[float] = None
+        _wl_stats: dict = {}
         wl_ptcm = _calibrate_scale_from_wall_lengths(
             img=img,
             walls=result.walls,
@@ -597,6 +605,7 @@ class FloorplanPipeline:
             rotated_labels=rotated_ocr_labels,
             debug_dir=output_dir,
             rotated_labels_in_image_coords=True,
+            stats=_wl_stats,
         )
         # Legit wall-length corrections of the prior estimate reach ~3×
         # (case 11520: 0.28 → 0.87), but a >5× jump is never a correction —
@@ -621,7 +630,18 @@ class FloorplanPipeline:
                 self.config = self.config.copy_with(pixels_to_cm=wl_ptcm)
                 self.exporter.update_scale(wl_ptcm)
                 self.visualizer.pixels_to_cm = wl_ptcm
+                # A multi-dimension consensus means pixels_to_cm is now a real
+                # measurement in cm/px, which fixes the scale factor outright:
+                # exported cm = px * pixels_to_cm / sf, so sf = 1 is exact.
+                # Stage 4b offers it as a candidate and the verdict counts it
+                # as a strong source (report item 1.1 — dimension chains are
+                # printed on plans whose room labels never OCR'd).
+                if _wl_stats.get("n_consensus", 0) >= 2:
+                    _wall_dim_sf = 1.0
         diag_out["scale"]["wall_length_ptcm"] = wl_ptcm
+        diag_out["scale"]["wall_length_matches"] = _wl_stats.get("n_matches", 0)
+        diag_out["scale"]["wall_length_consensus"] = _wl_stats.get(
+            "n_consensus", 0)
         diag_out["scale"]["stage1_final_ptcm"] = result.pixels_to_cm
 
         # ── Stage 2: Opening Detection (UNIFIED: gap + U-Net with deduplication) ─────
@@ -887,6 +907,7 @@ class FloorplanPipeline:
             wall_mask=result.wall_mask,
             enclosed_labels=None,
             seal_only_openings=getattr(result, 'dropped_diagonal_openings', None),
+            area_ocr_labels=ocr_text_labels,
         )
 
         result.rooms = rooms
@@ -897,7 +918,7 @@ class FloorplanPipeline:
         # integer numeric label with a smaller decimal label directly above it
         # and no other integers in the room, the integer is the room area in m².
         # Falls back to standard room-polygon calibration.
-        if result.rooms and ocr_text_labels:
+        if (result.rooms and ocr_text_labels) or _wall_dim_sf is not None:
             logger.info("[%s] Stage 4b: Scale calibration from rooms", base_name)
             # Order matters. The stacked-label rule used to run first because it
             # is the more specific pattern, but it was the least reliable source
@@ -906,6 +927,14 @@ class FloorplanPipeline:
             # produced 3.6%. It now only runs when the general rule found no
             # consensus, and — like every source here — its answer must survive
             # the same plausibility band the sanity gate applies.
+            #
+            # wall_dimensions ranks second: it is a direct physical
+            # measurement (a printed dimension against the pixel span of the
+            # wall it annotates) and needs no room polygons at all, which is
+            # exactly the situation on the plans that used to end with no
+            # source.  It ranks below room_polygons only because bracketing a
+            # dimension to the wrong wall span is a quieter failure than a
+            # mispaired area label.
             _candidates = [
                 ("room_polygons", lambda: self._calibrate_scale_from_rooms(
                     rooms=result.rooms,
@@ -913,16 +942,23 @@ class FloorplanPipeline:
                     pixels_to_cm=result.pixels_to_cm,
                     current_scale_factor=self.config.sh3d_scale_factor,
                 )),
+                ("wall_dimensions", lambda: _wall_dim_sf),
                 ("stacked_labels", lambda: self._calibrate_scale_from_stacked_labels(
                     ocr_text_labels=ocr_text_labels,
                     rooms=result.rooms,
                     pixels_to_cm=result.pixels_to_cm,
                     current_scale_factor=self.config.sh3d_scale_factor,
                 )),
+                ("apartment_area", lambda: self._calibrate_scale_from_area_sum(
+                    rooms=result.rooms,
+                    ocr_text_labels=ocr_text_labels,
+                    pixels_to_cm=result.pixels_to_cm,
+                )),
             ]
             new_sf = None
             _sf_source = None
             _rejected: List[str] = []
+            _in_band: List[Tuple[str, float]] = []
             for _name, _fn in _candidates:
                 _cand = _fn()
                 if _cand is None:
@@ -939,12 +975,31 @@ class FloorplanPipeline:
                         self.config.scale_sanity_max_extent_m,
                     )
                     continue
-                new_sf, _sf_source = _cand, _name
-                break
+                _in_band.append((_name, _cand))
+                if new_sf is None:
+                    new_sf, _sf_source = _cand, _name
             diag_out["scale"]["stage4b_sf"] = new_sf
             diag_out["scale"]["stage4b_source"] = _sf_source
             if _rejected:
                 diag_out["scale"]["stage4b_rejected"] = _rejected
+
+            # Corroboration.  The audit's error distribution is all-or-nothing:
+            # a plan is either right to a few percent or wrong by >100%.  Two
+            # calibrators that derive scale from unrelated evidence — printed
+            # room areas, printed dimensions, the apartment total — cannot
+            # land within 12% of each other by accident while both being
+            # wrong.  Agreement is therefore usable as acceptance evidence in
+            # its own right, which is what lets a plan whose only source is a
+            # "weak" one still ship without review.
+            _agree = [n for n, v in _in_band
+                      if n != _sf_source and new_sf
+                      and abs(v - new_sf) / new_sf <= 0.12]
+            if _agree:
+                diag_out["scale"]["stage4b_corroborated_by"] = _agree
+                logger.info(
+                    "[%s] Stage 4b: %s corroborated by %s (within 12%%)",
+                    base_name, _sf_source, ", ".join(_agree),
+                )
             if new_sf is not None and abs(new_sf - self.config.sh3d_scale_factor) > 1e-4:
                 # Update the XML generator's scale_factor
                 inner_exp = getattr(self.exporter, '_inner', None)
@@ -967,6 +1022,7 @@ class FloorplanPipeline:
                     wall_mask=result.wall_mask,
                     enclosed_labels=None,
                     seal_only_openings=getattr(result, 'dropped_diagonal_openings', None),
+                    area_ocr_labels=ocr_text_labels,
                 )
                 result.rooms = rooms
                 result.sh3d_path = sh3d_path if os.path.exists(sh3d_path) else None
@@ -1055,6 +1111,7 @@ class FloorplanPipeline:
                     wall_mask=result.wall_mask,
                     enclosed_labels=None,
                     seal_only_openings=getattr(result, 'dropped_diagonal_openings', None),
+                    area_ocr_labels=ocr_text_labels,
                 )
                 result.rooms = rooms
                 result.sh3d_path = sh3d_path if os.path.exists(sh3d_path) else None
@@ -1072,24 +1129,43 @@ class FloorplanPipeline:
         # that rule from scattered diag fields, the pipeline states its own
         # verdict — accepted plans are the ~73% whose median area error is 3.6%,
         # rejected ones the group that needs a human before it is used.
+        #
+        # A source is strong on its own when it measures the plan directly and
+        # had to agree with itself to produce an answer at all: room_polygons
+        # (≥2 agreeing label↔polygon ratios) and wall_dimensions (≥2 agreeing
+        # printed dimensions — it is not offered otherwise).  Any source, weak
+        # ones included, also counts as strong once a second, independent
+        # calibrator lands within 12% of it.
+        _STRONG_SOURCES = ("room_polygons", "wall_dimensions")
         _scale_diag = diag_out.get("scale", {})
         _reasons: List[str] = []
-        if _scale_diag.get("stage4b_source") is None:
+        _src = _scale_diag.get("stage4b_source")
+        if _src is None:
             _reasons.append("no_calibration_source")
-        elif _scale_diag.get("stage4b_source") != "room_polygons":
-            _reasons.append(
-                f"weak_source:{_scale_diag['stage4b_source']}")
+        elif (_src not in _STRONG_SOURCES
+                and not _scale_diag.get("stage4b_corroborated_by")):
+            _reasons.append(f"weak_source:{_src}")
         if not _scale_diag.get("gate", {}).get("in_band", True):
             _reasons.append("extent_out_of_band")
+        # Wall coverage below the decomposer's own target means the export is
+        # missing wall the mask found — a geometry defect, independent of
+        # scale, that the audit could only track as a hand-kept list of 14
+        # plans.  It is a review reason in its own right.
+        _wall_diag = diag_out.get("walls", {})
+        _cov = _wall_diag.get("coverage")
+        _cov_target = _wall_diag.get("coverage_target")
+        if _cov is not None and _cov_target and _cov < _cov_target:
+            _reasons.append(
+                f"wall_coverage_short:{_cov:.3f}<{_cov_target:.3f}")
         _scale_diag["accepted"] = not _reasons
         _scale_diag["reject_reasons"] = _reasons
         if _reasons:
             logger.warning(
-                "[%s] Scale verdict: NEEDS REVIEW (%s) — areas on this plan "
-                "are not trustworthy", base_name, ", ".join(_reasons),
+                "[%s] Verdict: NEEDS REVIEW (%s)", base_name,
+                ", ".join(_reasons),
             )
         else:
-            logger.info("[%s] Scale verdict: accepted", base_name)
+            logger.info("[%s] Verdict: accepted", base_name)
 
         # ── Stage 4c: Room area validation (diagnostic only) ──────────────
         if result.rooms and ocr_text_labels:
@@ -1821,6 +1897,7 @@ class FloorplanPipeline:
         wall_mask: Optional[np.ndarray],
         enclosed_labels: Optional[np.ndarray] = None,
         seal_only_openings: Optional[List[Opening]] = None,
+        area_ocr_labels: Optional[List] = None,
     ) -> List[Room]:
         """Run SH3D export and return detected rooms."""
         try:
@@ -1834,6 +1911,7 @@ class FloorplanPipeline:
                 wall_mask=wall_mask,
                 enclosed_labels=enclosed_labels,
                 seal_only_openings=seal_only_openings,
+                area_ocr_labels=area_ocr_labels,
             )
         except Exception as e:
             logger.error("SH3D export failed: %s", e, exc_info=True)

@@ -643,6 +643,9 @@ def decompose(
     thin_rescue_min_len:  float = 25.0,
     thin_rescue_min_area: int   = 40,
     thin_rescue_fringe_px: int  = 2,
+    second_rescue:        bool  = True,
+    second_rescue_thickness_factor: float = 2.0,
+    second_rescue_len_factor:       float = 0.4,
 ) -> List[Rect]:
     """
     Greedy rectangle decomposition.  Runs until no rectangle clears the
@@ -722,6 +725,13 @@ def decompose(
                            `coverage_stop` would otherwise abandon.  The
                            `thin_rescue_*` parameters are documented on
                            `rescue_thin_residual`.
+    second_rescue        : if True, and coverage is STILL below `coverage_stop`
+                           after the first rescue, retry the leftover residual
+                           with the wall-shape gates relaxed by
+                           `second_rescue_thickness_factor` (thickness ceiling)
+                           and `second_rescue_len_factor` (length/area floors).
+                           No effect on plans that reached the target, so the
+                           usual path is unchanged.
 
     Returns
     -------
@@ -862,7 +872,7 @@ def decompose(
             print(f"\n    └─ {best_rect}")
 
     if thin_rescue and remaining.any():
-        chosen.extend(rescue_thin_residual(
+        rescued = rescue_thin_residual(
             mask, remaining, placed_union,
             axis_only          = axis_only,
             max_thickness      = thin_rescue_max_thickness,
@@ -873,7 +883,41 @@ def decompose(
             max_spill_fraction = max_spill_fraction,
             refine             = refine,
             verbose            = verbose,
-        ))
+        )
+        chosen.extend(rescued)
+        for r in rescued:
+            pix = rasterise(r, H, W)
+            placed_union |= pix
+            remaining    &= ~pix
+
+        # Second rescue, gates relaxed.  The first pass abandons a component
+        # the moment its best rectangle is thicker than `max_thickness` or
+        # shorter than `min_len` — sensible defaults for a THIN wall, but they
+        # also drop the stub ends of ordinary walls and the fatter fragments
+        # left where two walls meet.  On most plans that residual is noise;
+        # on a minority it is the few percent that keeps coverage under the
+        # target (28–29.07 audit: median 97.2%, 14 plans short, min 91.9%).
+        # Escalating only when the target was actually missed keeps the
+        # normal path byte-identical.
+        covered = total - int(np.count_nonzero(remaining))
+        if (second_rescue and remaining.any() and total > 0
+                and covered / total < coverage_stop):
+            if verbose:
+                print(f"  [rescue-2] coverage {100*covered/total:.1f}% < "
+                      f"{100*coverage_stop:.1f}% — retrying residual with "
+                      f"relaxed gates")
+            chosen.extend(rescue_thin_residual(
+                mask, remaining, placed_union,
+                axis_only          = axis_only,
+                max_thickness      = thin_rescue_max_thickness * second_rescue_thickness_factor,
+                min_len            = max(4.0, thin_rescue_min_len * second_rescue_len_factor),
+                min_area           = max(12, int(thin_rescue_min_area * second_rescue_len_factor)),
+                fringe_px          = 1,
+                bleed_weight       = bleed_weight,
+                max_spill_fraction = max_spill_fraction,
+                refine             = refine,
+                verbose            = verbose,
+            ))
 
     return chosen
 

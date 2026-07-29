@@ -1804,6 +1804,9 @@ class RectWallDetector:
         _p_rescue_len  = getattr(cfg, "rect_thin_rescue_min_len",  25.0)
         _p_rescue_area = getattr(cfg, "rect_thin_rescue_min_area", 40)
         _p_rescue_frg  = getattr(cfg, "rect_thin_rescue_fringe_px", 2)
+        _p_rescue2     = getattr(cfg, "rect_second_rescue",         True)
+        _p_rescue2_thk = getattr(cfg, "rect_second_rescue_thickness_factor", 2.0)
+        _p_rescue2_len = getattr(cfg, "rect_second_rescue_len_factor",       0.4)
 
         _L("  Wall pixels entering decompose: %d / %d  (%.2f%%)",
            total_wall_px, total_px, 100.0 * total_wall_px / max(1, total_px))
@@ -1827,6 +1830,10 @@ class RectWallDetector:
                "  min_area=%dpx²  fringe=%dpx) — full-res re-search of the"
                " abandoned residual", _p_rescue_thk, _p_rescue_len,
                _p_rescue_area, _p_rescue_frg)
+            if _p_rescue2:
+                _L("  second rescue      = ON  (fires only if coverage < %.0f%%;"
+                   " thickness ×%.1f, len/area ×%.1f)",
+                   _p_cov_stop * 100, _p_rescue2_thk, _p_rescue2_len)
         else:
             _L("  thin rescue        = OFF (rect_thin_rescue=False)")
         _LL.append("\n--- rd.decompose verbose output (start) ---\n")
@@ -1856,6 +1863,9 @@ class RectWallDetector:
                 thin_rescue_min_len  = _p_rescue_len,
                 thin_rescue_min_area = _p_rescue_area,
                 thin_rescue_fringe_px = _p_rescue_frg,
+                second_rescue        = _p_rescue2,
+                second_rescue_thickness_factor = _p_rescue2_thk,
+                second_rescue_len_factor       = _p_rescue2_len,
             )
         _verbose_text = _verbose_buf.getvalue()
         _LL.append(_verbose_text if _verbose_text
@@ -2070,6 +2080,8 @@ class RectWallDetector:
             outline_mask=outline_mask,
             wall_rect_polygons=wall_rect_polygons,
             source="rect_walls",
+            wall_coverage=float(_coverage_frac),
+            wall_coverage_target=float(_p_cov_stop),
         )
 
     # ------------------------------------------------------------------

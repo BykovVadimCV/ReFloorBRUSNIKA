@@ -202,6 +202,8 @@ class SH3DExporter:
             split_doorways=getattr(cfg, "room_split_doorways", True),
             max_doorway_cm=getattr(cfg, "room_max_doorway_cm", 110.0),
             max_room_label_m2=getattr(cfg, "max_room_label_m2", 25.0),
+            rescue_lost_rooms=getattr(cfg, "room_rescue_lost", True),
+            split_rooms_by_labels=getattr(cfg, "room_split_by_labels", True),
             sanitize_geometry=getattr(
                 cfg, "enable_export_geometry_sanitation", True),
             min_wall_length_cm=getattr(cfg, "export_min_wall_length_cm", 10.0),
@@ -237,6 +239,7 @@ class SH3DExporter:
         wall_mask: Optional[np.ndarray] = None,
         enclosed_labels: Optional[np.ndarray] = None,
         seal_only_openings: Optional[List[Opening]] = None,
+        area_ocr_labels: Optional[List] = None,
     ) -> List[Room]:
         """
         Export a floorplan to SH3D format.
@@ -252,6 +255,9 @@ class SH3DExporter:
             seal_only_openings: Openings excluded from export (e.g. dropped
                 diagonal-wall doors) that still mark real doorways — used only
                 to seal passages during room detection.
+            area_ocr_labels: Full OCR word list, used by RoomDetector as
+                room-area evidence to rescue rooms lost to an exterior leak
+                and to split merged rooms.
 
         Returns:
             List of detected Room objects for visualization
@@ -387,6 +393,7 @@ class SH3DExporter:
                 enclosed_labels=enclosed_labels,
                 extra_structural_walls=extra_structural if extra_structural else None,
                 seal_only_openings=seal_only_legacy if seal_only_legacy else None,
+                area_ocr_labels=area_ocr_labels,
             )
         except Exception as e:
             logger.error("SH3D export failed: %s", e, exc_info=True)

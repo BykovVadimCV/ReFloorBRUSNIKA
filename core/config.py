@@ -272,6 +272,21 @@ class PipelineConfig:
     # over-split, so keep it near a real max door width.
     room_max_doorway_cm: float = 110.0
 
+    # Recover rooms that flooded away as exterior through a leak WIDER than
+    # room_max_doorway_cm (missing facade wall, collapsed entrance chain), so
+    # the neck cut cannot sever it.  A printed room-area label stranded in
+    # exterior space is the evidence; the leak is then cut by a watershed
+    # between that label and the raster border.  Report item 1.2 (7/257 plans
+    # exported with rooms missing on the 28–29.07.2026 run).
+    room_rescue_lost: bool = True
+
+    # Split a room blob that carries 2+ of its own area labels, using those
+    # labels as watershed seeds.  Addresses merges the neck cut structurally
+    # cannot see — the partition is absent from the plan, drawn as furniture,
+    # or thinner than the detector resolves.  Report item 2.1 (169/1253 rooms,
+    # 13.5%, unchanged between the June and July runs).
+    room_split_by_labels: bool = True
+
     # ============================================================
     # EXPORT
     # ============================================================
@@ -541,6 +556,18 @@ class PipelineConfig:
     rect_thin_rescue_min_len:       float = 25.0  # px, rescued rect long-side floor
     rect_thin_rescue_min_area:      int   = 40    # px², ignore smaller residual specks
     rect_thin_rescue_fringe_px:     int   = 2     # drop residual this close to placed rects
+
+    # Second rescue pass, fired ONLY when coverage is still under
+    # rect_coverage_stop after the first one.  The first pass abandons a
+    # residual component as soon as its best rectangle breaks the thin-wall
+    # shape gates, which also discards wall stubs and the fatter fragments at
+    # junctions.  Relaxing those gates recovers the last few percent on the
+    # plans that fell short (28–29.07.2026 audit: coverage median 97.2%, 14
+    # plans below target, minimum 91.9%).  Plans already at target are
+    # untouched.  Report item 3.1.
+    rect_second_rescue:                  bool  = True
+    rect_second_rescue_thickness_factor: float = 2.0  # ×max_thickness ceiling
+    rect_second_rescue_len_factor:       float = 0.4  # ×min_len / min_area floors
 
     # Cap (morph-close) kernel size applied to the raw U-Net wall mask
     # before enclosed-space analysis and rect decomposition.  Bridges small

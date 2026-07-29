@@ -39,6 +39,7 @@ def _calibrate_scale_from_wall_lengths(
     max_dist: float = 80.0,
     debug_dir: Optional[str] = None,
     rotated_labels_in_image_coords: bool = False,
+    stats: Optional[dict] = None,
 ) -> Optional[float]:
     """Match wall-length labels to walls and compute pixels_to_cm (cm/px).
 
@@ -55,6 +56,13 @@ def _calibrate_scale_from_wall_lengths(
         coords (caller has un-rotated them) — use bbox centre directly.
         When False (legacy), bboxes are in 90° CW rotated-image coords —
         un-rotate using image height ``h``.
+    stats : dict, optional
+        Filled with ``n_matches`` (label↔segment pairs that survived the
+        plausibility band) and ``n_consensus`` (of those, how many agree with
+        the median within 30%).  A single match is a guess — one mis-bracketed
+        segment and it is wrong with nothing to contradict it — whereas two or
+        more independent printed dimensions agreeing is a real measurement.
+        Callers use the distinction to decide how far to trust the result.
     """
     h, w = img.shape[:2]
 
@@ -431,6 +439,9 @@ def _calibrate_scale_from_wall_lengths(
     # batch. No agreement → no calibration; caller keeps the prior scale.
     med = float(np.median(ratios))
     filtered = [r for r in ratios if abs(r - med) / med < 0.30]
+    if stats is not None:
+        stats["n_matches"] = len(ratios)
+        stats["n_consensus"] = len(filtered)
     if not filtered:
         logger.warning("Wall-length calibration: %d match(es) mutually "
                        "disagree (ratios: %s) — no consensus, keeping prior "

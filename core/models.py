@@ -657,6 +657,15 @@ class DetectionResult:
     pixel_scale: Optional[float] = None  # meters per pixel
     source: str = "unknown"
 
+    # Fraction of wall-mask pixels covered by the decomposed rectangles, and
+    # the target the decomposer was aiming for.  Published because coverage is
+    # the geometry defect that survived the 28–29.07.2026 audit as a residual
+    # (median 97.2%, minimum 91.9%): a plan below target has walls the export
+    # is missing, and the pipeline should say so itself rather than leave the
+    # short list to be tracked by hand.  ``None`` when no decomposition ran.
+    wall_coverage: Optional[float] = None
+    wall_coverage_target: Optional[float] = None
+
     @property
     def doors(self) -> List[Opening]:
         """Get all door openings."""

@@ -1160,6 +1160,24 @@ class RoomDetector:
     # use <10M. Exceeding it coarsens self.resolution (see _rasterize_walls).
     MAX_RASTER_PX = 64_000_000
 
+    # Rescue-pass gates (see _rescue_lost_rooms).  A rescued blob must be
+    # mostly bounded by wall pixels — dimension-chain and title-block labels
+    # sit in open space and fail this; a leaked room fails only along its one
+    # leak.  The area/label plausibility band is deliberately loose: it only
+    # has to reject carving a whole facade strip out for a stray "3.50".
+    RESCUE_MIN_WALL_BOUND = 0.55
+    RESCUE_STRONG_WALL_BOUND = 0.75
+    RESCUE_MAX_AREA_M2 = 60.0
+    RESCUE_LABEL_RATIO = (0.35, 3.0)
+    # Neck widths tried for a leak, as multiples of max_doorway_cm, and the
+    # absolute cap: past ~4 m the "leak" is an open facade, not a doorway.
+    RESCUE_NECK_STEPS = (1.5, 2.0, 3.0, 4.0)
+    RESCUE_MAX_NECK_CM = 400.0
+    # Label-split gates (see _split_component_by_labels).
+    SPLIT_MIN_LABEL_SEP_CM = 100.0     # closer labels are one room's clutter
+    SPLIT_MIN_WALL_CLEAR_CM = 30.0     # seed must sit away from walls
+    SPLIT_MAX_RATIO_SPREAD = 2.5       # fragment/label consistency band
+
     def __init__(
         self,
         resolution: float = 0.5,        # finer raster → sharper corners
@@ -1169,14 +1187,30 @@ class RoomDetector:
         snap_tolerance_cm: float = 18.0,          # max snap distance
         split_doorways: bool = True,
         max_doorway_cm: float = 110.0,
+        rescue_lost_rooms: bool = True,
+        split_by_labels: bool = True,
+        plan_scale: float = 1.0,
     ) -> None:
         self.resolution = resolution
-        self.min_room_area_cm2 = min_room_area_cm2
         self.wall_dilation_px = wall_dilation_px
         self.simplify_epsilon_cm = simplify_epsilon_cm
         self.snap_tolerance_cm = snap_tolerance_cm
         self.split_doorways = split_doorways
-        self.max_doorway_cm = max_doorway_cm
+        self.rescue_lost_rooms = rescue_lost_rooms
+        self.split_by_labels = split_by_labels
+        # Walls arrive here in px × pixels_to_cm, which is `scale_factor`
+        # times real cm — the exporter divides by scale_factor only when it
+        # writes the XML.  Every real-world constant below (a doorway is
+        # ~90 cm, a room is bigger than 0.2 m²) therefore has to be converted
+        # into that space, or it silently means something else: at the
+        # observed median scale_factor of 1.5 an untranslated 110 cm doorway
+        # threshold is a 73 cm one, narrower than any real interior door, so
+        # genuine doorways were never cut and their rooms shipped merged
+        # (audit 28–29.07.2026: 72% of plans under an 80 cm effective
+        # threshold; room merging 13.5% and unmoved since June).
+        self.plan_scale = plan_scale if plan_scale and plan_scale > 0 else 1.0
+        self.max_doorway_cm = max_doorway_cm * self.plan_scale
+        self.min_room_area_cm2 = min_room_area_cm2 * (self.plan_scale ** 2)
 
     # ---- public API ----
     def detect(
@@ -1184,7 +1218,13 @@ class RoomDetector:
         walls: List[Wall],
         enclosed_labels: Optional[np.ndarray] = None,
         openings: Optional[List[Opening]] = None,
+        area_labels_cm: Optional[List[Tuple[float, float, float]]] = None,
     ) -> List[Room]:
+        """``area_labels_cm``: room-area OCR labels as (x_cm, y_cm, area_m2),
+        already filtered to single-room values (no apartment totals).  They
+        drive two evidence-based passes: rescuing rooms lost to an exterior
+        leak (a label stranded in flooded-out space marks a lost room) and
+        splitting merged rooms (two labels in one blob mark two rooms)."""
         if len(walls) < 3:
             return []
 
@@ -1230,10 +1270,30 @@ class RoomDetector:
                     len(door_widths), derived, self.max_doorway_cm,
                 )
                 self.max_doorway_cm = derived
-            interior = self._extract_interior_with_neck_cut(mask)
-        else:
-            interior = self._extract_interior(mask)
-        rooms = self._components_to_rooms(interior, origin, enclosed_labels, mask)
+
+        # Project area labels into raster px once; both the rescue pass and
+        # the merged-room split consume them.  self.resolution is only final
+        # after _rasterize_walls (it coarsens on oversized rasters).
+        min_x, min_y = origin
+        labels_px: List[Tuple[int, int, float]] = []
+        h_px, w_px = mask.shape[:2]
+        for (lx, ly, lm2) in (area_labels_cm or []):
+            px = int((lx - min_x) / self.resolution)
+            py = int((ly - min_y) / self.resolution)
+            if 0 <= px < w_px and 0 <= py < h_px:
+                labels_px.append((px, py, float(lm2)))
+
+        sealed = self._close_wall_gaps(mask)
+        sealed_cut = (self._neck_cut_sealed(sealed)
+                      if self.split_doorways else sealed)
+        interior = self._flood_interior(sealed_cut)
+        if self.rescue_lost_rooms and labels_px:
+            interior = self._rescue_lost_rooms(
+                sealed, sealed_cut, interior, labels_px)
+        rooms = self._components_to_rooms(
+            interior, origin, enclosed_labels, mask,
+            split_labels=labels_px if self.split_by_labels else None,
+        )
         logger.info(
             "RoomDetector: %d room(s) from flood-fill (split_doorways=%s, "
             "max_doorway_cm=%.0f, %d sealed opening(s))",
@@ -1762,6 +1822,23 @@ class RoomDetector:
         return cv2.bitwise_or(sealed, mask)
 
     @staticmethod
+    def _border_band(shape: Tuple[int, int], width: int = 3) -> np.ndarray:
+        """Boolean band hugging the raster frame, used to seed the outdoors.
+
+        It must be several pixels wide, not one: ``cv2.watershed`` overwrites
+        all four image edges with -1 as a boundary condition, so a 1-px ring
+        seed is erased before flooding starts and the outdoors ends up with no
+        basin at all — whereupon the single remaining basin claims the whole
+        raster and the cut never happens.
+        """
+        h, w = shape
+        band = np.zeros((h, w), dtype=bool)
+        k = max(2, int(width))
+        band[:k, :] = band[-k:, :] = True
+        band[:, :k] = band[:, -k:] = True
+        return band
+
+    @staticmethod
     def _flood_interior(sealed: np.ndarray) -> np.ndarray:
         h, w = sealed.shape
         flood = sealed.copy()
@@ -1773,9 +1850,9 @@ class RoomDetector:
     def _extract_interior(self, mask: np.ndarray) -> np.ndarray:
         return self._flood_interior(self._close_wall_gaps(mask))
 
-    def _extract_interior_with_neck_cut(self, mask: np.ndarray) -> np.ndarray:
-        """Extract interior after cutting door-width necks in the ENTIRE
-        non-wall space, exterior included.
+    def _neck_cut_sealed(self, sealed: np.ndarray) -> np.ndarray:
+        """Return ``sealed`` with door-width necks cut (sealed as wall) in the
+        ENTIRE non-wall space, exterior included.
 
         A room joined to the OUTSIDE through an undetected doorway (entrance
         door, stair passage) floods as exterior during interior extraction
@@ -1784,9 +1861,17 @@ class RoomDetector:
         the same erode-core/watershed cut with the exterior as one more
         basin severs those passages first, so the flood-fill stays out.
         """
-        sealed = self._close_wall_gaps(mask)
+        return self._cut_with_neck(sealed, self.max_doorway_cm)
+
+    def _cut_with_neck(self, sealed: np.ndarray,
+                       neck_cm: float) -> np.ndarray:
+        """``_neck_cut_sealed`` with the neck width supplied by the caller.
+
+        The rescue pass reruns this at escalating widths to sever leaks the
+        configured doorway width cannot reach.
+        """
         res = self.resolution
-        neck_px = (self.max_doorway_cm / res) / 2.0
+        neck_px = (neck_cm / res) / 2.0
         if neck_px >= 1:
             non_wall = (sealed == 0).astype(np.uint8) * 255
             dist = cv2.distanceTransform(non_wall, cv2.DIST_L2, 3)
@@ -1795,9 +1880,7 @@ class RoomDetector:
             # is exterior by construction. Force it to be a core: with a
             # large derived neck the erosion could otherwise consume the
             # whole exterior margin and leave the outside without a basin.
-            ring = np.zeros_like(cores)
-            ring[0, :] = ring[-1, :] = 255
-            ring[:, 0] = ring[:, -1] = 255
+            ring = self._border_band(cores.shape).astype(np.uint8) * 255
             cores = cv2.bitwise_or(cores, cv2.bitwise_and(ring, non_wall))
             n_cores, core_lbls = cv2.connectedComponents(cores)
             if n_cores > 2:
@@ -1820,7 +1903,234 @@ class RoomDetector:
                                    iterations=2)
                 sealed = sealed.copy()
                 sealed[ridge > 0] = 255
-        return self._flood_interior(sealed)
+        return sealed
+
+    # ---- rescue rooms lost through a wide leak to the exterior ----
+    def _rescue_lost_rooms(
+        self,
+        sealed: np.ndarray,
+        sealed_cut: np.ndarray,
+        interior: np.ndarray,
+        labels_px: List[Tuple[int, int, float]],
+    ) -> np.ndarray:
+        """Recover rooms that flooded away as exterior despite the neck cut.
+
+        The neck cut only severs passages narrower than ``max_doorway_cm``; a
+        room connected to the outside through a WIDER hole (missing facade
+        wall, balcony slider merged with its opening, collapsed entrance
+        chain) still floods out and ships missing — the report-1.2 residual.
+
+        A printed room-area label sitting in exterior-flooded space is direct
+        evidence of such a loss.  A leak is just a neck too wide for the
+        standard cut, so the same erode-core/watershed severing is retried at
+        escalating neck widths (RESCUE_NECK_STEPS) until the stranded label
+        stops being reachable from the raster border.  Widening the neck
+        globally over-splits elsewhere, so nothing from the aggressive pass is
+        kept except the one component holding the label, and only when it
+        passes:
+
+        * wall-bound fraction ≥ RESCUE_MIN_WALL_BOUND, measured against real
+          walls only (never against cut ridges) — a real room is walled in
+          except at its leak, whereas an over-cut fragment is ridge-bound and
+          a dimension chain or title block carrying a stray decimal is open
+          space.  Both are rejected;
+        * area within [min_room_area_cm2, RESCUE_MAX_AREA_M2] and, unless the
+          blob is strongly wall-bound, within RESCUE_LABEL_RATIO of the
+          label's printed value (scale may be broken, so that ratio alone is
+          advisory — together they reject facade strips and courtyards).
+
+        Components failing the gates stay exterior, so a wrong label can only
+        fail to rescue — it cannot invent outdoor rooms.
+        """
+        res = self.resolution
+        ps2 = self.plan_scale ** 2      # raster m² per real m²
+        exterior = (sealed_cut == 0) & (interior == 0)
+        lost = [(px, py, m2) for (px, py, m2) in labels_px
+                if exterior[py, px]]
+        if not lost:
+            return interior
+
+        # Wall evidence = real walls and opening seals, never cut ridges — a
+        # fragment carved out by the aggressive cut must not look "enclosed"
+        # because of the cut itself.  Padded by ~8 cm because the cut's ridge
+        # coats the inner face of every wall, so the traced boundary of a
+        # rescued blob sits a few px shy of the masonry it is bounded by.
+        pad = max(2, int(round(8.0 * self.plan_scale / res)))
+        wall_evidence = cv2.dilate(
+            (sealed > 0).astype(np.uint8), np.ones((3, 3), np.uint8),
+            iterations=pad) > 0
+        accepted = interior.copy()
+        base_neck = self.max_doorway_cm
+        # The cut depends only on the neck width, so it is computed once per
+        # width and shared by every stranded label — each one costs a distance
+        # transform and a watershed over the whole raster.  Widths are deduped
+        # for the same reason (they collide once the cap bites).
+        necks: List[float] = []
+        neck_cap = self.RESCUE_MAX_NECK_CM * self.plan_scale
+        for mult in self.RESCUE_NECK_STEPS:
+            neck_cm = min(base_neck * mult, neck_cap)
+            if not necks or neck_cm > necks[-1] + 1.0:
+                necks.append(neck_cm)
+        cut_cache: Dict[float, np.ndarray] = {}
+
+        def _interior_at(neck_cm: float) -> np.ndarray:
+            if neck_cm not in cut_cache:
+                cut_cache[neck_cm] = self._flood_interior(
+                    self._cut_with_neck(sealed, neck_cm))
+            return cut_cache[neck_cm]
+
+        n_ok = 0
+        for (px, py, m2) in lost:
+            for neck_cm in necks:
+                interior2 = _interior_at(neck_cm)
+                if interior2[py, px] == 0:
+                    continue          # still flooding out — widen and retry
+                num2, lbl2 = cv2.connectedComponents(interior2)
+                comp = lbl2 == int(lbl2[py, px])
+                if np.any(comp & (interior > 0)):
+                    break             # already part of a kept room
+                area_cm2 = float(np.count_nonzero(comp)) * res * res
+                area_m2 = area_cm2 / 10000.0 / ps2      # real m², vs the label
+                if not (self.min_room_area_cm2 <= area_cm2
+                        <= self.RESCUE_MAX_AREA_M2 * 10000.0 * ps2):
+                    logger.info(
+                        "RoomDetector: rescue near label %.1f m² at neck "
+                        "%.0f cm rejected — blob is %.1f m²",
+                        m2, neck_cm, area_m2)
+                    continue
+                comp_u8 = comp.astype(np.uint8)
+                boundary = (cv2.dilate(comp_u8, np.ones((3, 3), np.uint8),
+                                       iterations=3) > 0) & ~comp
+                n_bd = int(np.count_nonzero(boundary))
+                frac = (float(np.count_nonzero(boundary & wall_evidence))
+                        / max(n_bd, 1))
+                if frac < self.RESCUE_MIN_WALL_BOUND:
+                    logger.info(
+                        "RoomDetector: rescue near label %.1f m² at neck "
+                        "%.0f cm rejected — only %.0f%% wall-bound",
+                        m2, neck_cm, frac * 100.0)
+                    continue
+                lo, hi = self.RESCUE_LABEL_RATIO
+                if (m2 > 0 and not (lo <= area_m2 / m2 <= hi)
+                        and frac < self.RESCUE_STRONG_WALL_BOUND):
+                    logger.info(
+                        "RoomDetector: rescue near label %.1f m² at neck "
+                        "%.0f cm rejected — blob measures %.1f m² and is "
+                        "only %.0f%% wall-bound",
+                        m2, neck_cm, area_m2, frac * 100.0)
+                    continue
+                accepted[comp] = 255
+                n_ok += 1
+                logger.info(
+                    "RoomDetector: rescued a %.1f m² room lost through a leak "
+                    "wider than the %.0f cm doorway cut (label %.1f m², neck "
+                    "%.0f cm, %.0f%% wall-bound)",
+                    area_m2, base_neck, m2, neck_cm, frac * 100.0)
+                break
+        if n_ok:
+            logger.info(
+                "RoomDetector: rescue pass recovered %d/%d lost room(s)",
+                n_ok, len(lost))
+        return accepted
+
+    # ---- split a merged component using its own area labels ----
+    def _split_component_by_labels(
+        self,
+        component: np.ndarray,
+        labels_px: List[Tuple[int, int, float]],
+    ) -> Optional[np.ndarray]:
+        """Cut a blob carrying 2+ room-area labels into one part per label.
+
+        Report item 2.1: rooms merge when the partition between them is
+        missing from the plan, drawn only as furniture, or too thin for the
+        detector.  The neck cut cannot help — there is no neck to find — but
+        the plan still says how many rooms are there: it prints one area
+        label inside each.  Two labels in one polygon means two rooms.
+
+        Each label seeds a watershed basin inside the blob; the ridges land
+        along the blob's narrowest waists, which is where the missing
+        partition ran.  The split is accepted only when every fragment stays
+        plausible against its own label — a consistent set of
+        fragment_area/label ratios (spread ≤ SPLIT_MAX_RATIO_SPREAD) — so a
+        blob whose labels do not describe it (one stray decimal from a
+        dimension chain, a total that slipped the ceiling) is left merged.
+
+        Returns the relabelled component (0 = background, 1..n = parts), or
+        None when the blob should stay as it is.
+        """
+        res = self.resolution
+        inside = [(px, py, m2) for (px, py, m2) in labels_px
+                  if component[py, px] > 0]
+        if len(inside) < 2:
+            return None
+
+        # Labels closer than SPLIT_MIN_LABEL_SEP_CM are one room's own
+        # clutter (name + area + room number stacked), not two rooms.
+        min_sep_px = self.SPLIT_MIN_LABEL_SEP_CM * self.plan_scale / res
+        kept: List[Tuple[int, int, float]] = []
+        for cand in inside:
+            if all(math.hypot(cand[0] - k[0], cand[1] - k[1]) >= min_sep_px
+                   for k in kept):
+                kept.append(cand)
+        if len(kept) < 2:
+            return None
+
+        # A seed must sit in open floor: a label printed over a wall stub or
+        # right against one would seed a basin that cannot grow.
+        comp_u8 = (component > 0).astype(np.uint8)
+        dist = cv2.distanceTransform(comp_u8, cv2.DIST_L2, 3)
+        clear_px = self.SPLIT_MIN_WALL_CLEAR_CM * self.plan_scale / res
+        seeds = [(px, py, m2) for (px, py, m2) in kept
+                 if dist[py, px] >= min(clear_px, float(dist.max()) * 0.5)]
+        if len(seeds) < 2:
+            return None
+
+        h, w = component.shape
+        markers = np.zeros((h, w), dtype=np.int32)
+        markers[component == 0] = len(seeds) + 1        # background basin
+        seed_r = max(2, int(round(3.0 / res)))
+        for i, (px, py, _) in enumerate(seeds):
+            disc = np.zeros((h, w), dtype=np.uint8)
+            cv2.circle(disc, (px, py), seed_r, 255, -1)
+            markers[(disc > 0) & (component > 0)] = i + 1
+
+        img3 = cv2.cvtColor(comp_u8 * 255, cv2.COLOR_GRAY2BGR)
+        cv2.watershed(img3, markers)
+
+        parts = np.zeros((h, w), dtype=np.int32)
+        ps2 = self.plan_scale ** 2
+        ratios: List[float] = []
+        for i, (_, _, m2) in enumerate(seeds):
+            part = (markers == i + 1) & (component > 0)
+            n = int(np.count_nonzero(part))
+            area_cm2 = n * res * res
+            if area_cm2 < self.min_room_area_cm2:
+                logger.info(
+                    "RoomDetector: label-split rejected — fragment for the "
+                    "%.1f m² label is only %.2f m²",
+                    m2, area_cm2 / 10000.0 / ps2)
+                return None
+            parts[part] = i + 1
+            if m2 > 0:
+                ratios.append((area_cm2 / 10000.0) / m2)
+
+        if len(ratios) >= 2:
+            spread = max(ratios) / max(min(ratios), 1e-6)
+            if spread > self.SPLIT_MAX_RATIO_SPREAD:
+                logger.info(
+                    "RoomDetector: label-split rejected — fragment/label "
+                    "ratios disagree (spread %.1fx over %d label(s)); the "
+                    "labels do not describe this blob", spread, len(ratios))
+                return None
+
+        # ``ratios`` only ever feeds a max/min spread, so plan_scale cancels
+        # there and no conversion is needed; the log below reports real m².
+        logger.info(
+            "RoomDetector: split a merged %.1f m² blob into %d room(s) using "
+            "its own area labels (%s m²)",
+            float(np.count_nonzero(component)) * res * res / 10000.0 / ps2,
+            len(seeds), ", ".join(f"{m2:.1f}" for _, _, m2 in seeds))
+        return parts
 
     # ---- connected components → Room objects ----
     def _components_to_rooms(
@@ -1829,6 +2139,7 @@ class RoomDetector:
         origin: Tuple[float, float],
         enclosed_labels: Optional[np.ndarray] = None,
         wall_mask: Optional[np.ndarray] = None,
+        split_labels: Optional[List[Tuple[int, int, float]]] = None,
     ) -> List[Room]:
         min_x, min_y = origin
         res = self.resolution
@@ -1872,7 +2183,7 @@ class RoomDetector:
                 logger.info(
                     "RoomDetector: dropped a %.1f m² component touching the "
                     "raster border — that is the outdoors, not a room",
-                    area_cm2 / 10000.0,
+                    area_cm2 / 10000.0 / (self.plan_scale ** 2),
                 )
                 continue
 
@@ -1883,37 +2194,55 @@ class RoomDetector:
                 if overlap_px / max(area_px, 1) < 0.20:
                     continue
 
-            contours, _ = cv2.findContours(
-                component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            if not contours:
-                continue
-            contour = max(contours, key=cv2.contourArea)
+            # A blob carrying its own 2+ area labels is a merged room; cut it
+            # apart before tracing (report item 2.1).  Falls through to the
+            # single-polygon path whenever the evidence is not conclusive.
+            pieces: List[np.ndarray] = [component]
+            if split_labels:
+                parts = self._split_component_by_labels(component, split_labels)
+                if parts is not None:
+                    pieces = [(parts == k).astype(np.uint8) * 255
+                              for k in range(1, int(parts.max()) + 1)]
 
-            # Simplify with an ABSOLUTE tolerance.  A tolerance proportional to
-            # the perimeter would scale with room size (a 20x12 m room gets a
-            # ~19 cm budget) and flatten away the short wall end-cap edges that
-            # bound a reflex corner's notch, which the snap step needs to see.
-            epsilon = self.simplify_epsilon_cm / self.resolution
-            approx = cv2.approxPolyDP(contour, epsilon, True)
-            if len(approx) < 3:
-                continue
-
-            points = [
-                Point(pt[0][0] * res + min_x, pt[0][1] * res + min_y)
-                for pt in approx
-            ]
-            # Snap the contour onto the wall faces so the floor is airtight.
-            points = self._snap_polygon_to_walls(points)
-            if len(points) < 3:
-                continue
-
-            rooms.append(Room(
-                points=points,
-                name=f'Room {len(rooms) + 1}',
-            ))
+            for piece in pieces:
+                points = self._component_polygon(piece, min_x, min_y)
+                if points is None:
+                    continue
+                rooms.append(Room(
+                    points=points,
+                    name=f'Room {len(rooms) + 1}',
+                ))
 
         return rooms
+
+    def _component_polygon(
+        self, component: np.ndarray, min_x: float, min_y: float,
+    ) -> Optional[List[Point]]:
+        """Trace one interior blob into a wall-snapped room polygon."""
+        res = self.resolution
+        contours, _ = cv2.findContours(
+            component, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            return None
+        contour = max(contours, key=cv2.contourArea)
+
+        # Simplify with an ABSOLUTE tolerance.  A tolerance proportional to
+        # the perimeter would scale with room size (a 20x12 m room gets a
+        # ~19 cm budget) and flatten away the short wall end-cap edges that
+        # bound a reflex corner's notch, which the snap step needs to see.
+        epsilon = self.simplify_epsilon_cm / res
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        if len(approx) < 3:
+            return None
+
+        points = [
+            Point(pt[0][0] * res + min_x, pt[0][1] * res + min_y)
+            for pt in approx
+        ]
+        # Snap the contour onto the wall faces so the floor is airtight.
+        points = self._snap_polygon_to_walls(points)
+        return points if len(points) >= 3 else None
 
 
 # ============================================================
@@ -2078,6 +2407,8 @@ class SweetHome3DExporter:
         split_doorways: bool = True,
         max_doorway_cm: float = 110.0,
         max_room_label_m2: float = 25.0,
+        rescue_lost_rooms: bool = True,
+        split_rooms_by_labels: bool = True,
         sanitize_geometry: bool = True,
         min_wall_length_cm: float = 10.0,
         min_wall_thickness_cm: float = 3.0,
@@ -2093,6 +2424,9 @@ class SweetHome3DExporter:
         self.split_doorways = split_doorways
         self.max_doorway_cm = max_doorway_cm
         self.max_room_label_m2 = max_room_label_m2
+        # Label-driven room recovery/splitting (report items 1.2 and 2.1).
+        self.rescue_lost_rooms = rescue_lost_rooms
+        self.split_rooms_by_labels = split_rooms_by_labels
         # Plan-space (post-/scale_factor) dimension bounds enforced at XML write.
         self.sanitize_geometry = sanitize_geometry
         self.min_wall_length_cm = min_wall_length_cm
@@ -2128,7 +2462,13 @@ class SweetHome3DExporter:
         enclosed_labels: Optional[np.ndarray] = None,
         extra_structural_walls: Optional[List] = None,
         seal_only_openings: Optional[List[Opening]] = None,
+        area_ocr_labels: Optional[List] = None,
     ) -> List[Room]:
+        """``area_ocr_labels``: the full OCR word list, used only as room-area
+        evidence by RoomDetector.  ``ocr_labels`` (naming, debug overlay) is
+        the room-measurement subset and is empty on plans where room
+        measurement failed — which are the plans the rescue pass exists for —
+        so the two are kept separate."""
         structural_walls = self.wall_converter.convert(wall_rectangles)
 
         # Prepend pre-built Wall objects (e.g. diagonal walls) that bypass
@@ -2180,8 +2520,16 @@ class SweetHome3DExporter:
             snap_tolerance_cm=18.0,
             split_doorways=self.split_doorways,
             max_doorway_cm=self.max_doorway_cm,
+            rescue_lost_rooms=self.rescue_lost_rooms,
+            split_by_labels=self.split_rooms_by_labels,
+            # Walls reach the detector in px × pixels_to_cm — scale_factor
+            # times real cm — so it needs the factor to read its own
+            # real-world thresholds correctly.
+            plan_scale=getattr(self.xml_generator, 'scale_factor', 1.0),
         ).detect(
             all_walls, enclosed_labels=enclosed_labels, openings=room_openings,
+            area_labels_cm=self._room_area_labels_cm(
+                area_ocr_labels if area_ocr_labels else ocr_labels),
         )
 
         _n_before_overlap = len(rooms)
@@ -2222,6 +2570,38 @@ class SweetHome3DExporter:
             )
             cv2.imwrite(debug_image_path, debug_img)
         return rooms
+
+    def _room_area_labels_cm(
+        self, ocr_labels: Optional[List],
+    ) -> List[Tuple[float, float, float]]:
+        """Room-area OCR labels as ``(x_cm, y_cm, area_m2)`` for RoomDetector.
+
+        ``ocr_labels`` are ``(text, x1, y1, x2, y2)`` in deskewed image pixels;
+        room geometry is in cm, so centres are scaled by ``pixels_to_cm``.
+        Apartment totals are filtered out by ``parse_room_area_m2`` — a total
+        must never seed a room split or a rescue basin (see
+        room-naming-total-label-filter).
+        """
+        if not ocr_labels:
+            return []
+        try:
+            from core.ocr_utils import parse_room_area_m2
+        except Exception:
+            return []
+        ptcm = self.wall_converter.pixels_to_cm
+        if not ptcm or ptcm <= 0:
+            return []
+        out: List[Tuple[float, float, float]] = []
+        for item in ocr_labels:
+            if len(item) < 5:
+                continue
+            area = parse_room_area_m2(str(item[0]), self.max_room_label_m2)
+            if area is None or area < 1.0:
+                continue
+            cx = ((float(item[1]) + float(item[3])) / 2.0) * ptcm
+            cy = ((float(item[2]) + float(item[4])) / 2.0) * ptcm
+            out.append((cx, cy, area))
+        return out
 
     # ----- final plan-space geometry bounds -----
     def _sanitize_export_geometry(
